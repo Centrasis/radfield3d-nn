@@ -1,0 +1,14 @@
+rich>=14.1.0
+RadFiled3D>=1.2.3
+torch>=2.9.1
+torchvision
+numpy>=2.0.0
+lightning>=2.5.6
+plotly>=6.3.1
+joblib>=1.5.2
+optuna>=4.5.0
+optuna-integration[lightning]>=4.5.0
+pandas>=2.3.3
+optuna>=4.5.0
+optuna-integration>=4.5.0
+-e ./ptbdatalab
