@@ -21,7 +21,7 @@ Note: install pytorch for your existing CUDA version prior to installing the `re
 
 4. To tune hyperparameters of a model:
     ```bash
-    python -m run_network_task --task tune --model_config </path/to/config.json> --epochs <n> --dataset_path </path/to/dataset_folder or .zip> --dataset_type <Layerwise/Voxelwise> --batch_size <n> --num_workers <n> <--join_channels |> --effective_batch_size <n> --normalization <linear0_1 | linear-1_1 | log_1e+3> --logs_path </path/to/store/logs> --mu_tr_file <path/to/used/mu_tr.txt> --enforce_voxel_resolution <W H D> --logger <mlflow | wandb> <--max_inner_batch_size <n> |> <--use_beam_parameters |> <--use_beam_parameters |> <--validate_gt |>
+    python -m run_network_task --task tune --model_config </path/to/config.json> --epochs <n> --dataset_path </path/to/dataset_folder or .zip> --dataset_type <Layerwise/Voxelwise> --batch_size <n> --num_workers <n> <--join_channels |> --effective_batch_size <n> --normalization <linear0_1 | linear-1_1 | log_1e+3> --logs_path </path/to/store/logs> --mu_tr_file <path/to/used/mu_tr.txt> --enforce_voxel_resolution <W H D> --logger <mlflow | wandb> <--max_inner_batch_size <n> |> <--use_beam_parameters |> <--use_beam_parameters |> <--validate_gt |> --n_trials <n>
     ```
 
 For a short description of each parameter please just call:
