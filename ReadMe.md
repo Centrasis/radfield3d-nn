@@ -1,6 +1,6 @@
 # RadField3D Neural Networks
 
-This framework is designed to train neural models using spatial radiation fields stored and loaded by [RadFiled3D](https://github.com/Centrasis/RadFiled3D). It supports direct per volume and per voxel predictors. The framework leverages PyTorch and PyTorch Lightning for model training.
+This framework is designed to train neural models using spatially resolved radiation fields stored and loaded by [RadFiled3D](https://github.com/Centrasis/RadFiled3D). It supports direct per volume and per voxel predictors. The framework leverages PyTorch and PyTorch Lightning for model training.
 
 ## Requirements
 
