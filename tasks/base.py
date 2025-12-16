@@ -1,5 +1,5 @@
-from models.base import BaseNeuralRadFieldModel
-from datasets.dataloader import RadiationFieldDataModule
+from radfield3dnn.models.base import BaseNeuralRadFieldModel
+from radfield3dnn.datasets.dataloader import RadiationFieldDataModule
 import lightning.pytorch as pl
 from loggers.logger import LoggerBase
 

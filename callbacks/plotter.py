@@ -3,16 +3,16 @@ from lightning.pytorch.trainer import Trainer
 from loggers.logger import LoggerBase
 import torch
 import random
-from rftypes import AirKermaField, TrainingInputData, RadiationField, PositionalInput
+from radfield3dnn import AirKermaField, TrainingInputData, RadiationField, PositionalInput
 from torch import Tensor
 import plotly.graph_objects as go
 from rich import print
-from datasets.channel_join import ChannelsJoin
-from models.base import BaseNeuralRadFieldModel
-from rfhelpers import InferenceHelper
-from visualizers.spectrum_plotter import SpectrumPlotter, SpectrumDescriptor
-from visualizers.volumetric_plotter import AirkermaPlotter
-from visualizers.sliced_plotter import SlicedAirkermaPlotter
+from radfield3dnn.datasets.channel_join import ChannelsJoin
+from radfield3dnn.models.base import BaseNeuralRadFieldModel
+from radfield3dnn.rfhelpers import InferenceHelper
+from radfield3dnn.visualizers.spectrum_plotter import SpectrumPlotter, SpectrumDescriptor
+from radfield3dnn.visualizers.volumetric_plotter import AirkermaPlotter
+from radfield3dnn.visualizers.sliced_plotter import SlicedAirkermaPlotter
 
 
 class ValidationPlotter(Callback):

@@ -1,9 +1,8 @@
 import lightning.pytorch as pl
-from sys import platform
 from tasks.base import Task
 from callbacks.metrics_plotter import ErrorFieldPlotter
-from models.base import BaseNeuralRadFieldModel
-from datasets.dataloader import RadiationFieldDataModule
+from radfield3dnn.models.base import BaseNeuralRadFieldModel
+from radfield3dnn.datasets.dataloader import RadiationFieldDataModule
 from rich import print
 from lightning.pytorch.callbacks import ModelCheckpoint
 import os
