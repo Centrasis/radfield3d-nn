@@ -110,12 +110,9 @@ class FluenceLoss(StdLossWeighted):
         self.mse_loss = nn.MSELoss(reduction='none')
         self.l1_loss = nn.L1Loss(reduction='none')
         self.log_scale = log_scale
-        self.ncc_loss = FluenceTopKLogNCCLoss() if ncc_loss else None
 
     def forward(self, target: Tensor, prediction: Tensor, input: TrainingInputData) -> Tensor:
         ssim = self.ssim(target, prediction, input)
-        if self.ncc_loss is not None:
-            ncc = self.ncc_loss(target, prediction, input)
 
         invalid_mask = ~(torch.isfinite(target) & torch.isfinite(prediction))
         if invalid_mask.any():
@@ -134,10 +131,7 @@ class FluenceLoss(StdLossWeighted):
 
         l1l2: Tensor = 0.5 * (l1 + l2)  # Huber loss with delta=1.0
         l1l2 = l1l2.mean()
-        if self.ncc_loss is not None:
-            return l1l2 * 0.5 + ssim * 0.25 + ncc * 0.25
-        else:
-            return l1l2 * 0.66 + ssim * 0.34
+        return l1l2 * 0.66 + ssim * 0.34
 
 
 class FluenceMultiScaleLoss(StdLossWeighted):
