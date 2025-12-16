@@ -4,30 +4,28 @@ import lightning.pytorch as pl
 from lightning.pytorch.tuner import Tuner
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelSummary, RichProgressBar, DeviceStatsMonitor
 import shutil
-from models import ModelConstructor
+from radfield3dnn.models import ModelConstructor
 from lightning.pytorch.callbacks import GradientAccumulationScheduler
 import argparse
 from callbacks.validate_gt import ValidateGroundTruth
 from callbacks.metrics_plotter import MetricsPlotter
-from metrics.airkerma_accuracy import AirkermaAccuracy, AirkermaRelDifferencesStdDev, AirkermaSphereAccuracy, AirkermaScatterAccuracy, AirkermaAccuracyEnergyWeighted
-from metrics.ssim import AirkermaSSIM
+from radfield3dnn.metrics.airkerma_accuracy import AirkermaAccuracy, AirkermaRelDifferencesStdDev, AirkermaSphereAccuracy, AirkermaScatterAccuracy, AirkermaAccuracyEnergyWeighted
+from radfield3dnn.metrics.ssim import AirkermaSSIM
 import json
-from normalizations import NormalizerConstructor
+from radfield3dnn.normalizations import NormalizerConstructor
 
-from preprocessing.airkerma import AirkermaProcessing
+from radfield3dnn.preprocessing.airkerma import AirkermaProcessing
 from joblib import Parallel, delayed
 from multiprocessing import Manager
 import time
 from rich import print
-from datasets import DatasetType, OriginalGroundTruthPreservation, construct_datamodule, get_dataset_dimensions_and_voxel_size
+from radfield3dnn.datasets import DatasetType, OriginalGroundTruthPreservation, construct_datamodule, get_dataset_dimensions_and_voxel_size
 
 from rich.progress import Progress
 from rich.progress import BarColumn, TimeRemainingColumn, TimeElapsedColumn, TextColumn
-from datasets.channel_join import ChannelsJoin
+from radfield3dnn.datasets.channel_join import ChannelsJoin
 
-from metrics import HistogramOverlapAccuracy
-from augmentations.augmentation_limit import LimitedAugmentation
-from augmentations.importance_sampling import ErrorbasedImportanceSampler
+from radfield3dnn.metrics import HistogramOverlapAccuracy
 import multiprocessing as mp
 from sys import platform
 
@@ -64,14 +62,12 @@ if __name__ == "__main__":
     parser.add_argument("--test_mode", action="store_true", help="Run in test mode, skipping batch size maximization and reducing overall system ressources usage.", required=False, default=False)
     parser.add_argument("--max_inner_batch_size", type=int, default=None, help="The maximum inner batch size (Used by voxel- or patch-wise models). Default: Search automatically.", required=False)
     parser.add_argument("--compile_model", action="store_true", help="Whether to compile the model, if supported.", required=False, default=False)
-    parser.add_argument("--no_fail", action="store_true", help="Whether to fail the training if an error occurs.", required=False, default=False)
     parser.add_argument("--use_geometry", action="store_true", help="Use geometry dataset (only for Layerwise datasets).", required=False, default=False)
     parser.add_argument("--use_beam_parameters", action="store_true", help="Use beam parameters normalization.", required=False, default=False)
     parser.add_argument("--use_airkerma", action="store_true", help="Use airkerma field in dataset and model.", required=False, default=False)
     parser.add_argument("--validate_gt", action="store_true", help="Validate ground truth data at the start of each training batch.", required=False, default=False)
     parser.add_argument("--task", type=str, default="train", help="The task to run. Currently 'train' and 'tune' are supported.", required=False)
     parser.add_argument("--n_trials", type=int, default=50, help="The number of trials for hyperparameter tuning (only for 'tune' task).", required=False)
-    parser.add_argument("--importance_sampling", action="store_true", help="Use error-based importance sampling for training.", required=False, default=False)
     args = parser.parse_args()
 
     model_config = args.model_config
@@ -115,12 +111,10 @@ if __name__ == "__main__":
     VOXEL_RESOLUTION = args.enforce_voxel_resolution
     MAX_INNER_BATCH_SIZE = args.max_inner_batch_size
     SHOULD_TRY_COMPILE_MODEL = args.compile_model
-    NO_FAIL = args.no_fail
     USE_GEOMETRY = args.use_geometry
     USE_BEAM_PARAMETERS = args.use_beam_parameters
     USE_AIRKERMA = args.use_airkerma
     SHOULD_VALIDATE_GT = args.validate_gt
-    IMPORTANCE_SAMPLING = args.importance_sampling
 
     mu_tr_file = args.mu_tr_file
     if mu_tr_file is not None and not os.path.isabs(mu_tr_file):
@@ -267,15 +261,6 @@ if __name__ == "__main__":
         print("[yellow]Using Airkerma processing!")
         airkerma_processor = AirkermaProcessing(mu_tr_file=mu_tr_file, bins=32, max_energy_eV=1.5e+5)
         dataprocessings.append(airkerma_processor)
-
-    if IMPORTANCE_SAMPLING:
-        importance_sampler = ErrorbasedImportanceSampler(max_drop_chance=0.99, high_fluence_keep_threshold=0.1)
-        dataprocessings.append(
-            LimitedAugmentation(
-                importance_sampler,
-                end_epoch=int(epochs * (3/4)),
-            )
-        )
 
     # create model and dataset
     model_cls = ModelConstructor.create_model_from_config(model_config, normalizer=normalizer)

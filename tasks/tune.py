@@ -4,8 +4,8 @@ from sys import platform
 import torch
 from tasks.base import Task
 from lightning.pytorch.tuner import Tuner
-from models.base import BaseNeuralRadFieldModel
-from datasets.dataloader import RadiationFieldDataModule
+from radfield3dnn.models.base import BaseNeuralRadFieldModel
+from radfield3dnn.datasets.dataloader import RadiationFieldDataModule
 from RadFiled3D.pytorch.datasets.radfield3d import RadField3DDatasetWithGeometry
 from rich import print
 from lightning.pytorch.callbacks import ModelCheckpoint
@@ -13,7 +13,7 @@ import os
 from loggers.logger import LoggerBase, TrainingSettings
 from callbacks.plotter import ValidationPlotter
 from callbacks.warmup_early_stopping import WarmupEarlyStopping
-from models import ModelConstructor
+from radfield3dnn.models import ModelConstructor
 from lightning.pytorch.callbacks import ModelSummary
 
 import optuna
@@ -28,9 +28,9 @@ from RadFiled3D.pytorch.datasets.processing import DataProcessing
 import traceback
 
 from callbacks.metrics_plotter import MetricsPlotter
-from metrics.airkerma_accuracy import AirkermaAccuracy, AirkermaSphereAccuracy, AirkermaScatterAccuracy, AirkermaAccuracyEnergyWeighted
-from metrics.ssim import AirkermaSSIM
-from metrics import HistogramOverlapAccuracy
+from radfield3dnn.metrics.airkerma_accuracy import AirkermaAccuracy, AirkermaSphereAccuracy, AirkermaScatterAccuracy, AirkermaAccuracyEnergyWeighted
+from radfield3dnn.metrics.ssim import AirkermaSSIM
+from radfield3dnn.metrics import HistogramOverlapAccuracy
 
 
 class HyperparameterTuningTask(Task):
