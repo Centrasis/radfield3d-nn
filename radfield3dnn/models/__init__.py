@@ -5,7 +5,10 @@ from .nerf import *
 from .feedforward import *
 from typing import Literal, Union, Type, List
 import json
+from radfield3dnn.rftypes import PositionalInput
 import os
+from rich import print
+from enum import Enum
 
 
 class ModelConstructor:
@@ -113,3 +116,96 @@ class ModelConstructor:
                 model.load_state_dict(torch.load(weight_path))
                 model.positional_location_encoding = pen
         return model
+
+
+class ModelFormat(Enum):
+    ONNX = 0
+    TORCH_SCRIPT = 1
+    TENSOR_RT = 2
+
+
+class ModelExporter:
+    @staticmethod
+    def export(model: BaseNeuralRadFieldModel, path: str, format: ModelFormat = ModelFormat.ONNX):
+        if format == ModelFormat.ONNX:
+            ModelExporter.onnx_export(model, path)
+        elif format == ModelFormat.TORCH_SCRIPT:
+            ModelExporter.ts_export(model, path)
+        elif format == ModelFormat.TENSOR_RT:
+            ModelExporter.rt_export(model, path)
+        else:
+            raise ValueError(f"Unknown format to exprot model: {format}")
+
+    @staticmethod
+    def rt_export(model: BaseNeuralRadFieldModel, path: str):
+        raise NotImplementedError()
+
+    @staticmethod
+    def ts_export(model: BaseNeuralRadFieldModel, path: str):
+        scripted = torch.jit.script(model.get_core_model())
+        scripted.save(path)
+
+    @staticmethod
+    def onnx_export(model: BaseNeuralRadFieldModel, path: str):
+        class ModelONNXDectorator(BaseNeuralRadFieldModel):
+            def __init__(self, decoratee: BaseNeuralRadFieldModel):
+                super().__init__()
+                self._decoratee = decoratee
+
+            def forward(self, direction: Tensor, position: Tensor, spectrum: Tensor, origin: Tensor, beam_shape_parameters: Tensor, beam_shape_type: Tensor, geometry: Tensor):
+                return self._decoratee.forward(
+                    PositionalInput(
+                        direction=direction,
+                        beam_shape_parameters=beam_shape_parameters,
+                        beam_shape_type=beam_shape_type,
+                        position=position,
+                        origin=origin,
+                        geometry=geometry,
+                        spectrum=spectrum
+                    )
+                )
+            
+            def forward2volume(self, x, voxel_counts, spectra_bins = 32, mask = None):
+                return self._decoratee.forward2volume(x, voxel_counts, spectra_bins, mask)
+            
+            def forward2volume_from_training_input(self, batch, voxel_counts = None, spectra_bins = 32):
+                return self._decoratee.forward2volume_from_training_input(batch, voxel_counts, spectra_bins)
+            
+            def evaluate_forward(self, batch: TrainingInputData):
+                return self._decoratee.evaluate_forward(batch)
+            
+            def get_model_config(self) -> dict:
+                return self._decoratee.get_model_config()
+
+            def get_custom_parameters(self) -> dict:
+                return self._decoratee.get_custom_parameters()
+            
+            lr = property(lambda x: x._decoratee.get_lr(), lambda x, v: x._decoratee.set_lr(v))
+            learning_rate = property(lambda x: x._decoratee.get_lr(), lambda x, v: x._decoratee.set_lr(v))
+
+        input_tuple: PositionalInput = model._generate_random_input(model.device)
+
+        model = ModelONNXDectorator(model.get_core_model())
+        torch.onnx.export(
+            model=model,
+            args=(
+                input_tuple.direction,
+                input_tuple.position,
+                input_tuple.spectrum,
+                input_tuple.origin,
+                input_tuple.beam_shape_parameters,
+                input_tuple.beam_shape_type,
+                input_tuple.geometry
+            ),
+            input_names=[
+                "direction",
+                "position",
+                "spectrum",
+                "origin",
+                "beam_shape_parameters",
+                "beam_shape_type",
+                "geometry"
+            ],
+            f=path,
+            dynamo=True
+        )

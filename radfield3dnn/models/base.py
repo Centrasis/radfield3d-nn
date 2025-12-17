@@ -131,13 +131,10 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
     lr = property(lambda x: x.get_lr(), lambda x, v: x.set_lr(v))
     learning_rate = property(lambda x: x.get_lr(), lambda x, v: x.set_lr(v))
 
-    def __init__(self, location_encoding_dims=10, direction_encoding_dims=4, d_model=256, normalizer: Union[Normalizer, str] = LinearNormalizer(), learning_rate: float=1e-3):
+    def __init__(self, normalizer: Union[Normalizer, str] = LinearNormalizer(), learning_rate: float=1e-3):
         super().__init__()
         self.logging_prefix = ""
         
-        self.positional_location_encoding = SinusoidalFrequencyEncoding(location_encoding_dims, 3, append_input=True)
-        self.positional_direction_encoding = AngularSinusoidalFrequencyEncoding(direction_encoding_dims, append_input=True)
-        self.d_model = d_model
         self._lr = learning_rate
         self._fluence_loss_fn: Loss = comb_loss.FluenceLoss(weight_with_error=False)
         self._spectrum_loss_fn: Loss = comb_loss.HistogramLoss(bin_dim=1) # comb_loss.HistogramLoss(bin_dim=1, weight_with_error=False, penalize_out_of_range=False) # std.KLDivLossWeighted(True)
@@ -149,6 +146,9 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
         self._channels_join = ChannelsJoin()
         assert isinstance(self._normalizer, Normalizer), f"normalizer must be an instance of Normalizer, got {type(self._normalizer)}"
         self.save_hyperparameters(ignore=["indices", "grid_dims", "_fluence_loss_fn", "_spectrum_loss_fn", "normalizer", "_channels_join"])
+
+    def get_core_model(self) -> nn.Module:
+        raise NotImplementedError("Please implement get_core_model()")
 
     def _generate_random_ground_truth(self, device) -> RadiationField:
         input = self._generate_random_input(device=device)

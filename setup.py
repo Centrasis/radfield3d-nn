@@ -1,4 +1,4 @@
-from setuptools import setup, find_packages, Distribution
+from setuptools import setup, find_packages
 import os
 
 
@@ -22,7 +22,9 @@ setup(
         "torchvision",
         "numpy>=2.0.0",
         "lightning>=2.5.6",
-        "pandas>=2.3.3"
+        "pandas>=2.3.3",
+        "onnx>=1.20.0",
+        "onnxscript>=0.5.7"
    ],
    packages=find_packages(),
    author="Felix Lehner",
