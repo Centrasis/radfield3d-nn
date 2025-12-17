@@ -9,17 +9,14 @@ from radfield3dnn.utils.mean_sampling import resample_histogram_bilinear
 
 
 class FeedforwardPointwiseModel(BaseNeuralRadFieldModel):
-    def __init__(self, location_encoding_dims=10, direction_encoding_dims=10, d_model=256, learning_rate: float = 1e-3, randomize_voxel_location_in_training: bool = True, voxels_centered_around_origin: bool = True, normalizer=None):
+    def __init__(self, learning_rate: float = 1e-3, randomize_voxel_location_in_training: bool = True, voxels_centered_around_origin: bool = True, normalizer=None):
         """
         Feedforward model that processes each voxel independently.
-        :param location_encoding_dims: Number of frequency bands for positional encoding of the location.
-        :param direction_encoding_dims: Number of frequency bands for positional encoding of the direction.
-        :param d_model: Dimension of the model.
         :param learning_rate: Learning rate for the optimizer.
         :param randomize_voxel_location_in_training: Whether to randomize voxel centers during training within the voxel extent.
         :param voxels_centered_around_origin: Whether the voxel grid is centered around the origin ([-1, 1]) or starts from the origin ([0, 1]).
         """
-        super().__init__(location_encoding_dims, direction_encoding_dims, d_model, learning_rate=learning_rate, normalizer=normalizer)
+        super().__init__(learning_rate=learning_rate, normalizer=normalizer)
         self.randomize_voxel_location_in_training = randomize_voxel_location_in_training
         self.voxels_centered_around_origin = voxels_centered_around_origin
         self.relevance_discriminator: "FeedforwardPointwiseModel" | None = None

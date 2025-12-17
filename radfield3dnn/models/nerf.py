@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from radfield3dnn.encodings.spherical_hamonics import SphericalHarmonics
+from radfield3dnn.encodings.sinusoidal_encoding import SinusoidalFrequencyEncoding
 from .feedforward import FeedforwardPointwiseModel
 from radfield3dnn import AirKermaField, RadiationField, RadiationFieldChannel, PositionalInput, DirectionalInput
 from radfield3dnn.activations.HistogramNormalize import HistogramNormalize
@@ -12,6 +13,7 @@ from radfield3dnn.activations.fluence_activations import GradientConservingClamp
 from .encoders.spectra_encoder import SpectraProjector, SimpleSpectraEncoder
 from radfield3dnn.normalizations.linear import LinearNormalizer
 from radfield3dnn.layers import FiLM, Concat, GatedFusion, ResidualFiLM
+from radfield3dnn.normalizations.base import Normalizer
 
 
 class RFNetBase(FeedforwardPointwiseModel):
@@ -107,6 +109,161 @@ class RFNetBase(FeedforwardPointwiseModel):
         }]
 
 
+class RFBackboneModel(nn.Module):
+    def __init__(self, location_encoding_dims=10, direction_encoding_dims=10, d_model=256, out_spectra_dim=32, normalizer=None, conditioning: Literal["None", "FiLM", "ResFiLM", "AttentionConditioning", "Hypernetwork", "Gated"] = "None"):
+        super().__init__()
+        self.d_model = d_model
+        self.out_spectra_dim = out_spectra_dim
+
+        self.positional_location_encoding = SinusoidalFrequencyEncoding(location_encoding_dims, d_input=3, append_input=True)
+        self.positional_direction_encoding = SphericalHarmonics(direction_encoding_dims, append_input=True)
+
+        self._normalizer: Normalizer = normalizer
+        self.activation_fn = nn.SiLU(inplace=True)
+        self.configure_beam_encoding(conditioning, self.positional_direction_encoding.encoded_dims, self.d_model)
+
+        if self.xyz_decoder_skip:
+            if self.use_conditioning:
+                self.decoder_in_dim = d_model
+            else:
+                self.decoder_in_dim = d_model * 2
+            self.decoder_in_dim += self.positional_location_encoding.encoded_dims
+        else:
+            self.decoder_in_dim = d_model
+
+        self.block1 = nn.Sequential(
+            nn.Linear(self.positional_location_encoding.encoded_dims, d_model) if self.use_conditioning else nn.Linear(self.positional_location_encoding.encoded_dims + d_model, d_model),
+            nn.Identity() if not self.use_layer_norm else nn.LayerNorm(d_model),  # LayerNorm only if not using FiLM
+            nn.SiLU(True),
+            nn.Linear(d_model, d_model),
+            nn.Identity() if not self.use_conditioning else nn.SiLU(True) # no activation and no normalization here, when using FiLM
+        )
+
+        self.block2 = nn.Sequential(
+            nn.Linear(d_model, d_model) if not self.use_layer_norm else nn.Linear(d_model * 2 + self.positional_location_encoding.encoded_dims, d_model),
+            nn.Identity() if not self.use_layer_norm else nn.LayerNorm(d_model),
+            nn.SiLU(True),
+            nn.Linear(d_model, d_model),
+            nn.SiLU(True),
+            nn.Linear(d_model, d_model),
+            nn.SiLU(True),
+            nn.Linear(d_model, d_model),
+            nn.Identity() if not self.use_conditioning else nn.SiLU(True) # no activation and no normalization here, as FiLM will be applied after
+        )
+
+        self.spectra_decoder = nn.Sequential(
+            nn.Linear(self.decoder_in_dim, d_model // 2),
+            nn.Identity() if not self.use_layer_norm else nn.LayerNorm(d_model // 2),
+            nn.SiLU(True),
+            nn.Linear(d_model // 2, self.out_spectra_dim)
+        )
+        self.fluence_decoder = nn.Linear(d_model, 1)
+        
+        self.spectra_activation = HistogramNormalize(dim=-1)  # nn.Softmax(dim=-1) 
+        if issubclass(self._normalizer.__class__, LinearNormalizer):
+            if self._normalizer.range[0] == -1.0 and self._normalizer.range[1] == 1.0:
+                self.fluence_activation = GradientConservingClamping(-1.0, 1.0)
+            elif self._normalizer.range[0] == 0.0 and self._normalizer.range[1] == 1.0:
+                self.fluence_activation = nn.Sigmoid()
+            else:
+                raise ValueError(f"Unsupported normalization range for LinearNormalizer: {self._normalizer.range}")
+        else:
+            print(f"Warning: Using default fluence activation (0.0, 1.0) clamping for unknown normalizer: {self._normalizer.__class__}.")
+            self.fluence_activation = GradientConservingClamping(0.0, 1.0)
+
+    def encode_additional_parameters(self, batch: PositionalInput) -> Tensor:
+        dir_enc = self.positional_direction_encoding(batch.direction)
+        beam_encoded = self.beam_encoder([dir_enc])
+        return beam_encoded
+
+    def configure_beam_encoding(self, conditioning: Literal["None", "FiLM", "ResFiLM", "AttentionConditioning", "Hypernetwork", "Gated"], beam_param_dims: int, d_model: int):
+        self.conditioning = conditioning
+
+        activation_fn = type(self.activation_fn)
+        self.xyz_decoder_skip = False
+        self.beam_conditioner1 = None
+        self.beam_conditioner2 = None
+        self.use_layer_norm = False
+        self.beam_encoder = nn.Sequential(
+            Concat(dim=-1),
+            nn.Linear(beam_param_dims, d_model),
+            nn.LayerNorm(d_model),  # to stabilize training because of the frequency encoding
+            nn.SiLU(True),
+            nn.Linear(d_model, d_model)
+        )
+        if conditioning == "FiLM":
+            self.use_conditioning = True
+            self.first_layer_xyz_only = True
+            self.xyz_decoder_skip = False
+            self.beam_conditioner1 = FiLM(d_model, d_model, non_linearity=activation_fn)
+            self.beam_conditioner2 = FiLM(d_model, d_model, non_linearity=activation_fn)
+
+        elif conditioning == "ResFiLM":
+            self.use_conditioning = True
+            self.first_layer_xyz_only = True
+            self.beam_conditioner1 = ResidualFiLM(d_model, d_model, non_linearity=activation_fn)
+            self.beam_conditioner2 = ResidualFiLM(d_model, d_model, non_linearity=activation_fn)
+            
+        elif conditioning == "Gated":
+            self.first_layer_xyz_only = True
+            self.use_conditioning = True
+            self.beam_conditioner1 = GatedFusion(d_model, d_model, hidden=d_model, non_linearity=activation_fn)
+            self.beam_conditioner2 = GatedFusion(d_model, d_model, hidden=d_model, non_linearity=activation_fn)
+
+        elif conditioning == "None":
+            self.first_layer_xyz_only = False
+            self.use_conditioning = False
+            self.use_layer_norm = True
+            self.xyz_decoder_skip = False
+
+        else:
+            raise ValueError(f"Unknown conditioning type: {conditioning}")
+        
+    def decode_results(self, model_output: Tensor) -> RadiationField | AirKermaField:
+        spectra = self.spectra_decoder(model_output)
+        fluence = self.fluence_decoder(model_output).squeeze(-1)
+        
+        spectra = self.spectra_activation(spectra)
+        fluence = self.fluence_activation(fluence)
+
+        return RadiationField(
+            scatter_field=RadiationFieldChannel(
+                spectrum=spectra,
+                fluence=fluence,
+                error=None
+            ),
+            xray_beam=None
+        )
+    
+    def forward(self, batch: PositionalInput, global_parameters: Union[Tensor, None, list] = None):
+        xyz_enc = self.positional_location_encoding(batch.position)
+        params_enc = self.encode_additional_parameters(batch) if global_parameters is None else global_parameters
+
+        x0 = xyz_enc if self.first_layer_xyz_only else torch.cat((xyz_enc, params_enc), dim=-1)
+        x1 = self.block1(x0)
+        
+        # Second block with skip connection
+        if self.use_conditioning:
+            x1_1 = self.beam_conditioner1(x1, params_enc)
+        else:
+            x1 = self.activation_fn(x1)
+            x1_1 = torch.cat((x1, x0), dim=-1)
+
+        x2 = self.block2(x1_1)
+
+        if self.use_conditioning:
+            x2 = self.beam_conditioner2(x2, params_enc)
+        else:
+            x2 = self.activation_fn(x2)
+
+        # Add the skip connection and reinforce location and beam encoding
+        if self.xyz_decoder_skip:
+            x2_1 = torch.cat([x2, x0], dim=-1)
+        else:
+            x2_1 = x2 + x1
+        return self.decode_results(x2_1)
+
+
 class SRBFNet(RFNetBase):
     """
     Static Rotatable Beam Field Network
@@ -156,20 +313,16 @@ class SRBFNet(RFNetBase):
             beam_shape_parameters=x.beam_shape_parameters,
             beam_shape_type=x.beam_shape_type
         )
-        global_parameters = self.encode_additional_parameters(x)
+        global_parameters = self.backbone_model.encode_additional_parameters(x)
         return super().forward2volume(x, voxel_counts, self.out_spectra_dim, mask=mask, global_parameters=global_parameters)
 
     def __init__(self, location_encoding_dims=10, direction_encoding_dims=10, d_model=256, out_spectra_dim=32, fluence_loss="L1LogLoss", spectrum_loss="HistogramLoss", learning_rate: float=1e-3, randomize_voxel_location_in_training: bool = True, voxels_centered_around_origin: bool = True, normalizer=None, conditioning: Literal["None", "FiLM", "ResFiLM", "AttentionConditioning", "Hypernetwork", "Gated"] = "None"):
         super().__init__(
-            location_encoding_dims,
-            direction_encoding_dims,
-            d_model,
             learning_rate=learning_rate,
             randomize_voxel_location_in_training=randomize_voxel_location_in_training,
             voxels_centered_around_origin=voxels_centered_around_origin,
             normalizer=normalizer
         )
-        self.positional_direction_encoding = SphericalHarmonics(direction_encoding_dims, append_input=True)
 
         self.location_encoding_dims = location_encoding_dims
         self.direction_encoding_dims = direction_encoding_dims
@@ -177,68 +330,25 @@ class SRBFNet(RFNetBase):
         self.conditioning = conditioning
         self.d_model = d_model
 
-        self.d_pos_dir_dims = self.positional_direction_encoding.encoded_dims + self.positional_location_encoding.encoded_dims
-
         self.fluence_loss_name = fluence_loss
         self.spectrum_loss_name = spectrum_loss
 
         self._fluence_loss_fn = ModuleBuilder.ConstructLoss_fn(fluence_loss)
         self._spectrum_loss_fn = ModuleBuilder.ConstructLoss_fn(spectrum_loss)
 
-        self.activation_fn = nn.SiLU(inplace=True)
-        self.configure_beam_encoding(conditioning, self.positional_direction_encoding.encoded_dims, self.d_model, [self.positional_direction_encoding.encoded_dims])
-
-        if self.xyz_decoder_skip:
-            if self.use_conditioning:
-                self.decoder_in_dim = d_model
-            else:
-                self.decoder_in_dim = d_model * 2
-            self.decoder_in_dim += self.positional_location_encoding.encoded_dims
-        else:
-            self.decoder_in_dim = d_model
-
-
-        self.block1 = nn.Sequential(
-            nn.Linear(self.positional_location_encoding.encoded_dims, d_model) if self.use_conditioning else nn.Linear(self.positional_location_encoding.encoded_dims + d_model, d_model),
-            nn.Identity() if not self.use_layer_norm else nn.LayerNorm(d_model),  # LayerNorm only if not using FiLM
-            nn.SiLU(True),
-            nn.Linear(d_model, d_model),
-            nn.Identity() if not self.use_conditioning else nn.SiLU(True) # no activation and no normalization here, when using FiLM
+        self.backbone_model = RFBackboneModel(
+            location_encoding_dims=location_encoding_dims,
+            direction_encoding_dims=direction_encoding_dims,
+            d_model=d_model,
+            out_spectra_dim=out_spectra_dim,
+            conditioning=conditioning,
+            normalizer=normalizer
         )
-
-        self.block2 = nn.Sequential(
-            nn.Linear(d_model, d_model) if not self.use_layer_norm else nn.Linear(d_model * 2 + self.positional_location_encoding.encoded_dims, d_model),
-            nn.Identity() if not self.use_layer_norm else nn.LayerNorm(d_model),
-            nn.SiLU(True),
-            nn.Linear(d_model, d_model),
-            nn.SiLU(True),
-            nn.Linear(d_model, d_model),
-            nn.SiLU(True),
-            nn.Linear(d_model, d_model),
-            nn.Identity() if not self.use_conditioning else nn.SiLU(True) # no activation and no normalization here, as FiLM will be applied after
-        )
-
-        self.spectra_decoder = nn.Sequential(
-            nn.Linear(self.decoder_in_dim, d_model // 2),
-            nn.Identity() if not self.use_layer_norm else nn.LayerNorm(d_model // 2),
-            nn.SiLU(True),
-            nn.Linear(d_model // 2, self.out_spectra_dim)
-        )
-        self.fluence_decoder = nn.Linear(d_model, 1)
-        
-        self.spectra_activation = HistogramNormalize(dim=-1)  # nn.Softmax(dim=-1) 
-        if issubclass(self._normalizer.__class__, LinearNormalizer):
-            if self._normalizer.range[0] == -1.0 and self._normalizer.range[1] == 1.0:
-                self.fluence_activation = GradientConservingClamping(-1.0, 1.0)
-            elif self._normalizer.range[0] == 0.0 and self._normalizer.range[1] == 1.0:
-                self.fluence_activation = nn.Sigmoid()
-            else:
-                raise ValueError(f"Unsupported normalization range for LinearNormalizer: {self._normalizer.range}")
-        else:
-            print(f"Warning: Using default fluence activation (0.0, 1.0) clamping for unknown normalizer: {self._normalizer.__class__}.")
-            self.fluence_activation = GradientConservingClamping(0.0, 1.0)
 
         self.apply_weights_init()
+
+    def get_core_model(self) -> nn.Module:
+        return self.backbone_model
         
     def apply_weights_init(self):
         self.apply(self._init_weights)
@@ -249,110 +359,16 @@ class SRBFNet(RFNetBase):
                 nn.init.xavier_uniform_(module.weight, gain=0.1)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
-        self.spectra_decoder.apply(_init_decoders)
-        self.fluence_decoder.apply(_init_decoders)
+        self.backbone_model.spectra_decoder.apply(_init_decoders)
+        self.backbone_model.fluence_decoder.apply(_init_decoders)
 
-        if self.beam_conditioner1 is not None:
-            self.beam_conditioner1.initialize()
-        if self.beam_conditioner2 is not None:
-            self.beam_conditioner2.initialize()
-
-    def encode_additional_parameters(self, batch: PositionalInput) -> Tensor:
-        dir_enc = self.positional_direction_encoding(batch.direction)
-        beam_encoded = self.beam_encoder([dir_enc])
-        return beam_encoded
-    
-    def decode_results(self, model_output: Tensor) -> RadiationField | AirKermaField:
-        spectra = self.spectra_decoder(model_output)
-        fluence = self.fluence_decoder(model_output).squeeze(-1)
-        
-        spectra = self.spectra_activation(spectra)
-        fluence = self.fluence_activation(fluence)
-
-        return RadiationField(
-            scatter_field=RadiationFieldChannel(
-                spectrum=spectra,
-                fluence=fluence,
-                error=None
-            ),
-            xray_beam=None
-        )
-    
-    def configure_beam_encoding(self, conditioning: Literal["None", "FiLM", "ResFiLM", "AttentionConditioning", "Hypernetwork", "Gated"], beam_param_dims: int, d_model: int, beam_param_components_dims: list = None):
-        self.conditioning = conditioning
-
-        activation_fn = type(self.activation_fn)
-        self.xyz_decoder_skip = False
-        self.beam_conditioner1 = None
-        self.beam_conditioner2 = None
-        self.use_layer_norm = False
-        self.beam_encoder = nn.Sequential(
-            Concat(dim=-1),
-            nn.Linear(beam_param_dims, d_model),
-            nn.LayerNorm(d_model),  # to stabilize training because of the frequency encoding
-            nn.SiLU(True),
-            nn.Linear(d_model, d_model)
-        )
-        if conditioning == "FiLM":
-            self.use_conditioning = True
-            self.first_layer_xyz_only = True
-            self.xyz_decoder_skip = False
-            self.beam_conditioner1 = FiLM(d_model, d_model, non_linearity=activation_fn)
-            self.beam_conditioner2 = FiLM(d_model, d_model, non_linearity=activation_fn)
-
-        elif conditioning == "ResFiLM":
-            self.use_conditioning = True
-            self.first_layer_xyz_only = True
-            self.beam_conditioner1 = ResidualFiLM(d_model, d_model, non_linearity=activation_fn)
-            self.beam_conditioner2 = ResidualFiLM(d_model, d_model, non_linearity=activation_fn)
-
-        elif conditioning == "Hypernetwork":
-            self.first_layer_xyz_only = True
-            self.xyz_decoder_skip = False
-            self.use_conditioning = False
-            
-        elif conditioning == "Gated":
-            self.first_layer_xyz_only = True
-            self.use_conditioning = True
-            self.beam_conditioner1 = GatedFusion(d_model, d_model, hidden=d_model, non_linearity=activation_fn)
-            self.beam_conditioner2 = GatedFusion(d_model, d_model, hidden=d_model, non_linearity=activation_fn)
-
-        elif conditioning == "None":
-            self.first_layer_xyz_only = False
-            self.use_conditioning = False
-            self.use_layer_norm = True
-            self.xyz_decoder_skip = False
-
-        else:
-            raise ValueError(f"Unknown conditioning type: {conditioning}")
+        if self.backbone_model.beam_conditioner1 is not None:
+            self.backbone_model.beam_conditioner1.initialize()
+        if self.backbone_model.beam_conditioner2 is not None:
+            self.backbone_model.beam_conditioner2.initialize()
 
     def forward(self, batch: PositionalInput, global_parameters: Union[Tensor, None, list] = None):
-        xyz_enc = self.positional_location_encoding(batch.position)
-        params_enc = self.encode_additional_parameters(batch) if global_parameters is None else global_parameters
-
-        x0 = xyz_enc if self.first_layer_xyz_only else torch.cat((xyz_enc, params_enc), dim=-1)
-        x1 = self.block1(x0)
-        
-        # Second block with skip connection
-        if self.use_conditioning:
-            x1_1 = self.beam_conditioner1(x1, params_enc)
-        else:
-            x1 = self.activation_fn(x1)
-            x1_1 = torch.cat((x1, x0), dim=-1)
-
-        x2 = self.block2(x1_1)
-
-        if self.use_conditioning:
-            x2 = self.beam_conditioner2(x2, params_enc)
-        else:
-            x2 = self.activation_fn(x2)
-
-        # Add the skip connection and reinforce location and beam encoding
-        if self.xyz_decoder_skip:
-            x2_1 = torch.cat([x2, x0], dim=-1)
-        else:
-            x2_1 = x2 + x1
-        return self.decode_results(x2_1)
+        return self.backbone_model.forward(batch, global_parameters=global_parameters)
     
     def get_custom_parameters(self):
         return {
@@ -376,6 +392,24 @@ class SPERFNet(SRBFNet):
     """
     __model_name__ = "SPERFNet"
 
+    class BackboneModel(RFBackboneModel):
+        def __init__(self, location_encoding_dims=10, direction_encoding_dims=10, d_model=256, in_spectra_dim=32, d_encoded_spectra=16, use_spectra_encoding=True, out_spectra_dim=32, normalizer=None, conditioning = "None"):
+            super().__init__(location_encoding_dims, direction_encoding_dims, d_model, out_spectra_dim, normalizer, conditioning)
+            # Redefine beam encoder to include spectra encoding
+            self.spectra_encoder = SimpleSpectraEncoder(in_spectra_dim, d_encoded_spectra) if use_spectra_encoding else SpectraProjector(in_spectra_dim, d_encoded_spectra)
+            d_beam_parameters_features = self.positional_direction_encoding.encoded_dims + d_encoded_spectra
+            self.configure_beam_encoding(
+                conditioning,
+                d_beam_parameters_features,
+                d_model
+            )
+
+        def encode_additional_parameters(self, batch: PositionalInput) -> Tensor:
+            spectrum = self.spectra_encoder(batch.spectrum)
+            dir_enc = self.positional_direction_encoding(batch.direction)
+            beam_params = self.beam_encoder([dir_enc, spectrum])
+            return beam_params
+
     def __init__(self, location_encoding_dims=10, direction_encoding_dims=10, d_model=256, out_spectra_dim=32, in_spectra_dim=150, encoded_spectra_dims=64, use_spectra_encoding=False, fluence_loss="L1LogLoss", spectrum_loss="HistogramLoss", learning_rate: float=1e-3, randomize_voxel_location_in_training: bool = True, voxels_centered_around_origin: bool = True, conditioning: Literal["None", "FiLM", "ResFiLM", "AttentionConditioning", "Hypernetwork", "Gated"] = "None", normalizer=None):
         super().__init__(
             location_encoding_dims,
@@ -392,28 +426,22 @@ class SPERFNet(SRBFNet):
         )
         self.in_spectra_dim = in_spectra_dim
         self.d_encoded_spectra = encoded_spectra_dims if use_spectra_encoding else in_spectra_dim
-        self.d_beam_parameters_features = self.positional_direction_encoding.encoded_dims + self.d_encoded_spectra
+        self.d_beam_parameters_features = self.backbone_model.positional_direction_encoding.encoded_dims + self.d_encoded_spectra
         self.use_spectra_encoding = use_spectra_encoding
 
-        # Redefine beam encoder to include spectra encoding
-        self.spectra_encoder = SimpleSpectraEncoder(in_spectra_dim, self.d_encoded_spectra) if use_spectra_encoding else SpectraProjector(in_spectra_dim, self.d_encoded_spectra)
-
-        self.configure_beam_encoding(
-            conditioning,
-            self.d_beam_parameters_features,
-            d_model,
-            [
-                self.positional_direction_encoding.encoded_dims,
-                self.d_encoded_spectra
-            ]
+        self.backbone_model = SPERFNet.BackboneModel(
+            location_encoding_dims=location_encoding_dims,
+            direction_encoding_dims=direction_encoding_dims,
+            d_encoded_spectra=self.d_encoded_spectra,
+            conditioning=conditioning,
+            d_model=d_model,
+            in_spectra_dim=in_spectra_dim,
+            normalizer=normalizer,
+            out_spectra_dim=out_spectra_dim,
+            use_spectra_encoding=use_spectra_encoding
         )
-        self.apply_weights_init()
 
-    def encode_additional_parameters(self, batch: PositionalInput) -> Tensor:
-        spectrum = self.spectra_encoder(batch.spectrum)
-        dir_enc = self.positional_direction_encoding(batch.direction)
-        beam_params = self.beam_encoder([dir_enc, spectrum])
-        return beam_params
+        self.apply_weights_init()
 
     def get_custom_parameters(self):
         params = super().get_custom_parameters()
@@ -431,54 +459,66 @@ class PBRFNet(SPERFNet):
     """
     __model_name__ = "PBRFNet"
 
+    class BackboneModel(SPERFNet.BackboneModel):
+        def __init__(self, location_encoding_dims=10, direction_encoding_dims=10, d_model=256, in_spectra_dim=32, d_encoded_spectra=16, use_spectra_encoding=True, out_spectra_dim=32, normalizer=None, conditioning = "None", use_beam_shape=False, scalar_encoding_dims=16):
+            super().__init__(location_encoding_dims=location_encoding_dims, direction_encoding_dims=direction_encoding_dims, d_model=d_model, out_spectra_dim=out_spectra_dim, normalizer=normalizer, conditioning=conditioning, in_spectra_dim=in_spectra_dim, d_encoded_spectra=d_encoded_spectra, use_spectra_encoding=use_spectra_encoding)
+            self.opening_angle_encoder = nn.Sequential(
+                nn.Linear(1, scalar_encoding_dims),
+                nn.SiLU(True),
+                nn.Linear(scalar_encoding_dims, scalar_encoding_dims),
+                nn.SiLU(True)
+            ) if use_beam_shape else None
+            self.distance_encoder = nn.Sequential(
+                nn.Linear(1, scalar_encoding_dims),
+                nn.SiLU(True),
+                nn.Linear(scalar_encoding_dims, scalar_encoding_dims),
+                nn.SiLU(True)
+            )
+            beam_param_dims = self.positional_direction_encoding.encoded_dims + self.d_encoded_spectra + self.scalar_encoding_dims
+            if use_beam_shape:
+                beam_param_dims += scalar_encoding_dims
+            self.use_beam_shape = use_beam_shape
+
+            self.configure_beam_encoding(
+                conditioning,
+                beam_param_dims,
+                d_model
+            )
+
+        def encode_additional_parameters(self, batch: PositionalInput) -> Tensor:
+            dir_enc = self.positional_direction_encoding(batch.direction)
+            assert batch.origin.shape[-1] == 1, f"Origin must be a single distance value for PBRFNet. Got shape: {batch.origin.shape}"
+
+            origin_enc = self.distance_encoder(batch.origin)
+            spectrum = self.spectra_encoder(batch.spectrum)
+            if self.use_beam_shape:
+                opening_angle = self.opening_angle_encoder(batch.beam_shape_parameters[:, 0].unsqueeze(-1)).view(batch.spectrum.shape[0], -1)
+                enc = [dir_enc, spectrum, opening_angle, origin_enc]
+            else:
+                enc = [dir_enc, spectrum, origin_enc]
+            beam = self.beam_encoder(enc)
+            return beam
+
     def __init__(self, location_encoding_dims=10, direction_encoding_dims=10, d_model=256, out_spectra_dim=32, in_spectra_dim=150, encoded_spectra_dims=64, scalar_encoding_dims=16, use_spectra_encoding=False, fluence_loss="L1LogLoss", spectrum_loss="HistogramLoss", learning_rate = 0.001, randomize_voxel_location_in_training = True, voxels_centered_around_origin = True, conditioning: Literal["None", "FiLM", "ResFiLM", "AttentionConditioning", "Gated"] = "None", use_beam_shape: bool = True, normalizer=None):
         super().__init__(location_encoding_dims, direction_encoding_dims, d_model, out_spectra_dim, in_spectra_dim, encoded_spectra_dims, use_spectra_encoding, fluence_loss, spectrum_loss, learning_rate, randomize_voxel_location_in_training, voxels_centered_around_origin, conditioning=conditioning, normalizer=normalizer)
         self.scalar_encoding_dims = scalar_encoding_dims
-        self.opening_angle_encoder = nn.Sequential(
-            nn.Linear(1, self.scalar_encoding_dims),
-            nn.SiLU(True),
-            nn.Linear(self.scalar_encoding_dims, self.scalar_encoding_dims),
-            nn.SiLU(True)
-        ) if use_beam_shape else None
-        self.distance_encoder = nn.Sequential(
-            nn.Linear(1, self.scalar_encoding_dims),
-            nn.SiLU(True),
-            nn.Linear(self.scalar_encoding_dims, self.scalar_encoding_dims),
-            nn.SiLU(True)
-        )
-
         self.use_beam_shape = use_beam_shape
 
-        beam_param_dims = self.positional_direction_encoding.encoded_dims + self.d_encoded_spectra + self.scalar_encoding_dims
-        if self.use_beam_shape:
-            beam_param_dims += self.scalar_encoding_dims
-
-        self.configure_beam_encoding(
-            conditioning,
-            beam_param_dims,
-            d_model,
-            [
-                self.positional_direction_encoding.encoded_dims,
-                self.d_encoded_spectra,
-                self.scalar_encoding_dims
-            ] + ([self.scalar_encoding_dims] if self.use_beam_shape else [])
+        self.backbone_model = PBRFNet.BackboneModel(
+            location_encoding_dims=location_encoding_dims,
+            direction_encoding_dims=direction_encoding_dims,
+            d_encoded_spectra=self.d_encoded_spectra,
+            conditioning=conditioning,
+            d_model=d_model,
+            in_spectra_dim=in_spectra_dim,
+            normalizer=normalizer,
+            out_spectra_dim=out_spectra_dim,
+            use_spectra_encoding=use_spectra_encoding,
+            scalar_encoding_dims=scalar_encoding_dims,
+            use_beam_shape=use_beam_shape
         )
 
         self.apply_weights_init()
-
-    def encode_additional_parameters(self, batch: PositionalInput) -> Tensor:
-        dir_enc = self.positional_direction_encoding(batch.direction)
-        assert batch.origin.shape[-1] == 1, f"Origin must be a single distance value for PBRFNet. Got shape: {batch.origin.shape}"
-
-        origin_enc = self.distance_encoder(batch.origin)
-        spectrum = self.spectra_encoder(batch.spectrum)
-        if self.use_beam_shape:
-            opening_angle = self.opening_angle_encoder(batch.beam_shape_parameters[:, 0].unsqueeze(-1)).view(batch.spectrum.shape[0], -1)
-            enc = [dir_enc, spectrum, opening_angle, origin_enc]
-        else:
-            enc = [dir_enc, spectrum, origin_enc]
-        beam = self.beam_encoder(enc)
-        return beam
 
     def get_custom_parameters(self):
         params = super().get_custom_parameters()
