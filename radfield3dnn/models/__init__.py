@@ -95,26 +95,24 @@ class ModelConstructor:
                 "model_name": model_config["model_name"]
             }
         )
+
+        model = model_cls()
+        core_model = model.get_core_model()
         try:
-            model = model_cls.load_from_checkpoint(weight_path)
-        except Exception as e:
-            print(f"[yellow]Weigths file was probably not a pytorch-lightning checkpoint: {e} [/yellow]")
-            model = model_cls()
-            try:
-                model.load_state_dict(torch.load(weight_path))
-            except:
-                # Try loading with a known pure python encoding and restore intended encoding afterwards
-                from radfield3dnn.encodings.sinusoidal_encoding import SinusoidalFrequencyEncoding
-                pen = model.positional_location_encoding
-                model.positional_location_encoding = SinusoidalFrequencyEncoding(
-                    pos_enc_dim=pen.pos_enc_dim,
-                    d_input=pen.d_input,
-                    append_input=pen.append_input,
-                    dim=-1,
-                    use_tcnn=False
-                )
-                model.load_state_dict(torch.load(weight_path))
-                model.positional_location_encoding = pen
+            core_model.load_state_dict(torch.load(weight_path))
+        except:
+            # Try loading with a known pure python encoding and restore intended encoding afterwards
+            from radfield3dnn.encodings.sinusoidal_encoding import SinusoidalFrequencyEncoding
+            pen = core_model.positional_location_encoding
+            core_model.positional_location_encoding = SinusoidalFrequencyEncoding(
+                pos_enc_dim=pen.pos_enc_dim,
+                d_input=pen.d_input,
+                append_input=pen.append_input,
+                dim=-1,
+                use_tcnn=False
+            )
+            core_model.load_state_dict(torch.load(weight_path))
+            core_model.positional_location_encoding = pen
         return model
 
 
