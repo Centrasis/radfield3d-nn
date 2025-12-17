@@ -10,9 +10,9 @@ from rich import print
 from radfield3dnn.datasets.channel_join import ChannelsJoin
 from radfield3dnn.models.base import BaseNeuralRadFieldModel
 from radfield3dnn.rfhelpers import InferenceHelper
-from radfield3dnn.visualizers.spectrum_plotter import SpectrumPlotter, SpectrumDescriptor
-from radfield3dnn.visualizers.volumetric_plotter import AirkermaPlotter
-from radfield3dnn.visualizers.sliced_plotter import SlicedAirkermaPlotter
+from visualizers.spectrum_plotter import SpectrumPlotter, SpectrumDescriptor
+from visualizers.volumetric_plotter import AirkermaPlotter
+from visualizers.sliced_plotter import SlicedAirkermaPlotter
 
 
 class ValidationPlotter(Callback):

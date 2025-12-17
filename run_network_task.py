@@ -1,7 +1,6 @@
 import os
 import torch
 import lightning.pytorch as pl
-from lightning.pytorch.tuner import Tuner
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelSummary, RichProgressBar, DeviceStatsMonitor
 import shutil
 from radfield3dnn.models import ModelConstructor
@@ -464,28 +463,6 @@ if __name__ == "__main__":
         model.max_inner_batch_size = MAX_INNER_BATCH_SIZE
         print(f"[yellow]Override maximum inner batch size and set it to: {model.max_inner_batch_size}")
 
-    print(f"[blue]Search learning rate with batch size {batch_size}...")
-    lr_trainer = pl.Trainer(
-        accelerator="gpu",
-        devices=1,
-        max_steps=250,
-        precision="16-mixed" if mixed_precision else "32-true",
-        logger=False,
-        enable_progress_bar=False,
-        enable_checkpointing=True,
-        num_sanity_val_steps=0 if platform == "win32" else 2  # workaround for windows lr finder issue
-    )
-    lr_tuner = Tuner(lr_trainer)
-    lr_result = lr_tuner.lr_find(
-        model,
-        datamodule=datamodule,
-        min_lr=1e-4,    # used by original NeRF paper as initial lr (5e-4)
-        max_lr=1e-2,
-        num_training=250
-    )
-    suggested_lr = lr_result.suggestion()
-    print(f"[green]LR finder suggestion: {suggested_lr}")
-    model._lr = float(suggested_lr)
     model._normalizer = normalizer
 
     trainer = pl.Trainer(
