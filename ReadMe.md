@@ -2,6 +2,8 @@
 
 This framework is designed to train neural models using spatially resolved radiation fields stored and loaded by [RadFiled3D](https://github.com/Centrasis/RadFiled3D). It supports direct per volume and per voxel predictors. The framework leverages PyTorch and PyTorch Lightning for model training.
 
+All methods are described in detail by the paper: [Estimating Spatially Resolved Radiation Fields Using Neural Networks](https://arxiv.org/abs/2512.17654)
+
 ## Requirements
 
 All required modules are listed in the `requirements.txt` file. Ensure you have all dependencies installed before running the training scripts.
