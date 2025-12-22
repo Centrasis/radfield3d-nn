@@ -36,9 +36,9 @@ For a short description of each parameter please just call:
 
 ## Datasets
 - Datasets are located on Zenodo:
-    - **[DS-01](https://xyz)**: Fixed H-100 cone beam; fixed distance
-    - **[DS-02](https://xyz)**: Dynamic C-Arm spectra cone beam; fixed distance
-    - **[DS-03](https://xyz)**: Dynamic C-Arm spectra rectangular beam; dynamic distance
+    - **[DS-01](https://box.ptb.de/dl/fi5etj6QwfD5PFgNqbaSo1VP/JML-2025/DS01-Alderson-H100-2_5m-Dataset.zip)**: Fixed H-100 cone beam; fixed distance
+    - **[DS-02](https://box.ptb.de/dl/fi5etj6QwfD5PFgNqbaSo1VP/JML-2025/DS02-Alderson-CArm-Dataset-Full-2_5m.zip)**: Dynamic C-Arm spectra cone beam; fixed distance
+    - **[DS-03](https://box.ptb.de/dl/fi5etj6QwfD5PFgNqbaSo1VP/JML-2025/DS03-Alderson-C-Arm-Dataset-DynSpectra-Rect-DynDist.zip)**: Dynamic C-Arm spectra rectangular beam; dynamic distance
 
 ## Getting started
 ### Using models
