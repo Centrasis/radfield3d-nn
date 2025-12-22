@@ -45,4 +45,4 @@ For a short description of each parameter please just call:
 In order to load models, place the models configuration json together with the weights file, sharing the same basename in a folder. Just load the weights file to let the module search for the configuration to create the matching model.
 
 ### Adding models
-Inherit from ``BaseNeuralRadFieldModel`` and set the ``__model_name__`` class attribute with a matching name. Make sure, that the file of the new model was imported before importing ``radfield3dnn.models`` to allow the model factory to access the new model defininition.
+Inherit from ``BaseNeuralRadFieldModel`` and set the ``__model_name__`` class attribute with a matching name. Make sure, that the file of the new model was imported before importing ``radfield3dnn.models`` to allow the model factory to access the new model defininition. In order to store and load hyperparameters of the model, that are passed to the constructor, override the ``get_custom_parameters(self)`` method.
