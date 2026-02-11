@@ -2,6 +2,8 @@
 
 This framework is designed to train neural models using spatially resolved radiation fields stored and loaded by [RadFiled3D](https://github.com/Centrasis/RadFiled3D). It supports direct per volume and per voxel predictors. The framework leverages PyTorch and PyTorch Lightning for model training.
 
+All methods are described in detail by the paper: [Estimating Spatially Resolved Radiation Fields Using Neural Networks](https://arxiv.org/abs/2512.17654)
+
 ## Requirements
 
 All required modules are listed in the `requirements.txt` file. Ensure you have all dependencies installed before running the training scripts.
@@ -36,13 +38,13 @@ For a short description of each parameter please just call:
 
 ## Datasets
 - Datasets are located on Zenodo:
-    - **[DS-01](https://xyz)**: Fixed H-100 cone beam; fixed distance
-    - **[DS-02](https://xyz)**: Dynamic C-Arm spectra cone beam; fixed distance
-    - **[DS-03](https://xyz)**: Dynamic C-Arm spectra rectangular beam; dynamic distance
+    - **[DS-01](https://box.ptb.de/dl/fi5etj6QwfD5PFgNqbaSo1VP/JML-2025/DS01-Alderson-H100-2_5m-Dataset.zip)**: Fixed H-100 cone beam; fixed distance
+    - **[DS-02](https://box.ptb.de/dl/fi5etj6QwfD5PFgNqbaSo1VP/JML-2025/DS02-Alderson-CArm-Dataset-Full-2_5m.zip)**: Dynamic C-Arm spectra cone beam; fixed distance
+    - **[DS-03](https://box.ptb.de/dl/fi5etj6QwfD5PFgNqbaSo1VP/JML-2025/DS03-Alderson-C-Arm-Dataset-DynSpectra-Rect-DynDist.zip)**: Dynamic C-Arm spectra rectangular beam; dynamic distance
 
 ## Getting started
 ### Using models
 In order to load models, place the models configuration json together with the weights file, sharing the same basename in a folder. Just load the weights file to let the module search for the configuration to create the matching model.
 
 ### Adding models
-Inherit from ``BaseNeuralRadFieldModel`` and set the ``__model_name__`` class attribute with a matching name. Make sure, that the file of the new model was imported before importing ``radfield3dnn.models`` to allow the model factory to access the new model defininition.
+Inherit from ``BaseNeuralRadFieldModel`` and set the ``__model_name__`` class attribute with a matching name. Make sure, that the file of the new model was imported before importing ``radfield3dnn.models`` to allow the model factory to access the new model defininition. In order to store and load hyperparameters of the model, that are passed to the constructor, override the ``get_custom_parameters(self)`` method.

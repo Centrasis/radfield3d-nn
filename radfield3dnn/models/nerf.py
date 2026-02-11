@@ -474,7 +474,7 @@ class PBRFNet(SPERFNet):
                 nn.Linear(scalar_encoding_dims, scalar_encoding_dims),
                 nn.SiLU(True)
             )
-            beam_param_dims = self.positional_direction_encoding.encoded_dims + self.d_encoded_spectra + self.scalar_encoding_dims
+            beam_param_dims = self.positional_direction_encoding.encoded_dims + d_encoded_spectra + scalar_encoding_dims
             if use_beam_shape:
                 beam_param_dims += scalar_encoding_dims
             self.use_beam_shape = use_beam_shape
