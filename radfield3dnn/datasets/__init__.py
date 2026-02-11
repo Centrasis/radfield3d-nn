@@ -145,7 +145,7 @@ def construct_datamodule(dataset_path: str, batch_size: int, num_workers: int, u
                 stats["tube_distances_m"]["Min"],
                 stats["tube_distances_m"]["Max"]
             ),
-            half_field_size=(field_dim.x/2, field_dim.y/2, field_dim.z/2)
+            half_field_size=(field_dim[0]/2, field_dim[1]/2, field_dim[2]/2)
         )
         dataprocessings.append(beam_normalizer)
 
