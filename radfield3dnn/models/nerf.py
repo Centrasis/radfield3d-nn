@@ -3,27 +3,30 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from radfield3dnn.encodings.spherical_hamonics import SphericalHarmonics
-from radfield3dnn.encodings.sinusoidal_encoding import SinusoidalFrequencyEncoding
-from .feedforward import FeedforwardPointwiseModel
-from radfield3dnn import AirKermaField, RadiationField, RadiationFieldChannel, PositionalInput, DirectionalInput
+from radfield3dnn.models.feedforward import FeedforwardPointwiseModel
+from radfield3dnn.rftypes import AirKermaField, RadiationField, RadiationFieldChannel, PositionalInput, DirectionalInput
 from radfield3dnn.activations.HistogramNormalize import HistogramNormalize
-from .base import ModuleBuilder
+from radfield3dnn.models.base import ModuleBuilder
 from typing import Union, Literal
-from radfield3dnn.activations.fluence_activations import GradientConservingClamping
-from .encoders.spectra_encoder import SpectraProjector, SimpleSpectraEncoder
+from radfield3dnn.activations.flux_activations import GradientConservingClamping
+from radfield3dnn.models.encoders.spectra_encoder import SpectraProjector, SimpleSpectraEncoder
+from radfield3dnn.layers.film import ResidualFiLM, FiLM
 from radfield3dnn.normalizations.linear import LinearNormalizer
-from radfield3dnn.layers import FiLM, Concat, GatedFusion, ResidualFiLM
-from radfield3dnn.normalizations.base import Normalizer
+from radfield3dnn.layers.gates import GatedFusion
+import os
 
 
 class RFNetBase(FeedforwardPointwiseModel):
     def _init_weights(self, module: nn.Module):
         if isinstance(module, nn.Linear):
+            #nn.init.xavier_uniform_(module.weight, gain=nn.init.calculate_gain('relu')) # or 1.0
             nn.init.xavier_uniform_(module.weight, gain=1.0)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
     
     def configure_optimizers(self):
+        # Force a more aggressive learning rate to ensure proper training
+        # The issue may be that PyTorch Lightning is scaling down the learning rate
         effective_lr = max(float(self._lr), 1e-5)
 
         # Collect param ids of all LayerNorms (no weight decay)
@@ -57,10 +60,9 @@ class RFNetBase(FeedforwardPointwiseModel):
                 {'params': mlp_params, 'lr': effective_lr, 'initial_lr': effective_lr, 'weight_decay': 1e-4, "eps": 1e-8},
                 {'params': no_decay, 'lr': effective_lr, 'initial_lr': effective_lr, 'weight_decay': 0.0, "eps": 1e-8},
             ],
-            betas=(0.9, 0.99)
+            betas=(0.9, 0.99)  # Standard Adam betas
         )
 
-        # method to extract the number of elements effectively used as one batch
         def get_accumulate_grad_batches(trainer) -> int:
             try:
                 for cb in getattr(trainer, "callbacks", []):
@@ -109,18 +111,92 @@ class RFNetBase(FeedforwardPointwiseModel):
         }]
 
 
-class RFBackboneModel(nn.Module):
-    def __init__(self, location_encoding_dims=10, direction_encoding_dims=10, d_model=256, out_spectra_dim=32, normalizer=None, conditioning: Literal["None", "FiLM", "ResFiLM", "AttentionConditioning", "Hypernetwork", "Gated"] = "None"):
-        super().__init__()
-        self.d_model = d_model
-        self.out_spectra_dim = out_spectra_dim
+class SRBFNet(RFNetBase):
+    """
+    Static Rotatable Beam Field Network
+    A NeRF-based architecture for learning implicit radiation fields with static radiation field, but rotated beam.
+    """
+    __model_name__ = "SRBFNet"
 
-        self.positional_location_encoding = SinusoidalFrequencyEncoding(location_encoding_dims, d_input=3, append_input=True)
+    class Concat(nn.Module):
+        def __init__(self, dim: int = -1):
+            super().__init__()
+            self.dim = dim
+
+        def forward(self, x: list[Tensor]) -> Tensor:
+            return torch.cat(x, dim=self.dim) if len(x) > 1 else x[0]
+        
+    class IndexSelectableList(list):
+        def __init__(self, inner_list: list):
+            self.inner_list = inner_list
+
+        @staticmethod
+        def recursive_index_select(dim: int, batch_idx: int, target: list | Tensor) -> list | Tensor:
+            if isinstance(target, Tensor):
+                return target.index_select(dim, batch_idx)
+            else:
+                return [
+                    SRBFNet.IndexSelectableList.recursive_index_select(dim, batch_idx, tl)
+                    for tl in target
+                ]
+
+        def index_select(self, dim: int, batch_idx: int) -> list:
+            return SRBFNet.IndexSelectableList.recursive_index_select(dim, batch_idx, self.inner_list)
+        
+        def __getitem__(self, idx):
+            return self.inner_list[idx]
+        
+        def __len__(self):
+            return len(self.inner_list)
+        
+        def __iter__(self):
+            return self.inner_list.__iter__()
+        
+
+    def forward2volume(self, x: DirectionalInput, voxel_counts, spectra_bins = 32, mask: Union[Tensor, None] = None):
+        assert spectra_bins == self.out_spectra_dim, f"Output spectra bins must match the model's output dimension. Given: {spectra_bins}, expected: {self.out_spectra_dim}"
+        # drop geometry if present to speed up training, as this network is learning only implicit geometry
+        global_parameters = self.encode_additional_parameters(x)
+        x = DirectionalInput(
+            direction=x.direction,
+            spectrum=x.spectrum,
+            geometry=None,
+            origin=x.origin,
+            beam_shape_parameters=x.beam_shape_parameters,
+            beam_shape_type=x.beam_shape_type
+        )
+        return super().forward2volume(x, voxel_counts, self.out_spectra_dim, mask=mask, global_parameters=global_parameters)
+
+    def __init__(self, location_encoding_dims=10, direction_encoding_dims=10, d_model=256, out_spectra_dim=32, flux_loss="L1LogLoss", spectrum_loss="HistogramLoss", learning_rate: float=1e-3, randomize_voxel_location_in_training: bool = True, voxels_centered_around_origin: bool = True, normalizer=None, conditioning: Literal["None", "FiLM", "ResFiLM", "AttentionConditioning", "Hypernetwork", "Gated"] = "None"):
+        super().__init__(
+            location_encoding_dims,
+            direction_encoding_dims,
+            d_model,
+            learning_rate=learning_rate,
+            randomize_voxel_location_in_training=randomize_voxel_location_in_training,
+            voxels_centered_around_origin=voxels_centered_around_origin,
+            normalizer=normalizer
+        )
+        #self.positional_direction_encoding = SinusoidalFrequencyEncoding(direction_encoding_dims, 3, append_input=True) # just as in the original NeRF paper
         self.positional_direction_encoding = SphericalHarmonics(direction_encoding_dims, append_input=True)
+        #self.positional_location_encoding = VoxelHashGridEncoding(voxel_count=50**3, n_levels=12, features_per_level=2, base_resolution=20, log2_hashmap_size=16)
 
-        self._normalizer: Normalizer = normalizer
+        self.location_encoding_dims = location_encoding_dims
+        self.direction_encoding_dims = direction_encoding_dims
+        self.out_spectra_dim = out_spectra_dim
+        self.conditioning = conditioning
+        self.d_model = d_model
+
+        self.d_pos_dir_dims = self.positional_direction_encoding.encoded_dims + self.positional_location_encoding.encoded_dims
+
+        self.flux_loss_name = flux_loss
+        self.spectrum_loss_name = spectrum_loss
+
+        self._flux_loss_fn = ModuleBuilder.ConstructLoss_fn(flux_loss)
+        self._spectrum_loss_fn = ModuleBuilder.ConstructLoss_fn(spectrum_loss)
+
         self.activation_fn = nn.SiLU(inplace=True)
-        self.configure_beam_encoding(conditioning, self.positional_direction_encoding.encoded_dims, self.d_model)
+        self.configure_beam_encoding(conditioning, self.positional_direction_encoding.encoded_dims, self.d_model, [self.positional_direction_encoding.encoded_dims])
 
         if self.xyz_decoder_skip:
             if self.use_conditioning:
@@ -157,26 +233,61 @@ class RFBackboneModel(nn.Module):
             nn.SiLU(True),
             nn.Linear(d_model // 2, self.out_spectra_dim)
         )
-        self.fluence_decoder = nn.Linear(d_model, 1)
+        self.flux_decoder = nn.Linear(d_model, 1)
         
-        self.spectra_activation = HistogramNormalize(dim=-1)  # nn.Softmax(dim=-1) 
+        self.spectra_activation = HistogramNormalize(dim=-1)
         if issubclass(self._normalizer.__class__, LinearNormalizer):
             if self._normalizer.range[0] == -1.0 and self._normalizer.range[1] == 1.0:
-                self.fluence_activation = GradientConservingClamping(-1.0, 1.0)
+                self.flux_activation = GradientConservingClamping(-1.0, 1.0) # to allow for high dynamic range
             elif self._normalizer.range[0] == 0.0 and self._normalizer.range[1] == 1.0:
-                self.fluence_activation = nn.Sigmoid()
+                self.flux_activation = nn.Sigmoid()
             else:
                 raise ValueError(f"Unsupported normalization range for LinearNormalizer: {self._normalizer.range}")
         else:
-            print(f"Warning: Using default fluence activation (0.0, 1.0) clamping for unknown normalizer: {self._normalizer.__class__}.")
-            self.fluence_activation = GradientConservingClamping(0.0, 1.0)
+            print(f"Warning: Using default flux activation (0.0, 1.0) clamping for unknown normalizer: {self._normalizer.__class__}.")
+            self.flux_activation = GradientConservingClamping(0.0, 1.0)
+
+        self.apply_weights_init()
+        
+    def apply_weights_init(self):
+        self.apply(self._init_weights)
+
+        def _init_decoders(module):
+            if isinstance(module, nn.Linear):
+                # Use smaller initialization for better gradient flow
+                nn.init.xavier_uniform_(module.weight, gain=0.1)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        self.spectra_decoder.apply(_init_decoders)
+        self.flux_decoder.apply(_init_decoders)
+
+        if self.beam_conditioner1 is not None:
+            self.beam_conditioner1.initialize()
+        if self.beam_conditioner2 is not None:
+            self.beam_conditioner2.initialize()
 
     def encode_additional_parameters(self, batch: PositionalInput) -> Tensor:
         dir_enc = self.positional_direction_encoding(batch.direction)
         beam_encoded = self.beam_encoder([dir_enc])
         return beam_encoded
+    
+    def decode_results(self, model_output: Tensor) -> RadiationField | AirKermaField:
+        spectra = self.spectra_decoder(model_output)
+        flux = self.flux_decoder(model_output).squeeze(-1)
+        
+        spectra = self.spectra_activation(spectra)
+        flux = self.flux_activation(flux)
 
-    def configure_beam_encoding(self, conditioning: Literal["None", "FiLM", "ResFiLM", "AttentionConditioning", "Hypernetwork", "Gated"], beam_param_dims: int, d_model: int):
+        return RadiationField(
+            scatter_field=RadiationFieldChannel(
+                spectrum=spectra,
+                flux=flux,
+                error=None
+            ),
+            direct_beam=None
+        )
+    
+    def configure_beam_encoding(self, conditioning: Literal["None", "FiLM", "ResFiLM", "AttentionConditioning", "Hypernetwork", "Gated"], beam_param_dims: int, d_model: int, beam_param_components_dims: list = None):
         self.conditioning = conditioning
 
         activation_fn = type(self.activation_fn)
@@ -185,7 +296,7 @@ class RFBackboneModel(nn.Module):
         self.beam_conditioner2 = None
         self.use_layer_norm = False
         self.beam_encoder = nn.Sequential(
-            Concat(dim=-1),
+            SRBFNet.Concat(dim=-1),
             nn.Linear(beam_param_dims, d_model),
             nn.LayerNorm(d_model),  # to stabilize training because of the frequency encoding
             nn.SiLU(True),
@@ -218,23 +329,7 @@ class RFBackboneModel(nn.Module):
 
         else:
             raise ValueError(f"Unknown conditioning type: {conditioning}")
-        
-    def decode_results(self, model_output: Tensor) -> RadiationField | AirKermaField:
-        spectra = self.spectra_decoder(model_output)
-        fluence = self.fluence_decoder(model_output).squeeze(-1)
-        
-        spectra = self.spectra_activation(spectra)
-        fluence = self.fluence_activation(fluence)
 
-        return RadiationField(
-            scatter_field=RadiationFieldChannel(
-                spectrum=spectra,
-                fluence=fluence,
-                error=None
-            ),
-            xray_beam=None
-        )
-    
     def forward(self, batch: PositionalInput, global_parameters: Union[Tensor, None, list] = None):
         xyz_enc = self.positional_location_encoding(batch.position)
         params_enc = self.encode_additional_parameters(batch) if global_parameters is None else global_parameters
@@ -262,127 +357,25 @@ class RFBackboneModel(nn.Module):
         else:
             x2_1 = x2 + x1
         return self.decode_results(x2_1)
-
-
-class SRBFNet(RFNetBase):
-    """
-    Static Rotatable Beam Field Network
-    A NeRF-based architecture for learning implicit radiation fields with static radiation field, but rotated beam.
-    """
-    __model_name__ = "SRBFNet"
-        
-    class IndexSelectableList(list):
-        """
-        IndexSelectableList is a decorator for an interatable (preferably a list) of tensors.
-        This decorator is needed to allow for the 'index_select' call as required by FeedforwardPointwiseModel.forward method.
-        """
-        def __init__(self, inner_list: list):
-            self.inner_list = inner_list
-
-        @staticmethod
-        def recursive_index_select(dim: int, batch_idx: int, target: list | Tensor) -> list | Tensor:
-            if isinstance(target, Tensor):
-                return target.index_select(dim, batch_idx)
-            else:
-                return [
-                    SRBFNet.IndexSelectableList.recursive_index_select(dim, batch_idx, tl)
-                    for tl in target
-                ]
-
-        def index_select(self, dim: int, batch_idx: int) -> list:
-            return SRBFNet.IndexSelectableList.recursive_index_select(dim, batch_idx, self.inner_list)
-        
-        def __getitem__(self, idx):
-            return self.inner_list[idx]
-        
-        def __len__(self):
-            return len(self.inner_list)
-        
-        def __iter__(self):
-            return self.inner_list.__iter__()
-        
-
-    def forward2volume(self, x: DirectionalInput, voxel_counts, spectra_bins = 32, mask: Union[Tensor, None] = None):
-        assert spectra_bins == self.out_spectra_dim, f"Output spectra bins must match the model's output dimension. Given: {spectra_bins}, expected: {self.out_spectra_dim}"
-        # drop geometry if present to speed up training, as this network is learning only implicit geometry
-        x = DirectionalInput(
-            direction=x.direction,
-            spectrum=x.spectrum,
-            geometry=None,
-            origin=x.origin,
-            beam_shape_parameters=x.beam_shape_parameters,
-            beam_shape_type=x.beam_shape_type
-        )
-        global_parameters = self.backbone_model.encode_additional_parameters(x)
-        return super().forward2volume(x, voxel_counts, self.out_spectra_dim, mask=mask, global_parameters=global_parameters)
-
-    def __init__(self, location_encoding_dims=10, direction_encoding_dims=10, d_model=256, out_spectra_dim=32, fluence_loss="L1LogLoss", spectrum_loss="HistogramLoss", learning_rate: float=1e-3, randomize_voxel_location_in_training: bool = True, voxels_centered_around_origin: bool = True, normalizer=None, conditioning: Literal["None", "FiLM", "ResFiLM", "AttentionConditioning", "Hypernetwork", "Gated"] = "None"):
-        super().__init__(
-            learning_rate=learning_rate,
-            randomize_voxel_location_in_training=randomize_voxel_location_in_training,
-            voxels_centered_around_origin=voxels_centered_around_origin,
-            normalizer=normalizer
-        )
-
-        self.location_encoding_dims = location_encoding_dims
-        self.direction_encoding_dims = direction_encoding_dims
-        self.out_spectra_dim = out_spectra_dim
-        self.conditioning = conditioning
-        self.d_model = d_model
-
-        self.fluence_loss_name = fluence_loss
-        self.spectrum_loss_name = spectrum_loss
-
-        self._fluence_loss_fn = ModuleBuilder.ConstructLoss_fn(fluence_loss)
-        self._spectrum_loss_fn = ModuleBuilder.ConstructLoss_fn(spectrum_loss)
-
-        self.backbone_model = RFBackboneModel(
-            location_encoding_dims=location_encoding_dims,
-            direction_encoding_dims=direction_encoding_dims,
-            d_model=d_model,
-            out_spectra_dim=out_spectra_dim,
-            conditioning=conditioning,
-            normalizer=normalizer
-        )
-
-        self.apply_weights_init()
-
-    def get_core_model(self) -> nn.Module:
-        return self.backbone_model
-        
-    def apply_weights_init(self):
-        self.apply(self._init_weights)
-
-        def _init_decoders(module):
-            if isinstance(module, nn.Linear):
-                # Use smaller initialization for better gradient flow
-                nn.init.xavier_uniform_(module.weight, gain=0.1)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-        self.backbone_model.spectra_decoder.apply(_init_decoders)
-        self.backbone_model.fluence_decoder.apply(_init_decoders)
-
-        if self.backbone_model.beam_conditioner1 is not None:
-            self.backbone_model.beam_conditioner1.initialize()
-        if self.backbone_model.beam_conditioner2 is not None:
-            self.backbone_model.beam_conditioner2.initialize()
-
-    def forward(self, batch: PositionalInput, global_parameters: Union[Tensor, None, list] = None):
-        return self.backbone_model.forward(batch, global_parameters=global_parameters)
     
     def get_custom_parameters(self):
-        return {
+        params = {
             "location_encoding_dims": self.location_encoding_dims,
             "direction_encoding_dims": self.direction_encoding_dims,
             "d_model": self.d_model,
             "out_spectra_dim": self.out_spectra_dim,
             "conditioning": self.conditioning,
-            "fluence_loss": self.fluence_loss_name,
+            "flux_loss": self.flux_loss_name,
             "spectrum_loss": self.spectrum_loss_name,
             "randomize_voxel_location_in_training": self.randomize_voxel_location_in_training,
             "voxels_centered_around_origin": self.voxels_centered_around_origin,
             "normalizer": self._normalizer.get_type() if self._normalizer is not None else None
         }
+
+        seed = os.environ.get("PL_GLOBAL_SEED", None)
+        if seed is not None:
+            params["training_seed"] = int(seed)
+        return params
 
 
 class SPERFNet(SRBFNet):
@@ -392,31 +385,13 @@ class SPERFNet(SRBFNet):
     """
     __model_name__ = "SPERFNet"
 
-    class BackboneModel(RFBackboneModel):
-        def __init__(self, location_encoding_dims=10, direction_encoding_dims=10, d_model=256, in_spectra_dim=32, d_encoded_spectra=16, use_spectra_encoding=True, out_spectra_dim=32, normalizer=None, conditioning = "None"):
-            super().__init__(location_encoding_dims, direction_encoding_dims, d_model, out_spectra_dim, normalizer, conditioning)
-            # Redefine beam encoder to include spectra encoding
-            self.spectra_encoder = SimpleSpectraEncoder(in_spectra_dim, d_encoded_spectra) if use_spectra_encoding else SpectraProjector(in_spectra_dim, d_encoded_spectra)
-            d_beam_parameters_features = self.positional_direction_encoding.encoded_dims + d_encoded_spectra
-            self.configure_beam_encoding(
-                conditioning,
-                d_beam_parameters_features,
-                d_model
-            )
-
-        def encode_additional_parameters(self, batch: PositionalInput) -> Tensor:
-            spectrum = self.spectra_encoder(batch.spectrum)
-            dir_enc = self.positional_direction_encoding(batch.direction)
-            beam_params = self.beam_encoder([dir_enc, spectrum])
-            return beam_params
-
-    def __init__(self, location_encoding_dims=10, direction_encoding_dims=10, d_model=256, out_spectra_dim=32, in_spectra_dim=150, encoded_spectra_dims=64, use_spectra_encoding=False, fluence_loss="L1LogLoss", spectrum_loss="HistogramLoss", learning_rate: float=1e-3, randomize_voxel_location_in_training: bool = True, voxels_centered_around_origin: bool = True, conditioning: Literal["None", "FiLM", "ResFiLM", "AttentionConditioning", "Hypernetwork", "Gated"] = "None", normalizer=None):
+    def __init__(self, location_encoding_dims=10, direction_encoding_dims=10, d_model=256, out_spectra_dim=32, in_spectra_dim=150, encoded_spectra_dims=64, use_spectra_encoding=False, flux_loss="L1LogLoss", spectrum_loss="HistogramLoss", learning_rate: float=1e-3, randomize_voxel_location_in_training: bool = True, voxels_centered_around_origin: bool = True, conditioning: Literal["None", "FiLM", "ResFiLM", "AttentionConditioning", "Hypernetwork", "Gated"] = "None", normalizer=None):
         super().__init__(
             location_encoding_dims,
             direction_encoding_dims,
             d_model,
             out_spectra_dim=out_spectra_dim,
-            fluence_loss=fluence_loss,
+            flux_loss=flux_loss,
             spectrum_loss=spectrum_loss,
             learning_rate=learning_rate,
             randomize_voxel_location_in_training=randomize_voxel_location_in_training,
@@ -426,22 +401,28 @@ class SPERFNet(SRBFNet):
         )
         self.in_spectra_dim = in_spectra_dim
         self.d_encoded_spectra = encoded_spectra_dims if use_spectra_encoding else in_spectra_dim
-        self.d_beam_parameters_features = self.backbone_model.positional_direction_encoding.encoded_dims + self.d_encoded_spectra
+        self.d_beam_parameters_features = self.positional_direction_encoding.encoded_dims + self.d_encoded_spectra
         self.use_spectra_encoding = use_spectra_encoding
 
-        self.backbone_model = SPERFNet.BackboneModel(
-            location_encoding_dims=location_encoding_dims,
-            direction_encoding_dims=direction_encoding_dims,
-            d_encoded_spectra=self.d_encoded_spectra,
-            conditioning=conditioning,
-            d_model=d_model,
-            in_spectra_dim=in_spectra_dim,
-            normalizer=normalizer,
-            out_spectra_dim=out_spectra_dim,
-            use_spectra_encoding=use_spectra_encoding
-        )
+        # Redefine beam encoder to include spectra encoding
+        self.spectra_encoder = SimpleSpectraEncoder(in_spectra_dim, self.d_encoded_spectra) if use_spectra_encoding else SpectraProjector(in_spectra_dim, self.d_encoded_spectra)
 
+        self.configure_beam_encoding(
+            conditioning,
+            self.d_beam_parameters_features,
+            d_model,
+            [
+                self.positional_direction_encoding.encoded_dims,
+                self.d_encoded_spectra
+            ]
+        )
         self.apply_weights_init()
+
+    def encode_additional_parameters(self, batch: PositionalInput) -> Tensor:
+        spectrum = self.spectra_encoder(batch.spectrum)
+        dir_enc = self.positional_direction_encoding(batch.direction)
+        beam_params = self.beam_encoder([dir_enc, spectrum])
+        return beam_params
 
     def get_custom_parameters(self):
         params = super().get_custom_parameters()
@@ -459,66 +440,60 @@ class PBRFNet(SPERFNet):
     """
     __model_name__ = "PBRFNet"
 
-    class BackboneModel(SPERFNet.BackboneModel):
-        def __init__(self, location_encoding_dims=10, direction_encoding_dims=10, d_model=256, in_spectra_dim=32, d_encoded_spectra=16, use_spectra_encoding=True, out_spectra_dim=32, normalizer=None, conditioning = "None", use_beam_shape=False, scalar_encoding_dims=16):
-            super().__init__(location_encoding_dims=location_encoding_dims, direction_encoding_dims=direction_encoding_dims, d_model=d_model, out_spectra_dim=out_spectra_dim, normalizer=normalizer, conditioning=conditioning, in_spectra_dim=in_spectra_dim, d_encoded_spectra=d_encoded_spectra, use_spectra_encoding=use_spectra_encoding)
-            self.opening_angle_encoder = nn.Sequential(
-                nn.Linear(1, scalar_encoding_dims),
-                nn.SiLU(True),
-                nn.Linear(scalar_encoding_dims, scalar_encoding_dims),
-                nn.SiLU(True)
-            ) if use_beam_shape else None
-            self.distance_encoder = nn.Sequential(
-                nn.Linear(1, scalar_encoding_dims),
-                nn.SiLU(True),
-                nn.Linear(scalar_encoding_dims, scalar_encoding_dims),
-                nn.SiLU(True)
-            )
-            beam_param_dims = self.positional_direction_encoding.encoded_dims + d_encoded_spectra + scalar_encoding_dims
-            if use_beam_shape:
-                beam_param_dims += scalar_encoding_dims
-            self.use_beam_shape = use_beam_shape
-
-            self.configure_beam_encoding(
-                conditioning,
-                beam_param_dims,
-                d_model
-            )
-
-        def encode_additional_parameters(self, batch: PositionalInput) -> Tensor:
-            dir_enc = self.positional_direction_encoding(batch.direction)
-            assert batch.origin.shape[-1] == 1, f"Origin must be a single distance value for PBRFNet. Got shape: {batch.origin.shape}"
-
-            origin_enc = self.distance_encoder(batch.origin)
-            spectrum = self.spectra_encoder(batch.spectrum)
-            if self.use_beam_shape:
-                opening_angle = self.opening_angle_encoder(batch.beam_shape_parameters[:, 0].unsqueeze(-1)).view(batch.spectrum.shape[0], -1)
-                enc = [dir_enc, spectrum, opening_angle, origin_enc]
-            else:
-                enc = [dir_enc, spectrum, origin_enc]
-            beam = self.beam_encoder(enc)
-            return beam
-
-    def __init__(self, location_encoding_dims=10, direction_encoding_dims=10, d_model=256, out_spectra_dim=32, in_spectra_dim=150, encoded_spectra_dims=64, scalar_encoding_dims=16, use_spectra_encoding=False, fluence_loss="L1LogLoss", spectrum_loss="HistogramLoss", learning_rate = 0.001, randomize_voxel_location_in_training = True, voxels_centered_around_origin = True, conditioning: Literal["None", "FiLM", "ResFiLM", "AttentionConditioning", "Gated"] = "None", use_beam_shape: bool = True, normalizer=None):
-        super().__init__(location_encoding_dims, direction_encoding_dims, d_model, out_spectra_dim, in_spectra_dim, encoded_spectra_dims, use_spectra_encoding, fluence_loss, spectrum_loss, learning_rate, randomize_voxel_location_in_training, voxels_centered_around_origin, conditioning=conditioning, normalizer=normalizer)
+    def __init__(self, location_encoding_dims=10, direction_encoding_dims=10, d_model=256, out_spectra_dim=32, in_spectra_dim=150, encoded_spectra_dims=64, scalar_encoding_dims=16, use_spectra_encoding=False, flux_loss="L1LogLoss", spectrum_loss="HistogramLoss", learning_rate = 0.001, randomize_voxel_location_in_training = True, voxels_centered_around_origin = True, conditioning: Literal["None", "FiLM", "ResFiLM", "AttentionConditioning", "Gated"] = "None", use_beam_shape: bool = True, normalizer=None):
+        super().__init__(location_encoding_dims, direction_encoding_dims, d_model, out_spectra_dim, in_spectra_dim, encoded_spectra_dims, use_spectra_encoding, flux_loss, spectrum_loss, learning_rate, randomize_voxel_location_in_training, voxels_centered_around_origin, conditioning=conditioning, normalizer=normalizer)
         self.scalar_encoding_dims = scalar_encoding_dims
-        self.use_beam_shape = use_beam_shape
-
-        self.backbone_model = PBRFNet.BackboneModel(
-            location_encoding_dims=location_encoding_dims,
-            direction_encoding_dims=direction_encoding_dims,
-            d_encoded_spectra=self.d_encoded_spectra,
-            conditioning=conditioning,
-            d_model=d_model,
-            in_spectra_dim=in_spectra_dim,
-            normalizer=normalizer,
-            out_spectra_dim=out_spectra_dim,
-            use_spectra_encoding=use_spectra_encoding,
-            scalar_encoding_dims=scalar_encoding_dims,
-            use_beam_shape=use_beam_shape
+        self.opening_angle_encoder = nn.Sequential(
+            nn.Linear(1, self.scalar_encoding_dims),
+            nn.SiLU(True),
+            nn.Linear(self.scalar_encoding_dims, self.scalar_encoding_dims),
+            nn.SiLU(True)
+        ) if use_beam_shape else None
+        self.distance_encoder = nn.Sequential(
+            nn.Linear(1, self.scalar_encoding_dims),
+            nn.SiLU(True),
+            nn.Linear(self.scalar_encoding_dims, self.scalar_encoding_dims),
+            nn.SiLU(True)
         )
 
+        self.use_beam_shape = use_beam_shape
+
+        beam_param_dims = self.positional_direction_encoding.encoded_dims + self.d_encoded_spectra + self.scalar_encoding_dims
+        if self.use_beam_shape:
+            beam_param_dims += self.scalar_encoding_dims
+
+        self.configure_beam_encoding(
+            conditioning,
+            beam_param_dims,
+            d_model,
+            [
+                self.positional_direction_encoding.encoded_dims,
+                self.d_encoded_spectra,
+                self.scalar_encoding_dims
+            ] + ([self.scalar_encoding_dims] if self.use_beam_shape else [])
+        )
+
+        # RBF layer
+        # centers = torch.linspace(0, 1, 8).unsqueeze(0)  # 8 centers
+        #def rbf_encode(x, centers, gamma=10):
+        #    return torch.exp(-gamma * (x - centers)**2)
+
         self.apply_weights_init()
+
+    def encode_additional_parameters(self, batch: PositionalInput) -> Tensor:
+        dir_enc = self.positional_direction_encoding(batch.direction)
+        assert batch.origin.shape[-1] == 1, f"Origin must be a single distance value for PBRFNet. Got shape: {batch.origin.shape}"
+        #log_dist = torch.log1p(1.0 / (torch.clamp_min(batch.origin, 1e-3) ** 2))  # log(1 + d^2) to cover large distance ranges
+        #distance = torch.cat((batch.origin, log_dist), dim=-1)   # distance plus inverse square law in log-space
+        origin_enc = self.distance_encoder(batch.origin)
+        spectrum = self.spectra_encoder(batch.spectrum)
+        if self.use_beam_shape:
+            opening_angle = self.opening_angle_encoder(batch.beam_shape_parameters[:, 0].unsqueeze(-1)).view(batch.spectrum.shape[0], -1)
+            enc = [dir_enc, spectrum, opening_angle, origin_enc]
+        else:
+            enc = [dir_enc, spectrum, origin_enc]
+        beam = self.beam_encoder(enc)
+        return beam
 
     def get_custom_parameters(self):
         params = super().get_custom_parameters()

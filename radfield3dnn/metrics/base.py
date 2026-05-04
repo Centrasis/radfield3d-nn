@@ -17,7 +17,7 @@ def weight_field_by_statistical_error(tensor: Tensor, input: TrainingInputData, 
     :return: The weighted tensor.
     """
     if isinstance(input.ground_truth, RadiationField):
-        confidence = torch.clamp(1.0 - ((input.ground_truth.scatter_field.error + input.ground_truth.xray_beam.error) / 2.0), min=0.0, max=1.0)
+        confidence = torch.clamp(1.0 - ((input.ground_truth.scatter_field.error + input.ground_truth.direct_beam.error) / 2.0), min=0.0, max=1.0)
     elif isinstance(input.ground_truth, RadiationFieldChannel):
         confidence = torch.clamp(1.0 - input.ground_truth.error, min=0.0, max=1.0)
     else:
@@ -50,7 +50,7 @@ class MetricBase(nn.Module):
     """
     Base class for a metric method.
     """
-    def __init__(self, layer_name: Union[Literal['fluence'], Literal['spectrum'], Literal['error'], None] = None, reduction: Union[Literal['mean'], Literal['median'], Literal['none']] = 'mean', weight_with_error: bool = False, eps: float = 1e-8):
+    def __init__(self, layer_name: Union[Literal['flux'], Literal['spectrum'], Literal['error'], None] = None, reduction: Union[Literal['mean'], Literal['median'], Literal['none']] = 'mean', weight_with_error: bool = False, eps: float = 1e-8):
         super().__init__()
         self.layer_name = layer_name
         self.weight_with_error = weight_with_error
@@ -77,8 +77,8 @@ class MetricBase(nn.Module):
         ...
 
     def extract_tensor_from(self, x: Union[RadiationFieldChannel, Tensor]) -> Tensor:
-        if self.layer_name == 'fluence':
-            return x.fluence if isinstance(x, RadiationFieldChannel) else x
+        if self.layer_name == 'flux':
+            return x.flux if isinstance(x, RadiationFieldChannel) else x
         elif self.layer_name == 'spectrum':
             return x.spectrum if isinstance(x, RadiationFieldChannel) else x
         elif self.layer_name == 'error':

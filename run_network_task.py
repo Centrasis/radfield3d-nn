@@ -225,26 +225,7 @@ if __name__ == "__main__":
 
     if AUGMENTATIONS:
         dataprocessings = [
-            OriginalGroundTruthPreservation(),
-            #LimitedAugmentation(
-            #    GaussianFluenceNoise(1e-2, repeats_per_field=1.1, error_scaled_noise=False),
-            #    end_epoch=epochs//2,
-            #    start_epoch=0
-            #),
-            #LimitedAugmentation(
-            #    GaussianFluenceSmoothing(
-            #        kernel_size=3,
-            #        sigma=0.75,
-            #        p=0.75,
-            #        dataset_multiplier=1.2,
-            #        random_strength=True
-            #    ),
-            #    end_epoch=epochs//2
-            #),
-            #LimitedAugmentation(
-            #    SmoothingSpectra(kernel_size=3, sigma=1.0, p=0.75, dataset_multiplier=1.0),
-            #    end_epoch=epochs//2
-            #)
+            OriginalGroundTruthPreservation()
         ]
         print("[yellow]Using augmentations!")
     else:
@@ -323,25 +304,11 @@ if __name__ == "__main__":
                 max_energy_eV=1.5e+5,
                 importance_threshold=0.5
             ),
-            'top50_airkerma_accuracy_ncc': AirkermaAccuracy(
-                mu_tr_file=mu_tr_file,
-                spectra_bins=32,
-                max_energy_eV=1.5e+5,
-                importance_threshold=0.5,
-                metric_type='ncc'
-            ),
             'top90_airkerma_accuracy': AirkermaAccuracy(
                 mu_tr_file=mu_tr_file,
                 spectra_bins=32,
                 max_energy_eV=1.5e+5,
                 importance_threshold=0.1,
-            ),
-            'top90_airkerma_accuracy_ncc': AirkermaAccuracy(
-                mu_tr_file=mu_tr_file,
-                spectra_bins=32,
-                max_energy_eV=1.5e+5,
-                importance_threshold=0.1,
-                metric_type='ncc'
             ),
             'airkerma_ssim': AirkermaSSIM(
                 mu_tr_file=mu_tr_file,
@@ -363,14 +330,6 @@ if __name__ == "__main__":
                 sphere_radius_m=0.25,
                 voxel_size_m=VOXEL_SIZE_M if VOXEL_SIZE_M > 0.0 else 0.01,
             ),
-            'airkerma_onsphere_accuracy_radius25cm_ncc': AirkermaSphereAccuracy(
-                mu_tr_file=mu_tr_file,
-                spectra_bins=32,
-                max_energy_eV=1.5e+5,
-                sphere_radius_m=0.25,
-                voxel_size_m=VOXEL_SIZE_M if VOXEL_SIZE_M > 0.0 else 0.01,
-                metric_type='ncc'
-            ),
             'top50_airkerma_stddev': AirkermaRelDifferencesStdDev(
                 mu_tr_file=mu_tr_file,
                 spectra_bins=32,
@@ -387,12 +346,6 @@ if __name__ == "__main__":
                 mu_tr_file=mu_tr_file,
                 spectra_bins=32,
                 max_energy_eV=1.5e+5
-            ),
-            'airkerma_accuracy_scatter_ncc': AirkermaScatterAccuracy(
-                mu_tr_file=mu_tr_file,
-                spectra_bins=32,
-                max_energy_eV=1.5e+5,
-                metric_type='ncc'
             ),
             'spectrum_accuracy': HistogramOverlapAccuracy(),
             'top95_energy_weighted_airkerma_accuracy': AirkermaAccuracyEnergyWeighted(

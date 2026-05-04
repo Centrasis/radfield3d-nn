@@ -6,7 +6,7 @@ from typing import Union, Literal
 
 
 class SMAPEAccuracy(MetricBase):
-    def __init__(self, layer_name: Union[Literal['fluence'], Literal['spectrum'], Literal['error'], None] = None, clamp: bool = False, zero_eps: float = 1e-8, weight_with_error: bool = False, importance_threshold: float = 0.0, keep_dim: bool = False):
+    def __init__(self, layer_name: Union[Literal['flux'], Literal['spectrum'], Literal['error'], None] = None, clamp: bool = False, zero_eps: float = 1e-8, weight_with_error: bool = False, importance_threshold: float = 0.0, keep_dim: bool = False):
         """
         Symmetric Mean Absolute Percentage Error (SMAPE) as accuracy metric.
         SMAPE is defined as: SMAPE = |prediction - target| / ((|target| + |prediction|) / 2)
@@ -94,25 +94,25 @@ class SMAPEAccuracy(MetricBase):
                     ground_truth=RadiationField(
                         scatter_field=RadiationFieldChannel(
                             spectrum=input.ground_truth.scatter_field.spectrum,
-                            fluence=input.ground_truth.scatter_field.fluence,
+                            flux=input.ground_truth.scatter_field.flux,
                             error=torch.where(
                                 (target_data >= max_val) | (prediction_data >= max_val),
                                 input.ground_truth.scatter_field.error,
                                 torch.zeros_like(input.ground_truth.scatter_field.error)
                             )
                         ) if input.ground_truth.scatter_field is not None else None,
-                        xray_beam=RadiationFieldChannel(
-                            spectrum=input.ground_truth.xray_beam.spectrum,
-                            fluence=input.ground_truth.xray_beam.fluence,
+                        direct_beam=RadiationFieldChannel(
+                            spectrum=input.ground_truth.direct_beam.spectrum,
+                            flux=input.ground_truth.direct_beam.flux,
                             error=torch.where(
                                 (target_data >= max_val) | (prediction_data >= max_val),
-                                input.ground_truth.xray_beam.error,
-                                torch.zeros_like(input.ground_truth.xray_beam.error)
+                                input.ground_truth.direct_beam.error,
+                                torch.zeros_like(input.ground_truth.direct_beam.error)
                             )
-                        ) if input.ground_truth.xray_beam is not None else None
+                        ) if input.ground_truth.direct_beam is not None else None
                     ) if isinstance(input.ground_truth, RadiationField) else RadiationFieldChannel(
                         spectrum=input.ground_truth.spectrum,
-                        fluence=input.ground_truth.fluence,
+                        flux=input.ground_truth.flux,
                         error=torch.where(
                             (target_data >= max_val) | (prediction_data >= max_val),  # fixed precedence with parentheses
                             input.ground_truth.error,

@@ -113,7 +113,7 @@ class AirkermaProcessing(DataProcessing):
         assert isinstance(x.ground_truth, RadiationFieldChannel), "AirkermaProcessing only supports RadiationFieldChannel as ground truth."
         air_kerma = self.airkerma_module.forward(
             spectra=x.ground_truth.spectrum if x.ground_truth.spectrum is not None else None,
-            fluences=x.ground_truth.fluence
+            fluences=x.ground_truth.flux    # use flux for relative airkerma
         )
 
         return TrainingInputData(

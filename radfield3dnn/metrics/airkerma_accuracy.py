@@ -2,24 +2,18 @@ from radfield3dnn import AirKermaField, RadiationFieldChannel, TrainingInputData
 from radfield3dnn.preprocessing.airkerma import Airkerma
 from .smape import SMAPEAccuracy, EnergyWeightedSMAPEAccuracy
 from .base import MetricBase
-from .ncc import NCCAccuracy
 from typing import Union, Literal
 from torch import Tensor
 import torch
-from .log_rmse import LogRMSEAccuracy
 from .gpr import GammaPassingRate
 
 
 class AirkermaAccuracy(MetricBase):
-    def __init__(self, mu_tr_file: str, spectra_bins: int, max_energy_eV: float, weight_with_error: bool = False, importance_threshold: float = 0.0, keep_dim: bool = False, metric_type: Union[Literal['smape'], Literal['log_rmse'], Literal['ncc'], Literal['gpr']] = 'smape', voxel_size_m: float = 0.01, rel_dose_diff: float = 0.03, dist_crit_mm: float = 3.0):
+    def __init__(self, mu_tr_file: str, spectra_bins: int, max_energy_eV: float, weight_with_error: bool = False, importance_threshold: float = 0.0, keep_dim: bool = False, metric_type: Union[Literal['smape'], Literal['gpr']] = 'smape', voxel_size_m: float = 0.01, rel_dose_diff: float = 0.03, dist_crit_mm: float = 3.0):
         super().__init__(layer_name=None, weight_with_error=weight_with_error)
         self.airkerma = Airkerma(Airkerma.load_mu_tr_table(mu_tr_file), spectra_bins, max_energy_eV)
         if metric_type == 'smape':
             self.metric = SMAPEAccuracy(layer_name=None, clamp=True, weight_with_error=weight_with_error, zero_eps=5e-9, importance_threshold=importance_threshold, keep_dim=keep_dim)
-        elif metric_type == 'log_rmse':
-            self.metric = LogRMSEAccuracy(layer_name=None, weight_with_error=weight_with_error, importance_threshold=importance_threshold, keep_dim=keep_dim)
-        elif metric_type == 'ncc':
-            self.metric = NCCAccuracy(layer_name=None, reduction='mean', weight_with_error=weight_with_error, importance_threshold=importance_threshold)
         elif metric_type == 'gpr':
             self.metric = GammaPassingRate(layer_name=None, reduction='mean', weight_with_error=weight_with_error, keep_dim=keep_dim, voxel_size_m=voxel_size_m, rel_dose_diff=rel_dose_diff, dist_crit_mm=dist_crit_mm)
         else:
@@ -29,19 +23,19 @@ class AirkermaAccuracy(MetricBase):
         return self.metric._calc_metric(target, prediction)
 
     def forward(self, target: Union[RadiationFieldChannel, Tensor, AirKermaField], prediction: Union[RadiationFieldChannel, Tensor, AirKermaField], input: TrainingInputData = None) -> Tensor:
-        if isinstance(prediction, RadiationFieldChannel) and (prediction.spectrum is None or prediction.fluence is None):
+        if isinstance(prediction, RadiationFieldChannel) and (prediction.spectrum is None or prediction.flux is None):
             return None
 
-        # Compute air kerma without eps clamping; only enforce non-negativity on fluence
+        # Compute air kerma without eps clamping; only enforce non-negativity on flux
         if isinstance(target, RadiationFieldChannel):
-            target_airkerma = self.airkerma.forward(target.spectrum, target.fluence)
+            target_airkerma = self.airkerma.forward(target.spectrum, target.flux)
         elif isinstance(target, AirKermaField):
             target_airkerma = target.air_kerma
         else:
             target_airkerma = target
         
         if isinstance(prediction, RadiationFieldChannel):
-            prediction_airkerma = self.airkerma.forward(prediction.spectrum, prediction.fluence)
+            prediction_airkerma = self.airkerma.forward(prediction.spectrum, prediction.flux)
         elif isinstance(prediction, AirKermaField):
             prediction_airkerma = prediction.air_kerma
         else:
@@ -56,19 +50,19 @@ class AirkermaAccuracyEnergyWeighted(EnergyWeightedSMAPEAccuracy):
         self.airkerma = Airkerma(Airkerma.load_mu_tr_table(mu_tr_file), spectra_bins, max_energy_eV)
 
     def forward(self, target: Union[RadiationFieldChannel, Tensor, AirKermaField], prediction: Union[RadiationFieldChannel, Tensor, AirKermaField], input: TrainingInputData = None) -> Tensor:
-        if isinstance(prediction, RadiationFieldChannel) and (prediction.spectrum is None or prediction.fluence is None):
+        if isinstance(prediction, RadiationFieldChannel) and (prediction.spectrum is None or prediction.flux is None):
             return None
 
-        # Compute air kerma without eps clamping; only enforce non-negativity on fluence
+        # Compute air kerma without eps clamping; only enforce non-negativity on flux
         if isinstance(target, RadiationFieldChannel):
-            target_airkerma = self.airkerma.forward(target.spectrum, target.fluence)
+            target_airkerma = self.airkerma.forward(target.spectrum, target.flux)
         elif isinstance(target, AirKermaField):
             target_airkerma = target.air_kerma
         else:
             target_airkerma = target
         
         if isinstance(prediction, RadiationFieldChannel):
-            prediction_airkerma = self.airkerma.forward(prediction.spectrum, prediction.fluence)
+            prediction_airkerma = self.airkerma.forward(prediction.spectrum, prediction.flux)
         elif isinstance(prediction, AirKermaField):
             prediction_airkerma = prediction.air_kerma
         else:
@@ -84,15 +78,11 @@ class AirkermaRelDifferencesStdDev(MetricBase):
     Relative error: (prediction - target) / target (target clamped to eps).
     Returns a single scalar (mean over batch).
     """
-    def __init__(self, mu_tr_file: str, spectra_bins: int, max_energy_eV: float, zero_eps: float = 5e-9, weight_with_error: bool = False, importance_threshold: float = 0.0, metric_type: Union[Literal['smape'], Literal['log_rmse'], Literal['ncc']] = 'smape'):
+    def __init__(self, mu_tr_file: str, spectra_bins: int, max_energy_eV: float, zero_eps: float = 5e-9, weight_with_error: bool = False, importance_threshold: float = 0.0, metric_type: Union[Literal['smape']] = 'smape'):
         super().__init__(layer_name=None, weight_with_error=weight_with_error)
         self.airkerma = Airkerma(Airkerma.load_mu_tr_table(mu_tr_file), spectra_bins, max_energy_eV)
         if metric_type == 'smape':
             self.metric = SMAPEAccuracy(layer_name=None, clamp=True, weight_with_error=weight_with_error, zero_eps=zero_eps, importance_threshold=importance_threshold, keep_dim=True)
-        elif metric_type == 'log_rmse':
-            self.metric = LogRMSEAccuracy(layer_name=None, weight_with_error=weight_with_error, importance_threshold=importance_threshold, keep_dim=True)
-        elif metric_type == 'ncc':
-            self.metric = NCCAccuracy(layer_name=None, reduction='mean', weight_with_error=weight_with_error, importance_threshold=importance_threshold)
         else:
             raise ValueError(f"Unknown metric_type: {metric_type}")
         
@@ -100,19 +90,19 @@ class AirkermaRelDifferencesStdDev(MetricBase):
         return self.metric._calc_metric(target, prediction)
 
     def forward(self, target: Union[RadiationFieldChannel, Tensor, AirKermaField], prediction: Union[RadiationFieldChannel, Tensor, AirKermaField], input: TrainingInputData = None) -> Tensor:
-        if isinstance(prediction, RadiationFieldChannel) and (prediction.spectrum is None or prediction.fluence is None):
+        if isinstance(prediction, RadiationFieldChannel) and (prediction.spectrum is None or prediction.flux is None):
             return None
 
-        # Compute air kerma without eps clamping (only clamp negatives to 0 for fluence)
+        # Compute air kerma without eps clamping (only clamp negatives to 0 for flux)
         if isinstance(target, RadiationFieldChannel):
-            target_airkerma = self.airkerma.forward(target.spectrum, target.fluence)
+            target_airkerma = self.airkerma.forward(target.spectrum, target.flux)
         elif isinstance(target, AirKermaField):
             target_airkerma = target.air_kerma
         else:
             target_airkerma = target
         
         if isinstance(prediction, RadiationFieldChannel):
-            prediction_airkerma = self.airkerma.forward(prediction.spectrum, prediction.fluence)
+            prediction_airkerma = self.airkerma.forward(prediction.spectrum, prediction.flux)
         elif isinstance(prediction, AirKermaField):
             prediction_airkerma = prediction.air_kerma
         else:
@@ -135,17 +125,13 @@ class AirkermaSphereAccuracy(MetricBase):
     Accuracy metric for airkerma on the surface of a sphere around the center of the volume.
     All voxels overlapping the surface of the sphere are considered.
     """
-    def __init__(self, mu_tr_file: str, spectra_bins: int, max_energy_eV: float, sphere_radius_m: float, voxel_size_m: float, weight_with_error: bool = False, metric_type: Union[Literal['smape'], Literal['log_rmse'], Literal['ncc']] = 'smape', importance_threshold: float = 0.0, keep_dim: bool = False):
+    def __init__(self, mu_tr_file: str, spectra_bins: int, max_energy_eV: float, sphere_radius_m: float, voxel_size_m: float, weight_with_error: bool = False, metric_type: Union[Literal['smape']] = 'smape', importance_threshold: float = 0.0, keep_dim: bool = False):
         super().__init__(layer_name=None, weight_with_error=weight_with_error)
         self.airkerma = Airkerma(Airkerma.load_mu_tr_table(mu_tr_file), spectra_bins, max_energy_eV)
         self.sphere_radius_m = sphere_radius_m
         self.voxel_size_m = voxel_size_m
         if metric_type == 'smape':
             self.metric = SMAPEAccuracy(layer_name=None, clamp=True, weight_with_error=weight_with_error, zero_eps=5e-9, importance_threshold=importance_threshold, keep_dim=keep_dim)
-        elif metric_type == 'log_rmse':
-            self.metric = LogRMSEAccuracy(layer_name=None, weight_with_error=weight_with_error, importance_threshold=importance_threshold, keep_dim=keep_dim)
-        elif metric_type == 'ncc':
-            self.metric = NCCAccuracy(layer_name=None, reduction='mean', weight_with_error=weight_with_error, importance_threshold=importance_threshold)
         else:
             raise ValueError(f"Unknown metric_type: {metric_type}")
         
@@ -153,19 +139,19 @@ class AirkermaSphereAccuracy(MetricBase):
         return self.metric._calc_metric(target, prediction)
 
     def forward(self, target: Union[RadiationFieldChannel, Tensor], prediction: Union[RadiationFieldChannel, Tensor], input: TrainingInputData = None) -> Tensor:
-        if isinstance(prediction, RadiationFieldChannel) and (prediction.spectrum is None or prediction.fluence is None):
+        if isinstance(prediction, RadiationFieldChannel) and (prediction.spectrum is None or prediction.flux is None):
             return None
 
-        # Compute air kerma without eps clamping; only enforce non-negativity on fluence
+        # Compute air kerma without eps clamping; only enforce non-negativity on flux
         if isinstance(target, RadiationFieldChannel):
-            target_airkerma = self.airkerma.forward(target.spectrum, target.fluence)
+            target_airkerma = self.airkerma.forward(target.spectrum, target.flux)
         elif isinstance(target, AirKermaField):
             target_airkerma = target.air_kerma
         else:
             target_airkerma = target
         
         if isinstance(prediction, RadiationFieldChannel):
-            prediction_airkerma = self.airkerma.forward(prediction.spectrum, prediction.fluence)
+            prediction_airkerma = self.airkerma.forward(prediction.spectrum, prediction.flux)
         elif isinstance(prediction, AirKermaField):
             prediction_airkerma = prediction.air_kerma
         else:
@@ -189,32 +175,32 @@ class AirkermaSphereAccuracy(MetricBase):
 
 
 class AirkermaScatterAccuracy(AirkermaAccuracy):
-    def __init__(self, mu_tr_file: str, spectra_bins: int, max_energy_eV: float, weight_with_error: bool = False, keep_dim: bool = False, max_relative_fluence: float = 5e-2, min_relative_fluence: float = 5e-3, metric_type: Union[Literal['smape'], Literal['log_rmse'], Literal['ncc']] = 'smape'):
+    def __init__(self, mu_tr_file: str, spectra_bins: int, max_energy_eV: float, weight_with_error: bool = False, keep_dim: bool = False, max_relative_flux: float = 5e-2, min_relative_flux: float = 5e-3, metric_type: Union[Literal['smape']] = 'smape'):
         super().__init__(mu_tr_file, spectra_bins, max_energy_eV, weight_with_error, importance_threshold=0.0, keep_dim=keep_dim, metric_type=metric_type)
-        self.max_relative_fluence = max_relative_fluence
-        self.min_relative_fluence = min_relative_fluence
+        self.max_relative_flux = max_relative_flux
+        self.min_relative_flux = min_relative_flux
 
     def forward(self, target: Union[RadiationFieldChannel, AirKermaField, Tensor], prediction: Union[RadiationFieldChannel, AirKermaField, Tensor], input: TrainingInputData = None) -> Tensor:
-        assert (isinstance(input.ground_truth, RadiationField) and input.ground_truth.xray_beam is not None) or (input.original_ground_truth is not None and input.original_ground_truth.xray_beam is not None), "Input TrainingInputData must contain xray_beam for scatter field accuracy."
+        assert (isinstance(input.ground_truth, RadiationField) and input.ground_truth.direct_beam is not None) or (input.original_ground_truth is not None and input.original_ground_truth.direct_beam is not None), "Input TrainingInputData must contain direct_beam for scatter field accuracy."
 
-        xgt = input.original_ground_truth.xray_beam if input.original_ground_truth is not None and input.original_ground_truth.xray_beam is not None else input.ground_truth.xray_beam
-        xgt = xgt.fluence if isinstance(xgt, RadiationFieldChannel) else xgt
+        xgt = input.original_ground_truth.direct_beam if input.original_ground_truth is not None and input.original_ground_truth.direct_beam is not None else input.ground_truth.direct_beam
+        xgt = xgt.flux if isinstance(xgt, RadiationFieldChannel) else xgt
         sgt = input.original_ground_truth.scatter_field if input.original_ground_truth is not None and input.original_ground_truth.scatter_field is not None else input.ground_truth.scatter_field
-        sgt = sgt.fluence if isinstance(sgt, RadiationFieldChannel) else sgt
+        sgt = sgt.flux if isinstance(sgt, RadiationFieldChannel) else sgt
         fgt = sgt + xgt
 
-        beam_mask = xgt > xgt.max() * self.max_relative_fluence  # ignore areas with > max_relative_fluence of max primary fluence
-        low_fluence_mask_gt = fgt < fgt.max() * self.min_relative_fluence  # ignore areas with < min_relative_fluence of max total fluence
+        beam_mask = xgt > xgt.max() * self.max_relative_flux  # ignore areas with > max_relative_flux of max primary flux
+        low_flux_mask_gt = fgt < fgt.max() * self.min_relative_flux  # ignore areas with < min_relative_flux of max total flux
         if isinstance(prediction, RadiationFieldChannel):
-            low_fluence_mask = prediction.fluence < prediction.fluence.max() * self.min_relative_fluence  # ignore areas with < min_relative_fluence of max predicted fluence
+            low_flux_mask = prediction.flux < prediction.flux.max() * self.min_relative_flux  # ignore areas with < min_relative_flux of max predicted flux
         elif isinstance(prediction, AirKermaField):
-            low_fluence_mask = prediction.air_kerma < prediction.air_kerma.max() * self.min_relative_fluence  # ignore areas with < min_relative_fluence of max predicted air kerma
+            low_flux_mask = prediction.air_kerma < prediction.air_kerma.max() * self.min_relative_flux  # ignore areas with < min_relative_flux of max predicted air kerma
         else:
-            low_fluence_mask = prediction < prediction.max() * self.min_relative_fluence  # ignore areas with < min_relative_fluence of max predicted value
-        beam_mask = beam_mask | (low_fluence_mask & low_fluence_mask_gt)  # combine masks
+            low_flux_mask = prediction < prediction.max() * self.min_relative_flux  # ignore areas with < min_relative_flux of max predicted value
+        beam_mask = beam_mask | (low_flux_mask & low_flux_mask_gt)  # combine masks
 
         if isinstance(target, RadiationFieldChannel):
-            target.fluence[beam_mask] = -torch.inf
+            target.flux[beam_mask] = -torch.inf
         elif isinstance(target, AirKermaField):
             target.air_kerma[beam_mask] = -torch.inf
         else:
@@ -222,7 +208,7 @@ class AirkermaScatterAccuracy(AirkermaAccuracy):
 
 
         if isinstance(prediction, RadiationFieldChannel):
-            prediction.fluence[beam_mask] = -torch.inf
+            prediction.flux[beam_mask] = -torch.inf
         elif isinstance(prediction, AirKermaField):
             prediction.air_kerma[beam_mask] = -torch.inf
         else:

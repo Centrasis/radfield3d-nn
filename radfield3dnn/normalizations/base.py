@@ -25,11 +25,11 @@ class Normalizer(DataProcessing):
         elif isinstance(x, RadiationField):
             return RadiationField(
                 scatter_field=self.forward(x.scatter_field, respect_to=respect_to.scatter_field if respect_to is not None else None) if x.scatter_field is not None else None,
-                xray_beam=self.forward(x.xray_beam, respect_to=respect_to.xray_beam if respect_to is not None else None) if x.xray_beam is not None else None,
+                direct_beam=self.forward(x.direct_beam, respect_to=respect_to.direct_beam if respect_to is not None else None) if x.direct_beam is not None else None,
             )
         elif isinstance(x, RadiationFieldChannel):
             return RadiationFieldChannel(
-                fluence=self.forward(x.fluence, respect_to=respect_to.fluence if respect_to is not None else None),
+                flux=self.forward(x.flux, respect_to=respect_to.flux if respect_to is not None else None),
                 spectrum=x.spectrum,
                 error=x.error
             )
@@ -58,11 +58,11 @@ class Normalizer(DataProcessing):
         elif isinstance(x, RadiationField):
             return RadiationField(
                 scatter_field=self.inverse(x.scatter_field, respect_to=respect_to.scatter_field if respect_to is not None else None) if x.scatter_field is not None else None,
-                xray_beam=self.inverse(x.xray_beam, respect_to=respect_to.xray_beam if respect_to is not None else None) if x.xray_beam is not None else None,
+                direct_beam=self.inverse(x.direct_beam, respect_to=respect_to.direct_beam if respect_to is not None else None) if x.direct_beam is not None else None,
             )
         elif isinstance(x, RadiationFieldChannel):   
             return RadiationFieldChannel(
-                fluence=self.inverse(x.fluence, respect_to=respect_to.fluence if respect_to is not None else None),
+                flux=self.inverse(x.flux, respect_to=respect_to.flux if respect_to is not None else None),
                 spectrum=x.spectrum,
                 error=x.error
             )

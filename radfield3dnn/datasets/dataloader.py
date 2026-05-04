@@ -19,7 +19,7 @@ class RadiationFieldDataModule(pl.LightningDataModule):
         self._max_hits_per_voxel_per_file_per_stage = {}
         self._current_stage_creation = None
         self._dataset_cls = dataset_cls
-        self.max_log_fluence = 1.0
+        self.max_log_flux = 1.0
         self.is_prepared = False
         self._fields_count = 0
         self._train_count = 0
@@ -106,9 +106,9 @@ class RadiationFieldDataModule(pl.LightningDataModule):
         if not self.uploaded_processings:
             for i in range(len(self.data_processings)):
                 if isinstance(batch.ground_truth, RadiationField) or isinstance(batch.ground_truth, rf3RadiationField):
-                    self.data_processings[i] = self.data_processings[i].to(batch.ground_truth.scatter_field.fluence.device)
+                    self.data_processings[i] = self.data_processings[i].to(batch.ground_truth.scatter_field.flux.device)
                 else:
-                    self.data_processings[i] = self.data_processings[i].to(batch.ground_truth.fluence.device)
+                    self.data_processings[i] = self.data_processings[i].to(batch.ground_truth.flux.device)
             self.uploaded_processings = True
 
         for process in self.data_processings:

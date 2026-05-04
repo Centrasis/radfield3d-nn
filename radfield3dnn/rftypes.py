@@ -5,7 +5,7 @@ from torch import Tensor
 
 class RadiationField(NamedTuple):
     scatter_field: RadiationFieldChannel
-    xray_beam: RadiationFieldChannel
+    direct_beam: RadiationFieldChannel
     geometry: Union[Tensor, None] = None  # Optional geometry tensor associated with the radiation field
 
 
