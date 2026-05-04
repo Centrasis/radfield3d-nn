@@ -157,13 +157,13 @@ class AirkermaSSIM(MetricBase):
             raise ValueError(f"Unknown ssim_type: {ssim_type}")
 
     def forward(self, target: Union[RadiationFieldChannel, AirKermaField, Tensor], prediction: Union[RadiationFieldChannel, Tensor], input: TrainingInputData = None) -> Tensor:
-        if isinstance(prediction, RadiationFieldChannel) and (prediction.spectrum is None or prediction.fluence is None):
+        if isinstance(prediction, RadiationFieldChannel) and (prediction.spectrum is None or prediction.flux is None):
             return None
         
         if isinstance(prediction, RadiationFieldChannel):
-            invalid_mask = ~torch.isfinite(prediction.fluence)
+            invalid_mask = ~torch.isfinite(prediction.flux)
             if invalid_mask.any():
-                prediction.fluence[invalid_mask] = 0.0
+                prediction.flux[invalid_mask] = 0.0
                 invalid_mask = invalid_mask.expand_as(prediction.spectrum)
                 prediction.spectrum[invalid_mask] = 1.0 / prediction.spectrum.size(1)  # set to uniform if invalid
         elif isinstance(prediction, AirKermaField):
@@ -176,7 +176,7 @@ class AirkermaSSIM(MetricBase):
                 prediction[invalid_mask] = 0.0
 
         if isinstance(target, RadiationFieldChannel):
-            target_airkerma = self.airkerma.forward(target.spectrum, target.fluence)
+            target_airkerma = self.airkerma.forward(target.spectrum, target.flux)
         elif isinstance(target, AirKermaField):
             target_airkerma = target.air_kerma
         else:
@@ -187,7 +187,7 @@ class AirkermaSSIM(MetricBase):
             target_airkerma[invalid_mask] = 0.0
 
         if isinstance(prediction, RadiationFieldChannel):
-            prediction_airkerma = self.airkerma.forward(prediction.spectrum, prediction.fluence)
+            prediction_airkerma = self.airkerma.forward(prediction.spectrum, prediction.flux)
         elif isinstance(prediction, AirKermaField):
             prediction_airkerma = prediction.air_kerma
         else:

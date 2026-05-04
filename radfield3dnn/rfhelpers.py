@@ -24,7 +24,7 @@ class InferenceHelper:
 
             pred_field: RadiationField | AirKermaField | RadiationFieldChannel = pl_module.forward2volume_from_training_input(batch, voxel_resolution, spectra_bins=spectra_bins)
             if isinstance(pred_field, RadiationField):
-                if pred_field.xray_beam is not None:
+                if pred_field.direct_beam is not None:
                     pred_field: RadiationFieldChannel = InferenceHelper.channels_join.forward(pred_field)
                     pred_field = pl_module._normalizer.forward(pred_field)  # Ensure prediction is normalized
                 else:
@@ -78,16 +78,16 @@ class InferenceHelper:
         return gt
 
     @staticmethod
-    def extract_fluence_or_airkerma(field: RadiationFieldChannel | RadiationField | AirKermaField) -> torch.Tensor:
+    def extract_flux_or_airkerma(field: RadiationFieldChannel | RadiationField | AirKermaField) -> torch.Tensor:
         if isinstance(field, RadiationField):
             field = InferenceHelper.channels_join.forward(field)
-            return field.fluence
+            return field.flux
         elif isinstance(field, RadiationFieldChannel):
-            return field.fluence
+            return field.flux
         elif isinstance(field, AirKermaField):
             return field.air_kerma
         else:
-            raise ValueError("Field must be RadiationField, RadiationFieldChannel or AirKermaField to extract fluence or air kerma.")
+            raise ValueError("Field must be RadiationField, RadiationFieldChannel or AirKermaField to extract flux or air kerma.")
 
     @staticmethod
     def try_extract_spectrum(field: RadiationFieldChannel | RadiationField | AirKermaField) -> torch.Tensor | None:

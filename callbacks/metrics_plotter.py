@@ -120,9 +120,9 @@ class ErrorFieldPlotter(Callback):
                 spectra_bins=32
             )
 
-            aikerma_gt = self.airkerma.airkerma.forward(gt.spectrum, gt.fluence)
+            aikerma_gt = self.airkerma.airkerma.forward(gt.spectrum, gt.flux)
             if isinstance(pred_field, RadiationFieldChannel):
-                aikerma_pred = self.airkerma.airkerma.forward(pred_field.spectrum, pred_field.fluence)
+                aikerma_pred = self.airkerma.airkerma.forward(pred_field.spectrum, pred_field.flux)
             elif isinstance(pred_field, AirKermaField):                
                 aikerma_pred = pred_field.air_kerma
             else:

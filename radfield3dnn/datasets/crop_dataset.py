@@ -47,11 +47,11 @@ class CropDataset(DataProcessing):
             RadiationFieldChannel: Cropped RadiationFieldChannel.
         """
         cropped_spectrum = self.crop_tensor(field.spectrum)
-        cropped_fluence = self.crop_tensor(field.fluence)
+        cropped_flux = self.crop_tensor(field.flux)
         cropped_error = self.crop_tensor(field.error) if field.error is not None else None
         return RadiationFieldChannel(
             spectrum=cropped_spectrum,
-            fluence=cropped_fluence,
+            flux=cropped_flux,
             error=cropped_error
         )
     
@@ -63,10 +63,10 @@ class CropDataset(DataProcessing):
         Returns:
             RadiationField: Cropped RadiationField.
         """
-        xray_beam_cropped = self.crop_channel(field.xray_beam) if field.xray_beam is not None else None
+        direct_beam_cropped = self.crop_channel(field.direct_beam) if field.direct_beam is not None else None
         scatter_field_cropped = self.crop_channel(field.scatter_field) if field.scatter_field is not None else None
         return RadiationField(
-            xray_beam=xray_beam_cropped,
+            direct_beam=direct_beam_cropped,
             scatter_field=scatter_field_cropped,
             geometry=self.crop_tensor(field.geometry) if "geometry" in field._fields and field.geometry is not None else None
         )

@@ -40,7 +40,7 @@ class BeamParametersNormalization(DataProcessing):
                 distance_range = torch.tensor(
                     [
                         0.0,
-                        torch.linalg.norm(torch.tensor(x.ground_truth.fluence.shape[-3:], dtype=torch.float32, device=x.input.origin.device) * size_per_voxel, dim=-1, p=2)  # in meters
+                        torch.linalg.norm(torch.tensor(x.ground_truth.flux.shape[-3:], dtype=torch.float32, device=x.input.origin.device) * size_per_voxel, dim=-1, p=2)  # in meters
                     ],
                     dtype=torch.float32,
                     device=x.input.origin.device

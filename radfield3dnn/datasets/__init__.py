@@ -22,7 +22,7 @@ class DatasetType(Enum):
 class OriginalGroundTruthPreservation(DataProcessing):
     def clone_channel(self, channel: RadiationFieldChannel) -> RadiationFieldChannel:
         return RadiationFieldChannel(
-            fluence=channel.fluence.clone() if channel.fluence is not None else None,
+            flux=channel.flux.clone() if channel.flux is not None else None,
             spectrum=channel.spectrum.clone() if channel.spectrum is not None else None,
             error=channel.error.clone() if channel.error is not None else None
         )
@@ -30,7 +30,7 @@ class OriginalGroundTruthPreservation(DataProcessing):
     def clone_radfield(self, field: RadiationField) -> RadiationField:
         return RadiationField(
             scatter_field=self.clone_channel(field.scatter_field) if field.scatter_field is not None else None,
-            xray_beam=self.clone_channel(field.xray_beam) if field.xray_beam is not None else None,
+            direct_beam=self.clone_channel(field.direct_beam) if field.direct_beam is not None else None,
             geometry=field.geometry.clone() if "geometry" in field._fields and field.geometry is not None else None
         )
     

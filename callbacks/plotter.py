@@ -55,15 +55,15 @@ class ValidationPlotter(Callback):
             )
 
             with torch.no_grad():
-                gt_fluence = InferenceHelper.extract_fluence_or_airkerma(gt)
+                gt_flux = InferenceHelper.extract_flux_or_airkerma(gt)
                 gt_spectra = InferenceHelper.try_extract_spectrum(gt)
-                self.voxel_resolution = gt_fluence.shape[-3:]  # robust for 4D/5D
+                self.voxel_resolution = gt_flux.shape[-3:]  # robust for 4D/5D
                 self.spectra_bins = gt_spectra.shape[1] if gt_spectra is not None else 32
-                batch_size = gt_fluence.shape[0] if len(gt_fluence.shape) >= 4 else 1
-                is_complete_volume = len(gt_fluence.shape) >= 4
+                batch_size = gt_flux.shape[0] if len(gt_flux.shape) >= 4 else 1
+                is_complete_volume = len(gt_flux.shape) >= 4
                 
-                pred_field_fluence = InferenceHelper.extract_fluence_or_airkerma(pred_field).detach()
-                pred_field_fluence: Tensor = torch.clamp(pred_field_fluence, min=0.0)
+                pred_field_flux = InferenceHelper.extract_flux_or_airkerma(pred_field).detach()
+                pred_field_flux: Tensor = torch.clamp(pred_field_flux, min=0.0)
                 pred_field_spectra: Tensor | None = InferenceHelper.try_extract_spectrum(pred_field)
                 if pred_field_spectra is not None:
                     pred_field_spectra = pred_field_spectra.detach()
@@ -81,14 +81,14 @@ class ValidationPlotter(Callback):
             if self.plot_volume:
                 fig_volume = self.airkerma_plotter.create_airkerma_figure(title="Predicted Airkerma Volume")
 
-            invalid_mask = torch.isneginf(pred_field_fluence)
+            invalid_mask = torch.isneginf(pred_field_flux)
 
             # Iterate over batch
             for idx in range(batch_size):
-                pred_fluence = pred_field_fluence[idx] if batch_size > 1 else pred_field_fluence
+                pred_flux = pred_field_flux[idx] if batch_size > 1 else pred_field_flux
  
-                if (pred_fluence == 0.0).all():
-                    print(f"[yellow]Warning: Predicted fluence is all zeros for item {idx} in validation batch.[/yellow]")
+                if (pred_flux == 0.0).all():
+                    print(f"[yellow]Warning: Predicted flux is all zeros for item {idx} in validation batch.[/yellow]")
 
                 if self.plot_volume and idx == 0:
                     vidx = int(torch.randint(0, batch_size - 1, size=(1,)).item()) if batch_size > 1 else 0
@@ -96,20 +96,20 @@ class ValidationPlotter(Callback):
                         fig=fig_volume,
                         field=pred_field,
                         batch_idx=vidx,
-                        name=f"Predicted Fluence {vidx}"
+                        name=f"Predicted flux {vidx}"
                     )
 
                 # Optional target for blending (normalize independently to ensure visibility)
                 if is_complete_volume:
-                    gt_field = gt_fluence[idx] if batch_size > 1 else gt_fluence
+                    gt_field = gt_flux[idx] if batch_size > 1 else gt_flux
                     mask = invalid_mask[idx] if batch_size > 1 else invalid_mask
                     if mask.any():
-                        pred_fluence = pred_fluence.clone()
-                        pred_fluence[mask] = 0.0
+                        pred_flux = pred_flux.clone()
+                        pred_flux[mask] = 0.0
                     
                     self.sliced_airkerma_plotter.add_blended_slices(
                         fig=fig,
-                        pred_field=pred_fluence,
+                        pred_field=pred_flux,
                         gt_field=gt_field,
                         X=0.5,
                         name1=f"Pred YZ{idx}",
@@ -119,7 +119,7 @@ class ValidationPlotter(Callback):
                     )
                     self.sliced_airkerma_plotter.add_blended_slices(
                         fig=fig,
-                        pred_field=pred_fluence,
+                        pred_field=pred_flux,
                         gt_field=gt_field,
                         Y=0.5,
                         name1=f"Pred XZ{idx}",
@@ -129,7 +129,7 @@ class ValidationPlotter(Callback):
                     )
                     self.sliced_airkerma_plotter.add_blended_slices(
                         fig=fig,
-                        pred_field=pred_fluence,
+                        pred_field=pred_flux,
                         gt_field=gt_field,
                         Z=0.5,
                         name1=f"Pred XY{idx}",
@@ -140,7 +140,7 @@ class ValidationPlotter(Callback):
                 else:
                     self.sliced_airkerma_plotter.add_airkerma_slice_to_figure(
                         fig=fig,
-                        field=pred_fluence,
+                        field=pred_flux,
                         X=0.5,
                         name=f"Pred XZ {idx}",
                         row=1,
@@ -148,7 +148,7 @@ class ValidationPlotter(Callback):
                     )
                     self.sliced_airkerma_plotter.add_airkerma_slice_to_figure(
                         fig=fig,
-                        field=pred_fluence,
+                        field=pred_flux,
                         Y=0.5,
                         name=f"Pred XY {idx}",
                         row=2,
@@ -156,14 +156,14 @@ class ValidationPlotter(Callback):
                     )
                     self.sliced_airkerma_plotter.add_airkerma_slice_to_figure(
                         fig=fig,
-                        field=pred_fluence,
+                        field=pred_flux,
                         Z=0.5,
                         name=f"Pred YZ {idx}",
                         row=3,
                         col=idx + 1
                     )
 
-            rendered_measurand = "Air Kerma" if isinstance(pred_field, AirKermaField) else "Fluence"
+            rendered_measurand = "Air Kerma" if isinstance(pred_field, AirKermaField) else "flux"
             fig.update_layout(
                 title_text=f"Predicted vs Target {rendered_measurand} (Red=Pred, Blue=Target, Purple=Overlap) - Batch",
                 showlegend=False,
@@ -257,7 +257,7 @@ class ValidationDepthIntesityPlotter(Callback):
 
             targets = batch.ground_truth
             inputs = batch.input
-            idx = random.randint(0, targets.scatter_field.fluence.shape[0] - 1) if isinstance(targets, RadiationField) else random.randint(0, targets.fluence.shape[0] - 1)
+            idx = random.randint(0, targets.scatter_field.flux.shape[0] - 1) if isinstance(targets, RadiationField) else random.randint(0, targets.flux.shape[0] - 1)
             
             direction = inputs.direction[idx].unsqueeze(0)
             spectrum = inputs.spectrum[idx].unsqueeze(0)
@@ -308,20 +308,20 @@ class ValidationDepthIntesityPlotter(Callback):
             )
 
             field: RadiationField = pl_module.forward(net_in)
-            fluence = field.scatter_field.fluence
-            if field.xray_beam is not None:
-                fluence += field.xray_beam.fluence
-            fluence = fluence / (fluence.max() if fluence.max() > 0 else 1.0)
-            fluence = fluence.squeeze(0)
-            if len(fluence.shape) >= 4:
+            flux = field.scatter_field.flux
+            if field.direct_beam is not None:
+                flux += field.direct_beam.flux
+            flux = flux / (flux.max() if flux.max() > 0 else 1.0)
+            flux = flux.squeeze(0)
+            if len(flux.shape) >= 4:
                 return
 
             data = [
-                [x - fluence.shape[0] / 2.0, float(fluence[x].cpu().numpy())]
-                for x in range(fluence.shape[0])
+                [x - flux.shape[0] / 2.0, float(flux[x].cpu().numpy())]
+                for x in range(flux.shape[0])
             ]
 
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=[d[0] for d in data], y=[d[1] for d in data], mode='lines', name='Fluence'))
-            fig.update_layout(title='Fluence vs Depth', xaxis_title='Depth', yaxis_title='Fluence', plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)')
-            self.logger.log_plot("Fluence vs Depth", fig)
+            fig.add_trace(go.Scatter(x=[d[0] for d in data], y=[d[1] for d in data], mode='lines', name='flux'))
+            fig.update_layout(title='Flux vs Depth', xaxis_title='Depth', yaxis_title='Flux', plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)')
+            self.logger.log_plot("Flux vs Depth", fig)

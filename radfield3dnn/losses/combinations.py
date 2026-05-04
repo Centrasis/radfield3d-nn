@@ -103,8 +103,8 @@ class L1L2LossWeighted(StdLossWeighted):
         return torch.mean(losses) if invalid_mask.any() else torch.mean(losses, dim=tuple(range(1, losses.ndim)))  # mean over all but batch dim
 
 
-class FluenceLoss(StdLossWeighted):
-    def __init__(self, weight_with_error: bool = False, log_scale: bool = True, ncc_loss: bool = False):
+class FluxLoss(StdLossWeighted):
+    def __init__(self, weight_with_error: bool = False, log_scale: bool = True):
         super().__init__(None, weight_with_error)
         self.ssim = StructuralSimilarity3DLoss(weight_with_error=False)
         self.mse_loss = nn.MSELoss(reduction='none')
@@ -134,7 +134,7 @@ class FluenceLoss(StdLossWeighted):
         return l1l2 * 0.66 + ssim * 0.34
 
 
-class FluenceMultiScaleLoss(StdLossWeighted):
+class FluxMultiScaleLoss(StdLossWeighted):
     def __init__(self, weight_with_error: bool = False, levels: int = 3):
         super().__init__(None, weight_with_error)
         self.l1l2 = L1L2LossWeighted(weight_with_error=weight_with_error)

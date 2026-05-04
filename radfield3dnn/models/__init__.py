@@ -34,8 +34,11 @@ class ModelConstructor:
         return model
         
     @staticmethod
-    def get_model_names():
-        return ["NeuralRadiationField", "NeDF", "DeConvFluence", "FluenceNeRF"]
+    def get_model_names() -> list[str]:
+        names = []
+        for cls in BaseNeuralRadFieldModel.__subclasses__():
+            names.append(cls.__model_name__)
+        return names
     
     @staticmethod
     def get_dataset_type_for_model(name: str) -> Union[Literal["Voxelwise"], Literal["Layerwise"]]:

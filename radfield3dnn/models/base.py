@@ -4,10 +4,9 @@ import lightning.pytorch as pl
 from torch import Tensor
 from typing import Type
 from radfield3dnn.normalizations import Normalizer, LinearNormalizer, NormalizerConstructor
-from radfield3dnn.encodings.sinusoidal_encoding import SinusoidalFrequencyEncoding, AngularSinusoidalFrequencyEncoding
+from radfield3dnn.encodings.sinusoidal_encoding import SinusoidalFrequencyEncoding
 from radfield3dnn.encodings.hash_encoding import HashGridEncoding
-from radfield3dnn.encodings.spherical_hamonics import SphericalHarmonics
-from radfield3dnn import AirKermaField, RadiationField, PositionalInput, TrainingInputData, RadiationFieldChannel, DirectionalInput, PositionalInput
+from radfield3dnn.rftypes import AirKermaField, RadiationField, PositionalInput, TrainingInputData, RadiationFieldChannel, DirectionalInput, PositionalInput
 import gc
 from rich import print
 from typing import Union
@@ -15,6 +14,7 @@ from radfield3dnn.losses.base import Loss
 from radfield3dnn.metrics.types import TrainingMetrics, ChannelMetrics
 import radfield3dnn.losses.std as std
 import radfield3dnn.losses.combinations as comb_loss
+import torch.nn.functional as F
 from radfield3dnn.activations.HistogramNormalize import HistogramNormalize
 from radfield3dnn.datasets.channel_join import ChannelsJoin
 
@@ -36,8 +36,6 @@ class ModuleBuilder:
             raise NotImplementedError("BCEWithLogitsLoss is not supported.")
         elif loss_fn_name == "SmoothL1Loss":
             raise NotImplementedError("SmoothL1Loss is not supported.")
-        elif loss_fn_name == "HuberLoss":
-            return std.HuberLoss()
         elif loss_fn_name == "L1LogLoss":
             return std.L1LossLogSpace(False)
         elif loss_fn_name == "WassersteinLoss":
@@ -56,12 +54,12 @@ class ModuleBuilder:
             return std.StructuralSimilarity3DLoss(weight_with_error=False)
         elif loss_fn_name == "MultiScaleStructuralSimilarity3DLoss":
             return std.MultiScaleStructuralSimilarity3DLoss(weight_with_error=False)
-        elif loss_fn_name == "FluenceLoss":
-            return comb_loss.FluenceLoss(weight_with_error=False, log_scale=False, ncc_loss=False)
-        elif loss_fn_name == "FluenceLogLoss":
-            return comb_loss.FluenceLoss(weight_with_error=False, log_scale=True, ncc_loss=False)
-        elif loss_fn_name == "FluenceMultiScaleLoss":
-            return comb_loss.FluenceMultiScaleLoss(weight_with_error=False)
+        elif loss_fn_name == "FluxLoss":
+            return comb_loss.FluxLoss(weight_with_error=False, log_scale=False)
+        elif loss_fn_name == "FluxLogLoss":
+            return comb_loss.FluxLoss(weight_with_error=False, log_scale=True)
+        elif loss_fn_name == "FluxMultiScaleLoss":
+            return comb_loss.FluxMultiScaleLoss(weight_with_error=False)
         else:
             raise ValueError(f"Invalid loss function name: {loss_fn_name}")
         
@@ -119,10 +117,45 @@ class ModuleBuilder:
             return SinusoidalFrequencyEncoding
         elif encoding_fn_name == "HashGridEncoding":
             return HashGridEncoding
-        elif encoding_fn_name == "SphericalHarmonics":
-            return SphericalHarmonics
         else:
             raise ValueError(f"Invalid encoding function name: {encoding_fn_name}")
+
+
+class AngularSinusoidalFrequencyEncoding(SinusoidalFrequencyEncoding):
+    def __init__(self, pos_enc_dim, append_input = False, dim = -1):
+        super().__init__(pos_enc_dim, 2, append_input, dim)
+
+    def forward(self, x):
+        assert x.shape[-1] == 3, f"Input tensor last dim should be 3, got {x.shape[-1]}"
+        x = AngularSinusoidalFrequencyEncoding.map_direction_vector2spherical_coords(x)
+        return super().forward(x)
+    
+    @staticmethod
+    def map_direction_vector2spherical_coords(direction: Tensor) -> Tensor:
+        """Convert direction vectors (x,y,z) to spherical coordinates (theta, phi).
+        This version uses torch.atan2 for better numerical stability.
+        Args:
+            direction: Tensor of shape (..., 3) containing cartesian direction vectors
+        Returns:
+            Tensor of shape (..., 2) containing spherical coordinates (theta, phi)
+        """
+        # Normalize the vectors
+        direction = F.normalize(direction, dim=-1, p=2)
+        
+        # Extract x, y, z components
+        x, y, z = direction[..., 0], direction[..., 1], direction[..., 2]
+        
+        # Convert to spherical coordinates
+        # theta: angle from z-axis (0 to π)
+        # phi: angle in xy-plane from x-axis (0 to 2π)
+        theta = torch.acos(torch.clamp(z, -1.0 + 1e-8, 1.0 - 1e-8))
+        phi = torch.atan2(y, x)
+        
+        # Normalize to [0, 1] range for more stable training
+        theta = theta / torch.pi
+        phi = (phi + torch.pi) / (2 * torch.pi)
+        
+        return torch.stack([theta, phi], dim=-1)
 
 
 class BaseNeuralRadFieldModel(pl.LightningModule):
@@ -131,13 +164,16 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
     lr = property(lambda x: x.get_lr(), lambda x, v: x.set_lr(v))
     learning_rate = property(lambda x: x.get_lr(), lambda x, v: x.set_lr(v))
 
-    def __init__(self, normalizer: Union[Normalizer, str] = LinearNormalizer(), learning_rate: float=1e-3):
+    def __init__(self, location_encoding_dims=10, direction_encoding_dims=4, d_model=256, normalizer: Union[Normalizer, str] = LinearNormalizer(), learning_rate: float=1e-3):
         super().__init__()
         self.logging_prefix = ""
         
+        self.positional_location_encoding = SinusoidalFrequencyEncoding(location_encoding_dims, 3, append_input=True)
+        self.positional_direction_encoding = AngularSinusoidalFrequencyEncoding(direction_encoding_dims, append_input=True)
+        self.d_model = d_model
         self._lr = learning_rate
-        self._fluence_loss_fn: Loss = comb_loss.FluenceLoss(weight_with_error=False)
-        self._spectrum_loss_fn: Loss = comb_loss.HistogramLoss(bin_dim=1) # comb_loss.HistogramLoss(bin_dim=1, weight_with_error=False, penalize_out_of_range=False) # std.KLDivLossWeighted(True)
+        self._flux_loss_fn: Loss = comb_loss.FluxLoss(weight_with_error=False)
+        self._spectrum_loss_fn: Loss = comb_loss.HistogramLoss(bin_dim=1, weight_with_error=False, penalize_out_of_range=False)
         self._normalizer = normalizer if not isinstance(normalizer, str) else NormalizerConstructor.construct_by_name(normalizer)
         self.max_inner_batch_size = None
         self.indices: Tensor = None
@@ -145,10 +181,7 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
         self.batch_size = 1
         self._channels_join = ChannelsJoin()
         assert isinstance(self._normalizer, Normalizer), f"normalizer must be an instance of Normalizer, got {type(self._normalizer)}"
-        self.save_hyperparameters(ignore=["indices", "grid_dims", "_fluence_loss_fn", "_spectrum_loss_fn", "normalizer", "_channels_join"])
-
-    def get_core_model(self) -> nn.Module:
-        raise NotImplementedError("Please implement get_core_model()")
+        self.save_hyperparameters(ignore=["indices", "grid_dims", "_flux_loss_fn", "_spectrum_loss_fn", "normalizer", "_channels_join"])
 
     def _generate_random_ground_truth(self, device) -> RadiationField:
         input = self._generate_random_input(device=device)
@@ -169,6 +202,12 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
         )
 
     def _search_optimal_batch_size(self):
+        """
+        This method will simulate mutliple iterations of this network using a forward and a backward pass with incresing the batch size each.
+        Thus, this method will execute the model for n² batch sizes until a CUDA out of memory error occurs or the memory is filled to 90% capacity.
+        The biggest possible batch size will be stored to self.max_inner_batch_size.
+        NOTE: In order to skip the execution of this method set max_inner_batch_size to a value != None and > 0.
+        """
         print(f"[yellow]Try finding max inner batch_size...")
         self.max_inner_batch_size = 2
         device = next(self.parameters()).device
@@ -180,13 +219,13 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
         y_base = RadiationField(
             scatter_field=RadiationFieldChannel(
                 spectrum=y_base.scatter_field.spectrum[0] if y_base.scatter_field.spectrum is not None else None,
-                fluence=y_base.scatter_field.fluence[0],
-                error=torch.zeros_like(y_base.scatter_field.fluence[0])
+                flux=y_base.scatter_field.flux[0],
+                error=torch.zeros_like(y_base.scatter_field.flux[0])
             ),
-            xray_beam=RadiationFieldChannel(
+            direct_beam=RadiationFieldChannel(
                 spectrum=y_base.scatter_field.spectrum[0] if y_base.scatter_field.spectrum is not None else None,
-                fluence=y_base.scatter_field.fluence[0],
-                error=torch.zeros_like(y_base.scatter_field.fluence[0])
+                flux=y_base.scatter_field.flux[0],
+                error=torch.zeros_like(y_base.scatter_field.flux[0])
             )
         )
         train_in = TrainingInputData(
@@ -194,39 +233,39 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
             ground_truth=y_base
         )
 
-        # calculate scaling factor for the spectra and fluence loss functions
+        # calculate scaling factor for the spectra and flux loss functions
         num_losses = 1000
         if y_base.scatter_field.spectrum is not None:
             random_spectra1 = torch.rand((num_losses, y_base.scatter_field.spectrum.shape[0]), device=device)
             random_spectra1 = random_spectra1 / random_spectra1.sum(dim=1, keepdim=True)
         else:
             random_spectra1 = None
-        random_fluence1 = torch.rand((num_losses, 1), device=device)
+        random_flux1 = torch.rand((num_losses, 1), device=device)
         if y_base.scatter_field.spectrum is not None:
             random_spectra2 = torch.rand((num_losses, y_base.scatter_field.spectrum.shape[0]), device=device)
             random_spectra2 = random_spectra2 / random_spectra2.sum(dim=1, keepdim=True)
         else:
             random_spectra2 = None
-        random_fluence2 = torch.rand((num_losses, 1), device=device)
+        random_flux2 = torch.rand((num_losses, 1), device=device)
 
         loss_test_in = TrainingInputData(
             input=train_in.input,
             ground_truth=RadiationField(
                 scatter_field=RadiationFieldChannel(
                     spectrum=random_spectra1,
-                    fluence=random_fluence1,
-                    error=torch.zeros_like(random_fluence1)
+                    flux=random_flux1,
+                    error=torch.zeros_like(random_flux1)
                 ),
-                xray_beam=RadiationFieldChannel(
+                direct_beam=RadiationFieldChannel(
                     spectrum=random_spectra2,
-                    fluence=random_fluence2,
-                    error=torch.zeros_like(random_fluence2)
+                    flux=random_flux2,
+                    error=torch.zeros_like(random_flux2)
                 )
             )
         )
 
         _ = self._spectrum_loss_fn.forward(prediction=random_spectra1, target=random_spectra2, input=loss_test_in) if random_spectra1 is not None else torch.tensor(0.0, device=device)
-        _ = self._fluence_loss_fn.forward(prediction=random_fluence1, target=random_fluence2, input=loss_test_in) 
+        _ = self._flux_loss_fn.forward(prediction=random_flux1, target=random_flux2, input=loss_test_in) 
 
         while True:
             try:
@@ -238,30 +277,30 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
 
                 scatter_channel = RadiationFieldChannel(
                     spectrum=y_base.scatter_field.spectrum,
-                    fluence=y_base.scatter_field.fluence,
+                    flux=y_base.scatter_field.flux,
                     error=y_base.scatter_field.error
                 )
                 xray_channel = RadiationFieldChannel(
-                    spectrum=y_base.xray_beam.spectrum,
-                    fluence=y_base.xray_beam.fluence,
-                    error=y_base.xray_beam.error
-                ) if y_base.xray_beam is not None else scatter_channel
+                    spectrum=y_base.direct_beam.spectrum,
+                    flux=y_base.direct_beam.flux,
+                    error=y_base.direct_beam.error
+                ) if y_base.direct_beam is not None else scatter_channel
                 y = RadiationField(
                     scatter_field=scatter_channel,
-                    xray_beam=xray_channel,
-                    geometry=torch.zeros_like(y_base.scatter_field.fluence) if y_base.geometry is not None else None
+                    direct_beam=xray_channel,
+                    geometry=torch.zeros_like(y_base.scatter_field.flux) if y_base.geometry is not None else None
                 )
                 batch_size = self.max_inner_batch_size * 2
-                y_scatter_flu = y.scatter_field.fluence
+                y_scatter_flu = y.scatter_field.flux
                 y_scatter_spec = y.scatter_field.spectrum
-                y_xray_flu = y.xray_beam.fluence
-                y_xray_spec = y.xray_beam.spectrum
+                y_xray_flu = y.direct_beam.flux
+                y_xray_spec = y.direct_beam.spectrum
                 if y.scatter_field.spectrum is not None:
                     y_scatter_spec = y.scatter_field.spectrum.unsqueeze(0)
-                    y_xray_spec = y.xray_beam.spectrum.unsqueeze(0)
+                    y_xray_spec = y.direct_beam.spectrum.unsqueeze(0)
 
-                y_scatter_flu = y.scatter_field.fluence.unsqueeze(0)
-                y_xray_flu = y.xray_beam.fluence.unsqueeze(0)
+                y_scatter_flu = y.scatter_field.flux.unsqueeze(0)
+                y_xray_flu = y.direct_beam.flux.unsqueeze(0)
 
                 xray_err = torch.rand_like(y_xray_flu).expand(batch_size, *([-1] * (len(y_xray_flu.shape) - 1)))
                 if len(xray_err.shape) == 1:
@@ -272,12 +311,12 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
                 y = RadiationField(
                     scatter_field=RadiationFieldChannel(
                         spectrum=y_scatter_spec.expand(batch_size, *([-1] * (len(y_scatter_spec.shape) - 1))) if y_scatter_spec is not None else None,
-                        fluence=y_scatter_flu.expand(batch_size, *([-1] * (len(y_scatter_flu.shape) - 1))),
+                        flux=y_scatter_flu.expand(batch_size, *([-1] * (len(y_scatter_flu.shape) - 1))),
                         error=scatter_err
                     ),
-                    xray_beam=RadiationFieldChannel(
+                    direct_beam=RadiationFieldChannel(
                         spectrum=y_xray_spec.expand(batch_size, *([-1] * (len(y_xray_spec.shape) - 1))) if y_xray_spec is not None else None,
-                        fluence=y_xray_flu.expand(batch_size, *([-1] * (len(y_xray_flu.shape) - 1))),
+                        flux=y_xray_flu.expand(batch_size, *([-1] * (len(y_xray_flu.shape) - 1))),
                         error=xray_err
                     ),
                     geometry=torch.zeros_like(y_scatter_flu).expand(batch_size, *([-1] * (len(y_scatter_flu.shape) - 1))) if y.geometry is not None else None
@@ -376,33 +415,33 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
         Creates a new RadiationField with the same structure as the provided field, but with new and empty tensors.
         Args:
             field (RadiationField): The RadiationField to use as a template. Field shall not have a batch dimension.
-            batch_size (int, optional): If provided, the new RadiationField will have this batch size. If None, the batch size will be inferred from the field's fluence tensor shape.
+            batch_size (int, optional): If provided, the new RadiationField will have this batch size. If None, the batch size will be inferred from the field's flux tensor shape.
         Raises:
-            AssertionError: If the scatter_field.fluence tensor is not 4D (i.e., not batched).
+            AssertionError: If the scatter_field.flux tensor is not 4D (i.e., not batched).
         Returns:
             RadiationField: A new RadiationField with empty tensors.
         """
-        assert len(field.scatter_field.fluence.shape) == 4, "The scatter_field.fluence must be a 4D tensor (not batched)."
+        assert len(field.scatter_field.flux.shape) == 4, "The scatter_field.flux must be a 4D tensor (not batched)."
 
-        fluence_field_shape = [batch_size] + list(field.scatter_field.fluence.shape) if batch_size is not None else list(field.scatter_field.fluence.shape)
+        flux_field_shape = [batch_size] + list(field.scatter_field.flux.shape) if batch_size is not None else list(field.scatter_field.flux.shape)
         spectrum_field_shape = [batch_size] + list(field.scatter_field.spectrum.shape) if field.scatter_field.spectrum is not None and batch_size is not None else list(field.scatter_field.spectrum.shape) if field.scatter_field.spectrum is not None else None
         error_field_shape = [batch_size] + list(field.scatter_field.error.shape) if field.scatter_field.error is not None and batch_size is not None else list(field.scatter_field.error.shape) if field.scatter_field.error is not None else None
         return RadiationField(
             scatter_field=RadiationFieldChannel(
                 spectrum=torch.empty(spectrum_field_shape, dtype=field.scatter_field.spectrum.dtype, device=field.scatter_field.spectrum.device) if field.scatter_field.spectrum is not None else None,
-                fluence=torch.empty(fluence_field_shape, dtype=field.scatter_field.fluence.dtype, device=field.scatter_field.fluence.device) if field.scatter_field.fluence is not None else None,
+                flux=torch.empty(flux_field_shape, dtype=field.scatter_field.flux.dtype, device=field.scatter_field.flux.device) if field.scatter_field.flux is not None else None,
                 error=torch.empty(error_field_shape, dtype=field.scatter_field.error.dtype, device=field.scatter_field.error.device) if field.scatter_field.error is not None else None
             ) if field.scatter_field is not None else None,
-            xray_beam=RadiationFieldChannel(
-                spectrum=torch.empty(spectrum_field_shape, dtype=field.xray_beam.spectrum.dtype, device=field.xray_beam.spectrum.device) if field.xray_beam.spectrum is not None else None,
-                fluence= torch.empty(fluence_field_shape, dtype=field.xray_beam.fluence.dtype, device=field.xray_beam.fluence.device) if field.xray_beam.fluence is not None else None,
-                error=torch.empty(error_field_shape, dtype=field.xray_beam.error.dtype, device=field.xray_beam.error.device) if field.xray_beam.error is not None else None
-            ) if field.xray_beam is not None else None,
-            geometry=torch.empty(fluence_field_shape, dtype=field.geometry.dtype, device=field.geometry.device) if field.geometry is not None else None
+            direct_beam=RadiationFieldChannel(
+                spectrum=torch.empty(spectrum_field_shape, dtype=field.direct_beam.spectrum.dtype, device=field.direct_beam.spectrum.device) if field.direct_beam.spectrum is not None else None,
+                flux= torch.empty(flux_field_shape, dtype=field.direct_beam.flux.dtype, device=field.direct_beam.flux.device) if field.direct_beam.flux is not None else None,
+                error=torch.empty(error_field_shape, dtype=field.direct_beam.error.dtype, device=field.direct_beam.error.device) if field.direct_beam.error is not None else None
+            ) if field.direct_beam is not None else None,
+            geometry=torch.empty(flux_field_shape, dtype=field.geometry.dtype, device=field.geometry.device) if field.geometry is not None else None
         )
 
     def forward2volume_from_training_input(self, batch: TrainingInputData, voxel_counts: Tensor = None, spectra_bins: int = 32) -> RadiationField:
-        sample_field = batch.ground_truth.scatter_field.fluence if isinstance(batch.ground_truth, RadiationField) else (batch.ground_truth.fluence if isinstance(batch.ground_truth, RadiationFieldChannel) else batch.ground_truth.air_kerma)
+        sample_field = batch.ground_truth.scatter_field.flux if isinstance(batch.ground_truth, RadiationField) else (batch.ground_truth.flux if isinstance(batch.ground_truth, RadiationFieldChannel) else batch.ground_truth.air_kerma)
         is_complete_volume = (sample_field is not None) and (len(sample_field.shape) == 4 or (len(sample_field.shape) == 5 and sample_field.shape[1] == 1))
         if is_complete_volume:
             if len(sample_field.shape) == 5 and sample_field.shape[1] == 1:
@@ -417,11 +456,11 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
 
         drop_mask = None
         if isinstance(batch.ground_truth, RadiationField):
-            drop_mask = torch.isneginf(batch.ground_truth.scatter_field.fluence)
-            if batch.ground_truth.xray_beam is not None and batch.ground_truth.xray_beam.fluence is not None:
-                drop_mask = drop_mask | torch.isneginf(batch.ground_truth.xray_beam.fluence)
+            drop_mask = torch.isneginf(batch.ground_truth.scatter_field.flux)
+            if batch.ground_truth.direct_beam is not None and batch.ground_truth.direct_beam.flux is not None:
+                drop_mask = drop_mask | torch.isneginf(batch.ground_truth.direct_beam.flux)
         elif isinstance(batch.ground_truth, RadiationFieldChannel):
-            drop_mask = torch.isneginf(batch.ground_truth.fluence)
+            drop_mask = torch.isneginf(batch.ground_truth.flux)
         elif isinstance(batch.ground_truth, AirKermaField):
             drop_mask = torch.isneginf(batch.ground_truth.air_kerma)
         else:
@@ -461,9 +500,9 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
         x = batch.input
         self.batch_size = int(x.direction.shape[0])
         if isinstance(y, RadiationField) or isinstance(y, RadiationFieldChannel):
-            has_multi_channel = y.xray_beam is not None if isinstance(y, RadiationField) else False
+            has_multi_channel = y.direct_beam is not None if isinstance(y, RadiationField) else False
             scatter_field_gt = y.scatter_field if isinstance(y, RadiationField) else y
-            is_complete_volume = (len(scatter_field_gt.fluence.shape) == 4 or (len(scatter_field_gt.fluence.shape) == 5 and scatter_field_gt.fluence.shape[1] == 1)) and len(scatter_field_gt.spectrum.shape) == 5
+            is_complete_volume = (len(scatter_field_gt.flux.shape) == 4 or (len(scatter_field_gt.flux.shape) == 5 and scatter_field_gt.flux.shape[1] == 1)) and len(scatter_field_gt.spectrum.shape) == 5
         elif isinstance(y, AirKermaField):
             has_multi_channel = False
             is_complete_volume = (len(y.air_kerma.shape) == 4 or (len(y.air_kerma.shape) == 5 and y.air_kerma.shape[1] == 1))
@@ -477,25 +516,25 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
             pred_field: RadiationField | AirKermaField = self(x)
 
         if isinstance(y, RadiationField) or isinstance(y, RadiationFieldChannel):
-            if has_multi_channel and (pred_field.scatter_field is None and pred_field.xray_beam is None):
-                raise ValueError("The model should not return both scatter_field and xray_beam in the same forward pass when has_multi_channel is True.")
-            elif not has_multi_channel and ((pred_field.scatter_field is not None) and (pred_field.xray_beam is not None)):
-                raise ValueError("The model should return either scatter_field or xray_beam, but not both when has_multi_channel is False.")
+            if has_multi_channel and (pred_field.scatter_field is None and pred_field.direct_beam is None):
+                raise ValueError("The model should not return both scatter_field and direct_beam in the same forward pass when has_multi_channel is True.")
+            elif not has_multi_channel and ((pred_field.scatter_field is not None) and (pred_field.direct_beam is not None)):
+                raise ValueError("The model should return either scatter_field or direct_beam, but not both when has_multi_channel is False.")
 
         return self.calculate_metrics(pred_field, y, batch)
 
-    def calculate_metrics(self, pred_field: RadiationField | AirKermaField, y: RadiationField | AirKermaField, batch: TrainingInputData, ignore_scatter: bool = False, ignore_xray_beam: bool = False) -> TrainingMetrics:
+    def calculate_metrics(self, pred_field: RadiationField | AirKermaField, y: RadiationField | AirKermaField, batch: TrainingInputData, ignore_scatter: bool = False, ignore_direct_beam: bool = False) -> TrainingMetrics:
         scatter_metrics: ChannelMetrics = None
-        xray_metrics: ChannelMetrics = None
+        direct_beam_metrics: ChannelMetrics = None
 
         if isinstance(pred_field, RadiationField):
-            has_multi_channel = y.xray_beam is not None if isinstance(y, RadiationField) else False
+            has_multi_channel = y.direct_beam is not None if isinstance(y, RadiationField) else False
             scatter_field_gt = y.scatter_field if isinstance(y, RadiationField) else y
 
-            if not has_multi_channel and (pred_field.scatter_field is not None and pred_field.xray_beam is not None):
-                raise ValueError("The model should return either scatter_field or xray_beam, but not both when has_multi_channel is False.")
+            if not has_multi_channel and (pred_field.scatter_field is not None and pred_field.direct_beam is not None):
+                raise ValueError("The model should return either scatter_field or direct_beam, but not both when has_multi_channel is False.")
             
-            if has_multi_channel and (pred_field.scatter_field is None or pred_field.xray_beam is None):
+            if has_multi_channel and (pred_field.scatter_field is None or pred_field.direct_beam is None):
                 # if network is only predicting one channel, join channels for loss calculation
                 batch = self._normalizer.inverse(batch)
                 y = self._normalizer.inverse(y)
@@ -506,15 +545,15 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
                 scatter_field_gt = y
                 has_multi_channel = False
 
-            if pred_field.xray_beam is not None and has_multi_channel and not ignore_xray_beam:
+            if pred_field.direct_beam is not None and has_multi_channel and not ignore_direct_beam:
                 loss_spec = None
-                if pred_field.xray_beam.spectrum is not None:
-                    loss_spec = self._spectrum_loss_fn.forward(prediction=pred_field.xray_beam.spectrum, target=y.xray_beam.spectrum, input=batch)
+                if pred_field.direct_beam.spectrum is not None:
+                    loss_spec = self._spectrum_loss_fn.forward(prediction=pred_field.direct_beam.spectrum, target=y.direct_beam.spectrum, input=batch)
 
-                loss_fluence = self._fluence_loss_fn.forward(prediction=pred_field.xray_beam.fluence, target=y.xray_beam.fluence, input=batch)
+                loss_flux = self._flux_loss_fn.forward(prediction=pred_field.direct_beam.flux, target=y.direct_beam.flux, input=batch)
 
-                xray_metrics = ChannelMetrics(
-                    fluence_loss=loss_fluence,
+                direct_beam_metrics = ChannelMetrics(
+                    flux_loss=loss_flux,
                     spectrum_loss=loss_spec if loss_spec is not None else None,
                 )
 
@@ -526,28 +565,28 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
                         print(f"[red] Spectrum loss is not finite. Setting to 1.")
                         raise ValueError("Spectrum loss is not finite.")
 
-                loss_fluence = self._fluence_loss_fn.forward(prediction=pred_field.scatter_field.fluence, target=scatter_field_gt.fluence, input=batch)
+                loss_flux = self._flux_loss_fn.forward(prediction=pred_field.scatter_field.flux, target=scatter_field_gt.flux, input=batch)
 
-                if not torch.isfinite(loss_fluence).all():
-                    print(f"[red] Fluence loss is not finite. Setting to 1.")
-                    raise ValueError("Fluence loss is not finite.")
+                if not torch.isfinite(loss_flux).all():
+                    print(f"[red] Flux loss is not finite. Setting to 1.")
+                    raise ValueError("Flux loss is not finite.")
 
-                if xray_metrics is not None and y.xray_beam is not None:
-                    sum_fluence_ratio = y.xray_beam.fluence.sum() / scatter_field_gt.fluence.sum()
-                    loss_fluence = loss_fluence * sum_fluence_ratio
+                if direct_beam_metrics is not None and y.direct_beam is not None:
+                    sum_flux_ratio = y.direct_beam.flux.sum() / scatter_field_gt.flux.sum()
+                    loss_flux = loss_flux * sum_flux_ratio
 
                 scatter_metrics = ChannelMetrics(
-                    fluence_loss=loss_fluence,
+                    flux_loss=loss_flux,
                     spectrum_loss=loss_spec
                 )
 
             return TrainingMetrics(
                 scatter_field=scatter_metrics,
-                xray_beam=xray_metrics
+                direct_beam=direct_beam_metrics
             )
         elif isinstance(pred_field, AirKermaField):
             assert isinstance(y, AirKermaField), "Ground truth must be of type AirKermaField when predicting AirKermaField."
-            loss_airkerma = self._fluence_loss_fn.forward(prediction=pred_field.air_kerma, target=y.air_kerma, input=batch)
+            loss_airkerma = self._flux_loss_fn.forward(prediction=pred_field.air_kerma, target=y.air_kerma, input=batch)
             return TrainingMetrics(
                 airkerma_field=loss_airkerma
             )
@@ -563,21 +602,21 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
 
         on_step = not on_epoch
         if metrics.scatter_field is not None:
-            total_loss = metrics.scatter_field.fluence_loss
+            total_loss = metrics.scatter_field.flux_loss
             if metrics.scatter_field.spectrum_loss is not None:
                 loss_weight = 0.5
                 total_loss = total_loss * loss_weight + metrics.scatter_field.spectrum_loss * (1 - loss_weight)
                 self.log(f'{stage}_scatter_spectrum_loss', metrics.scatter_field.spectrum_loss.mean(), on_epoch=on_epoch, on_step=on_step, logger=True, batch_size=self.batch_size)
-            self.log(f'{stage}_scatter_fluence_loss', metrics.scatter_field.fluence_loss.mean(), on_epoch=on_epoch, on_step=on_step, logger=True, batch_size=self.batch_size)
+            self.log(f'{stage}_scatter_flux_loss', metrics.scatter_field.flux_loss.mean(), on_epoch=on_epoch, on_step=on_step, logger=True, batch_size=self.batch_size)
 
-        if metrics.xray_beam is not None:
-            if metrics.xray_beam.spectrum_loss is not None:
+        if metrics.direct_beam is not None:
+            if metrics.direct_beam.spectrum_loss is not None:
                 loss_weight = 0.5
-                total_loss = total_loss + metrics.xray_beam.fluence_loss * loss_weight + metrics.xray_beam.spectrum_loss * (1 - loss_weight)
-                self.log(f'{stage}_xray_beam_spectrum_loss', metrics.xray_beam.spectrum_loss.mean(), on_epoch=on_epoch, on_step=on_step, logger=True, batch_size=self.batch_size)
+                total_loss = total_loss + metrics.direct_beam.flux_loss * loss_weight + metrics.direct_beam.spectrum_loss * (1 - loss_weight)
+                self.log(f'{stage}_direct_beam_spectrum_loss', metrics.direct_beam.spectrum_loss.mean(), on_epoch=on_epoch, on_step=on_step, logger=True, batch_size=self.batch_size)
             else:
-                total_loss = total_loss + metrics.xray_beam.fluence_loss
-            self.log(f'{stage}_xray_beam_fluence_loss', metrics.xray_beam.fluence_loss.mean(), on_epoch=on_epoch, on_step=on_step, logger=True, batch_size=self.batch_size)
+                total_loss = total_loss + metrics.direct_beam.flux_loss
+            self.log(f'{stage}_direct_beam_flux_loss', metrics.direct_beam.flux_loss.mean(), on_epoch=on_epoch, on_step=on_step, logger=True, batch_size=self.batch_size)
 
         if metrics.airkerma_field is not None:
             total_loss = total_loss + metrics.airkerma_field

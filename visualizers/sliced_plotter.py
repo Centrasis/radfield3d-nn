@@ -53,7 +53,7 @@ class SlicedAirkermaPlotter(object):
             else:
                 field: RadiationFieldChannel | AirKermaField = self.channels_join.join_channels(field) if isinstance(field, RadiationField) else field
                 if isinstance(field, RadiationFieldChannel):
-                    airkerma = self.airkerma_calc.calc_airkerma(field.spectrum, field.fluence).detach()
+                    airkerma = self.airkerma_calc.calc_airkerma(field.spectrum, field.flux).detach()
                 elif isinstance(field, AirKermaField):
                     airkerma = field.air_kerma.detach()
                 else:

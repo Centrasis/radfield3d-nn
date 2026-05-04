@@ -32,6 +32,6 @@ setup(
    python_requires='>=3.12',
    license=open(os.path.join(os.path.dirname(__file__), "LICENSE")).read(),
    description="Implementation of neural networks for estimating spatially resolved radiation fields. The training pipeline is based on RadFiled3D datasets.",
-   long_description=open(os.path.join(os.path.dirname(__file__), "README.md")).read(),
+   long_description=open(os.path.join(os.path.dirname(__file__), "ReadMe.md")).read(),
    long_description_content_type="text/markdown"
 )

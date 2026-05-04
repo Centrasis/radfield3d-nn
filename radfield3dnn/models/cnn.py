@@ -1,13 +1,14 @@
 import torch
 import torch.nn as nn
 from torch import Tensor
+import os
 from radfield3dnn.normalizations.linear import LinearNormalizer
-from .base import BaseNeuralRadFieldModel
 from typing import Type
-from radfield3dnn import RadiationField, RadiationFieldChannel, TrainingInputData
+from radfield3dnn.rftypes import RadiationField, RadiationFieldChannel, TrainingInputData
+from radfield3dnn.models.base import BaseNeuralRadFieldModel
 from radfield3dnn.activations.HistogramNormalize import HistogramNormalize
 from RadFiled3D.pytorch.types import PositionalInput
-from radfield3dnn.activations.fluence_activations import GradientConservingClamping
+from radfield3dnn.activations.flux_activations import GradientConservingClamping
 from radfield3dnn.models.encoders.spectra_encoder import SimpleSpectraEncoder
 from radfield3dnn.layers.film import FiLM
 
@@ -86,7 +87,7 @@ class ConvBlock3D(nn.Module):
         return self.block(x)
 
 
-class ConvBase(BaseNeuralRadFieldModel):
+class DeConvBase(BaseNeuralRadFieldModel):
     def __init__(self, pos_enc_dim=10, d_model=256, spectra_bins: int = 150, out_dims: tuple[int, int, int] = (50, 50, 50), learning_rate: float = 1e-3, normalizer = None):
         super().__init__(direction_encoding_dims=pos_enc_dim, d_model=d_model, learning_rate=learning_rate, normalizer=normalizer)
         self.spectra_bins = spectra_bins
@@ -97,11 +98,11 @@ class ConvBase(BaseNeuralRadFieldModel):
         if not isinstance(batch, TrainingInputData):
             return self._generate_random_ground_truth(batch.direction.device)[:batch.direction.shape[0]]
 
-        voxel_counts = batch.ground_truth.scatter_field.fluence.shape[2:] if isinstance(batch.ground_truth, RadiationField) else batch.ground_truth.fluence.shape[2:]
+        voxel_counts = batch.ground_truth.scatter_field.flux.shape[2:] if isinstance(batch.ground_truth, RadiationField) else batch.ground_truth.flux.shape[2:]
         spectra_bins = batch.ground_truth.scatter_field.spectrum.shape[1] if isinstance(batch.ground_truth, RadiationField) else batch.ground_truth.spectrum.shape[1]
 
-        gt_fluence = (batch.ground_truth.scatter_field.fluence + (batch.ground_truth.xray_beam.fluence if batch.ground_truth.xray_beam is not None else 0.0) if isinstance(batch.ground_truth, RadiationField) else batch.ground_truth.fluence)
-        mask = ~torch.isfinite(gt_fluence)
+        gt_flux = (batch.ground_truth.scatter_field.flux + (batch.ground_truth.direct_beam.flux if batch.ground_truth.direct_beam is not None else 0.0) if isinstance(batch.ground_truth, RadiationField) else batch.ground_truth.flux)
+        mask = ~torch.isfinite(gt_flux)
         if not mask.any():
             mask = None
 
@@ -191,20 +192,20 @@ class ConvBase(BaseNeuralRadFieldModel):
         pred_field: RadiationField = self(x)
 
         if mask is not None:
-            inf_fluence = torch.full_like(pred_field.scatter_field.fluence, -torch.inf)
+            inf_flux = torch.full_like(pred_field.scatter_field.flux, -torch.inf)
             inf_spectrum = torch.full_like(pred_field.scatter_field.spectrum, -torch.inf)
             spec_mask = mask.unsqueeze(1).expand_as(pred_field.scatter_field.spectrum) if len(mask.shape) == 4 else mask.expand_as(pred_field.scatter_field.spectrum)
             pred_field = RadiationField(
                 scatter_field=RadiationFieldChannel(
                     spectrum=torch.where(spec_mask, inf_spectrum, pred_field.scatter_field.spectrum) if mask is not None else pred_field.scatter_field.spectrum,
-                    fluence=torch.where(mask, inf_fluence, pred_field.scatter_field.fluence) if mask is not None else pred_field.scatter_field.fluence,
+                    flux=torch.where(mask, inf_flux, pred_field.scatter_field.flux) if mask is not None else pred_field.scatter_field.flux,
                     error=pred_field.scatter_field.error
                 ),
-                xray_beam=RadiationFieldChannel(
-                    spectrum=torch.where(spec_mask, inf_spectrum, pred_field.xray_beam.spectrum) if mask is not None else pred_field.xray_beam.spectrum,
-                    fluence=torch.where(mask, inf_fluence, pred_field.xray_beam.fluence) if mask is not None else pred_field.xray_beam.fluence,
-                    error=pred_field.xray_beam.error
-                ) if pred_field.xray_beam is not None else None,
+                direct_beam=RadiationFieldChannel(
+                    spectrum=torch.where(spec_mask, inf_spectrum, pred_field.direct_beam.spectrum) if mask is not None else pred_field.direct_beam.spectrum,
+                    flux=torch.where(mask, inf_flux, pred_field.direct_beam.flux) if mask is not None else pred_field.direct_beam.flux,
+                    error=pred_field.direct_beam.error
+                ) if pred_field.direct_beam is not None else None,
                 geometry=pred_field.geometry
             )
 
@@ -228,7 +229,7 @@ class ConvBase(BaseNeuralRadFieldModel):
         }
 
 
-class Beam2ScatterUNet(ConvBase):
+class Beam2ScatterUNet(DeConvBase):
     __model_name__ = "Beam2ScatterUNet"
 
     def __init__(self, d_model: int = 256, out_spectra_bins: int = 32, in_spectra_bins: int = 32, out_dims: tuple[int, int, int] = (50, 50, 50), learning_rate: float = 1e-3, normalizer=None, use_spectra: bool = True):
@@ -248,14 +249,14 @@ class Beam2ScatterUNet(ConvBase):
         self.spectra_activation = HistogramNormalize(dim=-1)
         if issubclass(self._normalizer.__class__, LinearNormalizer):
             if self._normalizer.range[0] == -1.0 and self._normalizer.range[1] == 1.0:
-                self.fluence_activation = GradientConservingClamping(-1.0, 1.0) #SmoothedTanh() # nn.Softplus()  # to allow for high dynamic range
+                self.flux_activation = GradientConservingClamping(-1.0, 1.0) #SmoothedTanh() # nn.Softplus()  # to allow for high dynamic range
             elif self._normalizer.range[0] == 0.0 and self._normalizer.range[1] == 1.0:
-                self.fluence_activation = nn.Sigmoid()
+                self.flux_activation = nn.Sigmoid()
             else:
                 raise ValueError(f"Unsupported normalization range for LinearNormalizer: {self._normalizer.range}")
         else:
-            print(f"Warning: Using default fluence activation (0.0, 1.0) clamping for unknown normalizer: {self._normalizer.__class__}.")
-            self.fluence_activation = GradientConservingClamping(0.0, 1.0)
+            print(f"Warning: Using default flux activation (0.0, 1.0) clamping for unknown normalizer: {self._normalizer.__class__}.")
+            self.flux_activation = GradientConservingClamping(0.0, 1.0)
 
         self.apply(self._init_weights)
 
@@ -284,12 +285,12 @@ class Beam2ScatterUNet(ConvBase):
         return RadiationField(
             scatter_field=RadiationFieldChannel(
                 spectrum=torch.randn(2, self.out_spectra_bins, *self.out_dims, device=device),
-                fluence=torch.randn(2, 1, *self.out_dims, device=device),
+                flux=torch.randn(2, 1, *self.out_dims, device=device),
                 error=torch.randn(2, 1, *self.out_dims, device=device)
             ),
-            xray_beam=RadiationFieldChannel(
+            direct_beam=RadiationFieldChannel(
                 spectrum=torch.randn(2, self.out_spectra_bins, *self.out_dims, device=device),
-                fluence=torch.randn(2, 1, *self.out_dims, device=device),
+                flux=torch.randn(2, 1, *self.out_dims, device=device),
                 error=torch.randn(2, 1, *self.out_dims, device=device)
             )
         )
@@ -314,18 +315,18 @@ class Beam2ScatterUNet(ConvBase):
     def forward(self, batch: TrainingInputData) -> RadiationField:
         assert isinstance(batch.ground_truth, RadiationField), "Ground truth must be of type RadiationField. Disable channel joining."
         next_power_of_two = lambda x: 1 << (x - 1).bit_length()
-        padding_target_dims = torch.tensor(tuple(next_power_of_two(dim) for dim in batch.ground_truth.xray_beam.fluence.shape[2:]), device=batch.input.direction.device)
-        padding_difference = padding_target_dims - torch.tensor(batch.ground_truth.xray_beam.fluence.shape[2:], device=batch.input.direction.device)
+        padding_target_dims = torch.tensor(tuple(next_power_of_two(dim) for dim in batch.ground_truth.direct_beam.flux.shape[2:]), device=batch.input.direction.device)
+        padding_difference = padding_target_dims - torch.tensor(batch.ground_truth.direct_beam.flux.shape[2:], device=batch.input.direction.device)
         padding_l = padding_difference // 2
         padding_r = padding_difference - padding_l
 
-        padded_xray_fluence = nn.functional.pad(batch.ground_truth.xray_beam.fluence, (
+        padded_xray_flux = nn.functional.pad(batch.ground_truth.direct_beam.flux, (
             padding_l[2], padding_r[2], padding_l[1], padding_r[1], padding_l[0], padding_r[0]
         ), mode='constant', value=0.0)
         voxel_map = self.generate_voxelmap3d(padding_target_dims, None, batch.input.direction.device)
         voxel_map = (voxel_map * 2.0) - 1.0  # Normalize to [-1, 1]
         voxel_map = voxel_map.unsqueeze(0).expand(batch.input.direction.shape[0], -1, -1, -1, -1).permute(0, 4, 1, 2, 3)
-        x = torch.cat([padded_xray_fluence, voxel_map], dim=1)
+        x = torch.cat([padded_xray_flux, voxel_map], dim=1)
         if self.use_spectra:
             spectra = self.spectra_encoder(batch.input.spectrum)
         results = []
@@ -347,7 +348,7 @@ class Beam2ScatterUNet(ConvBase):
         crop_start = padding_l.to(dtype=torch.long)
         crop_end = (padding_target_dims - padding_r).to(dtype=torch.long)
         x = x[:, :, crop_start[0]:crop_end[0], crop_start[1]:crop_end[1], crop_start[2]:crop_end[2]]
-        fluence: Tensor = self.fluence_activation(x[:, self.out_spectra_bins, :, :, :]).unsqueeze(1)
+        flux: Tensor = self.flux_activation(x[:, self.out_spectra_bins, :, :, :]).unsqueeze(1)
         if self.out_spectra_bins > 0:
             spectra = self.spectra_activation(x[:, :self.out_spectra_bins, :, :, :])
         else:
@@ -356,17 +357,17 @@ class Beam2ScatterUNet(ConvBase):
         return RadiationField(
             scatter_field=RadiationFieldChannel(
                 spectrum=spectra,
-                fluence=fluence,
+                flux=flux,
                 error=None
             ),
-            xray_beam=None
+            direct_beam=None
         )
 
     def forward2volume_from_training_input(self, batch: TrainingInputData, voxel_counts: Tensor, spectra_bins: int = 32) -> RadiationField:
-        voxel_counts = batch.ground_truth.scatter_field.fluence.shape[2:] if isinstance(batch.ground_truth, RadiationField) else batch.ground_truth.fluence.shape[2:]
+        voxel_counts = batch.ground_truth.scatter_field.flux.shape[2:] if isinstance(batch.ground_truth, RadiationField) else batch.ground_truth.flux.shape[2:]
         spectra_bins = self.out_spectra_bins if spectra_bins is not None and spectra_bins <= 0 else (batch.ground_truth.scatter_field.spectrum.shape[1] if isinstance(batch.ground_truth, RadiationField) else batch.ground_truth.spectrum.shape[1])
-        gt_fluence = (batch.ground_truth.scatter_field.fluence + (batch.ground_truth.xray_beam.fluence if batch.ground_truth.xray_beam is not None else 0.0) if isinstance(batch.ground_truth, RadiationField) else batch.ground_truth.fluence)
-        mask = ~torch.isfinite(gt_fluence)
+        gt_flux = (batch.ground_truth.scatter_field.flux + (batch.ground_truth.direct_beam.flux if batch.ground_truth.direct_beam is not None else 0.0) if isinstance(batch.ground_truth, RadiationField) else batch.ground_truth.flux)
+        mask = ~torch.isfinite(gt_flux)
         if not mask.any():
             mask = None
         return self.forward2volume(batch, voxel_counts, spectra_bins, mask=mask)
@@ -459,7 +460,7 @@ class Beam2ScatterUNet(ConvBase):
         return nn.ModuleList(down_sampler), nn.ModuleList(up_sampler), midpoint_channels
 
     def get_custom_parameters(self):
-        return {
+        params = {
             "spectra_bins": self.spectra_bins,
             "out_dims": self.out_dims,
             "d_model": self.d_model,
@@ -467,3 +468,7 @@ class Beam2ScatterUNet(ConvBase):
             "normalization_type": self._normalizer.get_type(),
             "use_spectra": self.use_spectra
         }
+        seed = os.environ.get("PL_GLOBAL_SEED", None)
+        if seed is not None:
+            params["training_seed"] = int(seed)
+        return params
