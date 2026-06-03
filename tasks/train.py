@@ -1,15 +1,15 @@
 import lightning.pytorch as pl
+from sys import platform
 from tasks.base import Task
 from callbacks.metrics_plotter import ErrorFieldPlotter
-from radfield3dnn.models.base import BaseNeuralRadFieldModel
-from radfield3dnn.datasets.dataloader import RadiationFieldDataModule
+from models.base import BaseNeuralRadFieldModel
+from datasets.dataloader import RadiationFieldDataModule
 from rich import print
 from lightning.pytorch.callbacks import ModelCheckpoint
 import os
 from loggers.logger import LoggerBase
 from callbacks.plotter import ValidationPlotter
 from callbacks.warmup_early_stopping import WarmupEarlyStopping
-from lightning.pytorch.tuner import Tuner
 
 
 class TrainTask(Task):
@@ -41,29 +41,6 @@ class TrainTask(Task):
         ]
 
     def run_task(self, trainer: pl.Trainer, model: BaseNeuralRadFieldModel, datamodule: RadiationFieldDataModule):
-        print(f"[blue]Search learning rate with batch size {datamodule.batch_size}...")
-        lr_trainer = pl.Trainer(
-            accelerator="gpu",
-            devices=1,
-            max_steps=250,
-            precision=trainer.precision,
-            logger=False,
-            enable_progress_bar=False,
-            enable_checkpointing=True,
-            num_sanity_val_steps=trainer.num_sanity_val_steps
-        )
-        lr_tuner = Tuner(lr_trainer)
-        lr_result = lr_tuner.lr_find(
-            model,
-            datamodule=datamodule,
-            min_lr=1e-4,    # used by original NeRF paper as initial lr (5e-4)
-            max_lr=1e-2,
-            num_training=250
-        )
-        suggested_lr = lr_result.suggestion()
-        print(f"[green]LR finder suggestion: {suggested_lr}")
-        model._lr = float(suggested_lr)
-
         print("[green]Starting training task...")
         trainer.fit(model, datamodule=datamodule)
         print("[green]Final test!")

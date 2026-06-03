@@ -1,30 +1,34 @@
 import os
+import lightning
 import torch
 import lightning.pytorch as pl
+from lightning.pytorch.tuner import Tuner
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelSummary, RichProgressBar, DeviceStatsMonitor
 import shutil
-from radfield3dnn.models import ModelConstructor
+from models import ModelConstructor
 from lightning.pytorch.callbacks import GradientAccumulationScheduler
 import argparse
 from callbacks.validate_gt import ValidateGroundTruth
 from callbacks.metrics_plotter import MetricsPlotter
-from radfield3dnn.metrics.airkerma_accuracy import AirkermaAccuracy, AirkermaRelDifferencesStdDev, AirkermaSphereAccuracy, AirkermaScatterAccuracy, AirkermaAccuracyEnergyWeighted
-from radfield3dnn.metrics.ssim import AirkermaSSIM
+from metrics.airkerma_accuracy import AirkermaAccuracy, AirkermaRelDifferencesStdDev, AirkermaSphereAccuracy, AirkermaScatterAccuracy, AirkermaAccuracyEnergyWeighted
+from metrics.ssim import AirkermaSSIM
 import json
-from radfield3dnn.normalizations import NormalizerConstructor
+from normalizations import NormalizerConstructor
 
-from radfield3dnn.preprocessing.airkerma import AirkermaProcessing
+from processings.airkerma import AirkermaProcessing
 from joblib import Parallel, delayed
 from multiprocessing import Manager
 import time
 from rich import print
-from radfield3dnn.datasets import DatasetType, OriginalGroundTruthPreservation, construct_datamodule, get_dataset_dimensions_and_voxel_size
+from datasets import DatasetType, OriginalGroundTruthPreservation, construct_datamodule, get_dataset_dimensions_and_voxel_size
 
 from rich.progress import Progress
 from rich.progress import BarColumn, TimeRemainingColumn, TimeElapsedColumn, TextColumn
-from radfield3dnn.datasets.channel_join import ChannelsJoin
+from datasets.channel_join import ChannelsJoin
 
-from radfield3dnn.metrics import HistogramOverlapAccuracy
+from metrics import HistogramOverlapAccuracy
+from augmentations.augmentation_limit import LimitedAugmentation
+from augmentations.importance_sampling import ErrorbasedImportanceSampler
 import multiprocessing as mp
 from sys import platform
 
@@ -61,12 +65,14 @@ if __name__ == "__main__":
     parser.add_argument("--test_mode", action="store_true", help="Run in test mode, skipping batch size maximization and reducing overall system ressources usage.", required=False, default=False)
     parser.add_argument("--max_inner_batch_size", type=int, default=None, help="The maximum inner batch size (Used by voxel- or patch-wise models). Default: Search automatically.", required=False)
     parser.add_argument("--compile_model", action="store_true", help="Whether to compile the model, if supported.", required=False, default=False)
+    parser.add_argument("--no_fail", action="store_true", help="Whether to fail the training if an error occurs.", required=False, default=False)
     parser.add_argument("--use_geometry", action="store_true", help="Use geometry dataset (only for Layerwise datasets).", required=False, default=False)
     parser.add_argument("--use_beam_parameters", action="store_true", help="Use beam parameters normalization.", required=False, default=False)
     parser.add_argument("--use_airkerma", action="store_true", help="Use airkerma field in dataset and model.", required=False, default=False)
     parser.add_argument("--validate_gt", action="store_true", help="Validate ground truth data at the start of each training batch.", required=False, default=False)
     parser.add_argument("--task", type=str, default="train", help="The task to run. Currently 'train' and 'tune' are supported.", required=False)
     parser.add_argument("--n_trials", type=int, default=50, help="The number of trials for hyperparameter tuning (only for 'tune' task).", required=False)
+    parser.add_argument("--importance_sampling", action="store_true", help="Use error-based importance sampling for training.", required=False, default=False)
     args = parser.parse_args()
 
     model_config = args.model_config
@@ -110,10 +116,15 @@ if __name__ == "__main__":
     VOXEL_RESOLUTION = args.enforce_voxel_resolution
     MAX_INNER_BATCH_SIZE = args.max_inner_batch_size
     SHOULD_TRY_COMPILE_MODEL = args.compile_model
+    NO_FAIL = args.no_fail
     USE_GEOMETRY = args.use_geometry
     USE_BEAM_PARAMETERS = args.use_beam_parameters
     USE_AIRKERMA = args.use_airkerma
     SHOULD_VALIDATE_GT = args.validate_gt
+    IMPORTANCE_SAMPLING = args.importance_sampling
+
+    TRAINING_SEED = int(torch.seed()) % 4294967295  # ensure seed is in uint32 range
+    lightning.seed_everything(TRAINING_SEED, workers=True)
 
     mu_tr_file = args.mu_tr_file
     if mu_tr_file is not None and not os.path.isabs(mu_tr_file):
@@ -225,7 +236,26 @@ if __name__ == "__main__":
 
     if AUGMENTATIONS:
         dataprocessings = [
-            OriginalGroundTruthPreservation()
+            OriginalGroundTruthPreservation(),
+            #LimitedAugmentation(
+            #    GaussianFluenceNoise(1e-2, repeats_per_field=1.1, error_scaled_noise=False),
+            #    end_epoch=epochs//2,
+            #    start_epoch=0
+            #),
+            #LimitedAugmentation(
+            #    GaussianFluenceSmoothing(
+            #        kernel_size=3,
+            #        sigma=0.75,
+            #        p=0.75,
+            #        dataset_multiplier=1.2,
+            #        random_strength=True
+            #    ),
+            #    end_epoch=epochs//2
+            #),
+            #LimitedAugmentation(
+            #    SmoothingSpectra(kernel_size=3, sigma=1.0, p=0.75, dataset_multiplier=1.0),
+            #    end_epoch=epochs//2
+            #)
         ]
         print("[yellow]Using augmentations!")
     else:
@@ -241,6 +271,15 @@ if __name__ == "__main__":
         print("[yellow]Using Airkerma processing!")
         airkerma_processor = AirkermaProcessing(mu_tr_file=mu_tr_file, bins=32, max_energy_eV=1.5e+5)
         dataprocessings.append(airkerma_processor)
+
+    if IMPORTANCE_SAMPLING:
+        importance_sampler = ErrorbasedImportanceSampler(max_drop_chance=0.99, high_fluence_keep_threshold=0.1)
+        dataprocessings.append(
+            LimitedAugmentation(
+                importance_sampler,
+                end_epoch=int(epochs * (3/4)),
+            )
+        )
 
     # create model and dataset
     model_cls = ModelConstructor.create_model_from_config(model_config, normalizer=normalizer)
@@ -304,11 +343,25 @@ if __name__ == "__main__":
                 max_energy_eV=1.5e+5,
                 importance_threshold=0.5
             ),
+            'top50_airkerma_accuracy_ncc': AirkermaAccuracy(
+                mu_tr_file=mu_tr_file,
+                spectra_bins=32,
+                max_energy_eV=1.5e+5,
+                importance_threshold=0.5,
+                metric_type='ncc'
+            ),
             'top90_airkerma_accuracy': AirkermaAccuracy(
                 mu_tr_file=mu_tr_file,
                 spectra_bins=32,
                 max_energy_eV=1.5e+5,
                 importance_threshold=0.1,
+            ),
+            'top90_airkerma_accuracy_ncc': AirkermaAccuracy(
+                mu_tr_file=mu_tr_file,
+                spectra_bins=32,
+                max_energy_eV=1.5e+5,
+                importance_threshold=0.1,
+                metric_type='ncc'
             ),
             'airkerma_ssim': AirkermaSSIM(
                 mu_tr_file=mu_tr_file,
@@ -330,6 +383,14 @@ if __name__ == "__main__":
                 sphere_radius_m=0.25,
                 voxel_size_m=VOXEL_SIZE_M if VOXEL_SIZE_M > 0.0 else 0.01,
             ),
+            'airkerma_onsphere_accuracy_radius25cm_ncc': AirkermaSphereAccuracy(
+                mu_tr_file=mu_tr_file,
+                spectra_bins=32,
+                max_energy_eV=1.5e+5,
+                sphere_radius_m=0.25,
+                voxel_size_m=VOXEL_SIZE_M if VOXEL_SIZE_M > 0.0 else 0.01,
+                metric_type='ncc'
+            ),
             'top50_airkerma_stddev': AirkermaRelDifferencesStdDev(
                 mu_tr_file=mu_tr_file,
                 spectra_bins=32,
@@ -346,6 +407,12 @@ if __name__ == "__main__":
                 mu_tr_file=mu_tr_file,
                 spectra_bins=32,
                 max_energy_eV=1.5e+5
+            ),
+            'airkerma_accuracy_scatter_ncc': AirkermaScatterAccuracy(
+                mu_tr_file=mu_tr_file,
+                spectra_bins=32,
+                max_energy_eV=1.5e+5,
+                metric_type='ncc'
             ),
             'spectrum_accuracy': HistogramOverlapAccuracy(),
             'top95_energy_weighted_airkerma_accuracy': AirkermaAccuracyEnergyWeighted(
@@ -416,6 +483,28 @@ if __name__ == "__main__":
         model.max_inner_batch_size = MAX_INNER_BATCH_SIZE
         print(f"[yellow]Override maximum inner batch size and set it to: {model.max_inner_batch_size}")
 
+    print(f"[blue]Search learning rate with batch size {batch_size}...")
+    lr_trainer = pl.Trainer(
+        accelerator="gpu",
+        devices=1,
+        max_steps=250,
+        precision="16-mixed" if mixed_precision else "32-true",
+        logger=False,
+        enable_progress_bar=False,
+        enable_checkpointing=True,
+        num_sanity_val_steps=0 if platform == "win32" else 2  # workaround for windows lr finder issue
+    )
+    lr_tuner = Tuner(lr_trainer)
+    lr_result = lr_tuner.lr_find(
+        model,
+        datamodule=datamodule,
+        min_lr=1e-4,    # used by original NeRF paper as initial lr (5e-4)
+        max_lr=1e-2,
+        num_training=250
+    )
+    suggested_lr = lr_result.suggestion()
+    print(f"[green]LR finder suggestion: {suggested_lr}")
+    model._lr = float(suggested_lr)
     model._normalizer = normalizer
 
     trainer = pl.Trainer(

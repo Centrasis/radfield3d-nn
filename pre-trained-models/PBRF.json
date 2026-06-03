@@ -1,0 +1,38 @@
+{
+    "parameters": {
+        "location_encoding_dims": 14,
+        "direction_encoding_dims": 4,
+        "d_model": 192,
+        "out_spectra_dim": 32,
+        "conditioning": "FiLM",
+        "flux_loss": "FluenceLoss",
+        "spectrum_loss": "HistogramLoss",
+        "randomize_voxel_location_in_training": false,
+        "voxels_centered_around_origin": false,
+        "normalizer": "linear0_1",
+        "encoded_spectra_dims": 32,
+        "use_spectra_encoding": true,
+        "in_spectra_dim": 32,
+        "scalar_encoding_dims": 16,
+        "use_beam_shape": false
+    },
+    "model_name": "PBRFNet",
+    "metrics": {
+        "val_loss": 0.0028992516454309225,
+        "test_scatter_spectrum_loss": 0.005191875621676445,
+        "test_scatter_fluence_loss": 0.0005927365273237228,
+        "test_loss": 0.0028923065401613712,
+        "test_global_airkerma_accuracy": 0.8387972116470337,
+        "test_top90_airkerma_accuracy": 0.8624503016471863,
+        "test_airkerma_ssim": 0.9018541574478149,
+        "test_airkerma_ssim_gradient": 0.9012366533279419,
+        "test_airkerma_onsphere_accuracy_radius25cm": 0.8228915929794312,
+        "test_airkerma_accuracy_scatter": 0.8447890877723694,
+        "test_spectrum_accuracy": 0.866076648235321,
+        "test_top95_energy_weighted_airkerma_accuracy": 0.8897203803062439,
+        "test_global_airkerma_gamma_index_3percent_per_4cm": 0.7459943890571594,
+        "test_global_airkerma_gamma_index_10percent_per_4cm": 0.9479525685310364,
+        "test_global_airkerma_gamma_index_10percent_per_6cm": 0.984585165977478,
+        "test_global_airkerma_gamma_index_3percent_per_6cm": 0.8643978238105774
+    }
+}

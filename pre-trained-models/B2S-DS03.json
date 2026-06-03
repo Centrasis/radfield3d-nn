@@ -1,0 +1,34 @@
+{
+    "parameters": {
+        "spectra_bins": 32,
+        "out_dims": [
+            50,
+            50,
+            50
+        ],
+        "d_model": 128,
+        "out_spectra_bins": 32,
+        "normalization_type": "log_1e+5",
+        "use_spectra": true,
+        "training_seed": 3959971227
+    },
+    "model_name": "Beam2ScatterUNet",
+    "metrics": {
+        "val_loss": 0.0090405885130167,
+        "test_scatter_spectrum_loss": 0.006271268706768751,
+        "test_scatter_fluence_loss": 0.011825536377727985,
+        "test_loss": 0.009048406034708023,
+        "test_global_airkerma_accuracy": 0.3404075801372528,
+        "test_top90_airkerma_accuracy": 0.2601379156112671,
+        "test_airkerma_ssim": 0.8014094829559326,
+        "test_airkerma_ssim_gradient": 0.7988961935043335,
+        "test_airkerma_onsphere_accuracy_radius25cm": 0.25875651836395264,
+        "test_airkerma_accuracy_scatter": 0.23767304420471191,
+        "test_spectrum_accuracy": 0.843838632106781,
+        "test_top95_energy_weighted_airkerma_accuracy": 0.5398549437522888,
+        "test_global_airkerma_gamma_index_3percent_per_4cm": 0.23817677795886993,
+        "test_global_airkerma_gamma_index_10percent_per_4cm": 0.5019026398658752,
+        "test_global_airkerma_gamma_index_10percent_per_6cm": 0.600145697593689,
+        "test_global_airkerma_gamma_index_3percent_per_6cm": 0.2848484218120575
+    }
+}

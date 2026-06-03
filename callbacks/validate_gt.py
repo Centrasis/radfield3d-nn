@@ -1,8 +1,8 @@
-from radfield3dnn import TrainingInputData, RadiationFieldChannel, RadiationField, AirKermaField
-from radfield3dnn.models.base import BaseNeuralRadFieldModel
+from rftypes import TrainingInputData, RadiationFieldChannel, RadiationField, AirKermaField
+from models.base import BaseNeuralRadFieldModel
 from lightning.pytorch.callbacks import Callback
 from lightning.pytorch.trainer import Trainer
-from radfield3dnn.datasets.channel_join import ChannelsJoin
+from datasets.channel_join import ChannelsJoin
 import torch
 
 

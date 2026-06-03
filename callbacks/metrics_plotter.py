@@ -1,16 +1,16 @@
 from lightning.pytorch.callbacks import Callback
 from lightning.pytorch.trainer import Trainer
 from loggers.logger import LoggerBase
-from radfield3dnn.models.base import BaseNeuralRadFieldModel
+from models.base import BaseNeuralRadFieldModel
 import torch
-from radfield3dnn import RadiationField, TrainingInputData, RadiationFieldChannel, AirKermaField
-from radfield3dnn.metrics.airkerma_accuracy import AirkermaAccuracy
-from radfield3dnn.normalizations.base import Normalizer
-from radfield3dnn.rfhelpers import InferenceHelper
+from rftypes import RadiationField, TrainingInputData, RadiationFieldChannel, AirKermaField
+from metrics.airkerma_accuracy import AirkermaAccuracy
+from normalizations.base import Normalizer
+from rfhelpers import InferenceHelper
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from radfield3dnn.datasets.channel_join import ChannelsJoin
-from radfield3dnn.metrics import MetricBase
+from datasets.channel_join import ChannelsJoin
+from metrics import MetricBase
 
 
 class MetricsPlotter(Callback):
