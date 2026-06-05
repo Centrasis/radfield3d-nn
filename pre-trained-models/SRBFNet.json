@@ -1,0 +1,34 @@
+{
+    "parameters": {
+        "location_encoding_dims": 10,
+        "direction_encoding_dims": 4,
+        "d_model": 192,
+        "out_spectra_dim": 32,
+        "conditioning": "FiLM",
+        "fluence_loss": "FluenceLoss",
+        "spectrum_loss": "HistogramLoss",
+        "randomize_voxel_location_in_training": false,
+        "voxels_centered_around_origin": false,
+        "normalizer": "linear0_1",
+        "training_seed": 1822753836
+    },
+    "model_name": "SRBFNet",
+    "metrics": {
+        "val_loss": 0.004373186267912388,
+        "test_scatter_spectrum_loss": 0.0064687118865549564,
+        "test_scatter_fluence_loss": 0.002226075390353799,
+        "test_loss": 0.004347392823547125,
+        "test_global_airkerma_accuracy": 0.9568543434143066,
+        "test_top90_airkerma_accuracy": 0.9664878249168396,
+        "test_airkerma_ssim": 0.9620959758758545,
+        "test_airkerma_ssim_gradient": 0.9327691197395325,
+        "test_airkerma_onsphere_accuracy_radius25cm": 0.9639411568641663,
+        "test_airkerma_accuracy_scatter": 0.958297073841095,
+        "test_spectrum_accuracy": 0.8424670696258545,
+        "test_top95_energy_weighted_airkerma_accuracy": 0.9392445683479309,
+        "test_global_airkerma_gamma_index_3percent_per_4cm": 0.996038019657135,
+        "test_global_airkerma_gamma_index_10percent_per_4cm": 0.9998100996017456,
+        "test_global_airkerma_gamma_index_10percent_per_6cm": 0.9999482035636902,
+        "test_global_airkerma_gamma_index_3percent_per_6cm": 0.9984540939331055
+    }
+}

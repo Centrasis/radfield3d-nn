@@ -1,0 +1,37 @@
+{
+    "parameters": {
+        "location_encoding_dims": 10,
+        "direction_encoding_dims": 4,
+        "d_model": 192,
+        "out_spectra_dim": 32,
+        "conditioning": "FiLM",
+        "fluence_loss": "FluenceLoss",
+        "spectrum_loss": "HistogramLoss",
+        "randomize_voxel_location_in_training": false,
+        "voxels_centered_around_origin": false,
+        "normalizer": "linear0_1",
+        "training_seed": 3640990597,
+        "encoded_spectra_dims": 16,
+        "use_spectra_encoding": true,
+        "in_spectra_dim": 32
+    },
+    "model_name": "SPERFNet",
+    "metrics": {
+        "val_loss": 0.0035063198301941156,
+        "test_scatter_spectrum_loss": 0.005423692055046558,
+        "test_scatter_fluence_loss": 0.001640992471948266,
+        "test_loss": 0.0035323414485901594,
+        "test_global_airkerma_accuracy": 0.9587973356246948,
+        "test_top90_airkerma_accuracy": 0.9721684455871582,
+        "test_airkerma_ssim": 0.9526926875114441,
+        "test_airkerma_ssim_gradient": 0.9322701096534729,
+        "test_airkerma_onsphere_accuracy_radius25cm": 0.9609825015068054,
+        "test_airkerma_accuracy_scatter": 0.9619333744049072,
+        "test_spectrum_accuracy": 0.8605409860610962,
+        "test_top95_energy_weighted_airkerma_accuracy": 0.9386003613471985,
+        "test_global_airkerma_gamma_index_3percent_per_4cm": 0.9940742254257202,
+        "test_global_airkerma_gamma_index_10percent_per_4cm": 0.9996058940887451,
+        "test_global_airkerma_gamma_index_10percent_per_6cm": 0.9998628497123718,
+        "test_global_airkerma_gamma_index_3percent_per_6cm": 0.9973098635673523
+    }
+}
