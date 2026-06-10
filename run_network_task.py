@@ -1,0 +1,571 @@
+import os
+import math
+import json
+import argparse
+import multiprocessing as mp
+from sys import platform
+
+import torch
+# Use the file_system sharing strategy for DataLoader worker tensors. The default
+# file_descriptor strategy passes one fd per shared tensor and, across many runs /
+# large layerwise batches, exhausts fds — surfacing as "ConnectionResetError: [Errno
+# 104]" in multiprocessing.resource_sharer + "leaked semaphore" warnings at worker
+# spawn. file_system uses /dev/shm-backed names instead and is robust to that.
+torch.multiprocessing.set_sharing_strategy("file_system")
+import yaml
+import lightning.pytorch as pl
+from lightning.pytorch.callbacks import (
+    LearningRateMonitor, ModelSummary, RichProgressBar,
+    DeviceStatsMonitor, GradientAccumulationScheduler,
+)
+from rich import print
+
+from radfield3dnn.models import ModelConstructor
+from radfield3dnn.preprocessing.normalizations import NormalizerConstructor
+from radfield3dnn.preprocessing.normalizations.asinh import SplitChannelAsinhNormalizer
+from radfield3dnn.datasets import DatasetType, OriginalGroundTruthPreservation, construct_datamodule, get_dataset_dimensions_and_voxel_size
+from radfield3dnn.datasets.channel_join import ChannelsJoin
+from radfield3dnn.metrics.airkerma_accuracy import (
+    AirkermaAccuracy, AirkermaRelDifferencesStdDev,
+    AirkermaSphereAccuracy, AirkermaScatterAccuracy, AirkermaAccuracyEnergyWeighted,
+)
+from radfield3dnn.metrics.ssim import AirkermaSSIM
+from radfield3dnn.metrics import HistogramOverlapAccuracy
+from radfield3dnn.preprocessing.airkerma import AirkermaProcessing
+
+from callbacks.validate_gt import ValidateGroundTruth
+from callbacks.metrics_plotter import MetricsPlotter
+from loggers.logger import LoggerBase, TrainingSettings
+from loggers.mlflow import MLFlowLogger
+from loggers.wandb import WandBLogger
+from tasks.base import Task
+
+
+def load_config(path: str) -> dict:
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+def _set_data_adaptive_flux_bias(model, datamodule) -> None:
+    """Set the flux head's output-bias prior from the actual dataset, before training.
+
+    Scans one batch of real fields, applies the same processings + normalizer the training step uses,
+    and sets the flux head's FINAL Linear bias to the MIDPOINT of the observed normalized target
+    range. The midpoint is the activation's high-gradient interior — maximally far from the saturating
+    boundaries — so the flux head does not start pinned at the clamp floor (which starves the
+    peak-crushed scatter band of gradient -> the predict-0 lock-in). Adapts to the dataset AND the
+    normalizer: linear0_1 [0,1]->0.5, log_scale [-9,0]->-4.5, asinh [0,1]->0.5. Best-effort; on any
+    problem it leaves the model's configured ``flux_bias_init`` in place.
+    """
+    import torch
+    from radfield3dnn.rftypes import RadiationField
+    from lightning_utilities.core.apply_func import apply_to_collection
+    core = model.get_core_model()
+    if not hasattr(core, "flux_decoder"):
+        return
+    try:
+        with torch.no_grad():
+            batch = next(iter(datamodule.train_dataloader()))
+            dev = next(model.parameters()).device
+            batch = apply_to_collection(batch, torch.Tensor, lambda t: t.to(dev))
+            batch = datamodule.on_after_batch_transfer(batch, 0)
+            batch = model._normalizer.forward(batch)
+            gt = batch.ground_truth
+            flux = gt.scatter_field.flux if (isinstance(gt, RadiationField) and gt.scatter_field is not None) \
+                else getattr(gt, "flux", None)
+            if flux is None:
+                return
+            f = flux[torch.isfinite(flux)].float().flatten()
+            if f.numel() < 100:
+                return
+            lo, hi = float(f.min()), float(f.max())
+            # Prior = where the flux SIGNAL actually concentrates.
+            #  * LogScaleNormalizer: the targets are log10 flux in [log_min, log_max] plus a
+            #    zero-sentinel (~-7) carrying the ~87% occluded/background voxels. The MEAN over the
+            #    signal band (targets above the sentinel dead-zone) lands ~-3 for DS03 — the center of
+            #    the HDR scatter distribution — instead of being dragged to the -7 floor (the
+            #    predict-0 lock-in) by the background mass.
+            #  * Linear/asinh ([0,1]): the crushed scatter mean is ~0 (near the floor), so the MEAN
+            #    would re-introduce the lock-in; the codomain MIDPOINT is the anti-lock-in prior.
+            from radfield3dnn.preprocessing.normalizations.logscale import LogScaleNormalizer
+            if isinstance(model._normalizer, LogScaleNormalizer):
+                signal = f[f > model._normalizer.inverse_zero_threshold]
+                center = float(signal.mean()) if signal.numel() >= 100 else 0.5 * (lo + hi)
+            else:
+                center = 0.5 * (lo + hi)
+            # activation pre-image: set the head bias so the activation OUTPUT starts at `center`.
+            #  * clamp: identity in-range -> bias = center.
+            #  * softclip (0.5*(tanh z+1)): centered at z=0 -> bias = 0.
+            #  * sigmoid: invert -> bias = logit(center) = ln(center/(1-center)); for a crushed
+            #    linear0_1 center (~1e-3) this is a large negative logit (~-7), exactly the wide
+            #    [-30,30] split the sigmoid is meant to use, with live gradient (no clamp floor).
+            kind = getattr(core, "_flux_activation_kind", "clamp")
+            if kind == "softclip":
+                bias = 0.0
+            elif kind == "sigmoid":
+                c = min(max(center, 1e-13), 1.0 - 1e-13)
+                bias = float(max(-30.0, min(30.0, math.log(c / (1.0 - c)))))
+            else:
+                bias = center
+            flux_lins = [m for m in core.flux_decoder.modules() if isinstance(m, torch.nn.Linear)]
+            if flux_lins and flux_lins[-1].bias is not None:
+                torch.nn.init.constant_(flux_lins[-1].bias, float(bias))
+                model._flux_bias_init = float(bias)
+                print(f"[green]Data-adaptive flux-bias init: normalized target range "
+                      f"[{lo:.3f}, {hi:.3f}] -> output-bias {bias:.3f} (activation={kind}).[/green]")
+    except Exception as e:
+        print(f"[yellow]Data-adaptive flux-bias init skipped ({type(e).__name__}: {e}); "
+              f"keeping configured flux_bias_init={getattr(model, '_flux_bias_init', 0.5)}.[/yellow]")
+
+
+def _auto_tune_asinh(dataset_path: str, seed: int) -> SplitChannelAsinhNormalizer:
+    """Scan dataset to pick per-channel asinh σ values empirically."""
+    import glob, random, numpy as np
+    from RadFiled3D.RadFiled3D import FieldStore
+
+    paths = sorted(glob.glob(os.path.join(dataset_path, "**", "*.rf3"), recursive=True))
+    if not paths:
+        print("[yellow]asinh_auto: no .rf3 files found, using defaults.")
+        return SplitChannelAsinhNormalizer()
+
+    random.seed(seed)
+    random.shuffle(paths)
+    sample = paths[:min(40, len(paths))]
+    print(f"[yellow]asinh_auto: scanning {len(sample)}/{len(paths)} fields for σ.")
+
+    sc_vals, dr_vals = [], []
+    for p in sample:
+        try:
+            f = FieldStore.load(p)
+            sc = np.asarray(f.get_channel('scatter_field').get_layer_as_ndarray('flux'), dtype=np.float64).ravel()
+            dr = np.asarray(f.get_channel('direct_beam').get_layer_as_ndarray('flux'), dtype=np.float64).ravel()
+        except Exception:
+            continue
+        if sc.max() > 0:
+            n = sc / sc.max(); sc_vals.append(n[n > 0])
+        if dr.max() > 0:
+            n = dr / dr.max(); dr_vals.append(n[n > 0])
+
+    if not sc_vals or not dr_vals:
+        return SplitChannelAsinhNormalizer()
+
+    sigma_sc = float(np.clip(np.quantile(np.concatenate(sc_vals), 0.10), 1e-6, 1e-1))
+    sigma_dr = float(np.clip(np.quantile(np.concatenate(dr_vals), 0.90), 1e-6, 1e-1))
+    print(f"[green]asinh_auto: σ_scatter={sigma_sc:.3e}, σ_direct={sigma_dr:.3e}")
+    return SplitChannelAsinhNormalizer(scatter_sigma=sigma_sc, direct_sigma=sigma_dr)
+
+
+if __name__ == "__main__":
+    mp.set_start_method('spawn', force=True)
+    mp.freeze_support()
+
+    parser = argparse.ArgumentParser(description="Train a radfield3d neural network model.")
+    parser.add_argument("config", type=str, help="YAML training configuration file.")
+    parser.add_argument("--task", type=str, default="train", choices=["train", "tune"],
+                        help="Task to run: 'train' or 'tune'.")
+    parser.add_argument("--dataset_path", type=str, required=True, help="Path to the dataset.")
+    parser.add_argument("--logs_path", type=str, required=True, help="Path to save logs and checkpoints.")
+    parser.add_argument("--mu_tr_file", type=str, default=None,
+                        help="Mass energy absorption coefficients file for Airkerma metric.")
+    parser.add_argument("--seed", type=int, default=torch.randint(0, 2**31 - 1, (1,)).item(),
+                        help="Random seed. Defaults to a fresh random seed each run (persisted to the run config).")
+    args = parser.parse_args()
+
+    cfg = load_config(args.config)
+    train_cfg = cfg.get("training", {})
+    ds_cfg = cfg.get("dataset", {})
+    aug_cfg = cfg.get("augmentations", {})
+    tune_cfg = cfg.get("tune", {})
+
+    # ── Model config ──────────────────────────────────────────────────────────
+    model_config = train_cfg["model_config"]
+    with open(model_config) as f:
+        raw_model_cfg = json.load(f)
+    model_name = raw_model_cfg["model_name"]
+
+    # ── Task setup ────────────────────────────────────────────────────────────
+    dataset_base = os.path.splitext(os.path.basename(args.dataset_path))[0]
+    # Run name: defaults to "<model>-<dataset>", but the YAML `training: run_name:` overrides it so
+    # ablation runs can be named by their VERSION (e.g. "concat-d4") in a dedicated project_name.
+    experiment_name = train_cfg.get("run_name", f"{model_name}-{dataset_base}")
+
+    if args.task == "train":
+        from tasks.train import TrainTask
+        NETWORK_TASK: Task = TrainTask()
+    else:
+        from tasks.tune import HyperparameterTuningTask
+        NETWORK_TASK: Task = HyperparameterTuningTask(
+            model_config=model_config,
+            experiment_name=f"tune-{experiment_name}",
+            n_trials=tune_cfg.get("n_trials", 50),
+        )
+
+    # ── Working directory per run ─────────────────────────────────────────────
+    new_cwd = os.path.join(os.getcwd(), f"{model_name}_{dataset_base}")
+    os.makedirs(new_cwd, exist_ok=True)
+    os.chdir(new_cwd)
+
+    # ── Dataset caching ───────────────────────────────────────────────────────
+    dataset_path = args.dataset_path
+    if ds_cfg.get("cache", False):
+        import shutil, time
+        from joblib import Parallel, delayed
+        from multiprocessing import Manager
+        from rich.progress import Progress, BarColumn, TimeRemainingColumn, TimeElapsedColumn, TextColumn
+        from threading import Thread
+
+        cache_dir = ds_cfg.get("cache_dir", "./.cache")
+        cache_path = cache_dir if os.path.isabs(cache_dir) else os.path.abspath(cache_dir)
+
+        files_rel = []
+        for root, _, files in os.walk(dataset_path):
+            for f in files:
+                files_rel.append(os.path.join(root, f).removeprefix(dataset_path).lstrip("/\\"))
+
+        if os.path.exists(cache_path):
+            existing = set()
+            for root, _, files in os.walk(cache_path):
+                for f in files:
+                    existing.add(os.path.join(root, f).removeprefix(cache_path).lstrip("/\\"))
+            if not all(f in existing for f in files_rel):
+                shutil.rmtree(cache_path)
+
+        if not os.path.exists(cache_path):
+            print("[yellow]Caching dataset…")
+            os.makedirs(cache_path)
+
+            def _copy(rel, src, dst, prog):
+                dest = os.path.join(dst, rel)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                shutil.copy(os.path.join(src, rel), dest)
+                with prog["lock"]:
+                    prog["done"] += 1
+
+            with Manager() as mgr:
+                prog = mgr.dict(done=0, lock=mgr.Lock())
+                with Progress(TextColumn("{task.description}"), BarColumn(),
+                               TimeElapsedColumn(), TimeRemainingColumn()) as bar:
+                    t = bar.add_task("[cyan]Copying…", total=len(files_rel))
+                    Thread(target=lambda: [bar.update(t, completed=prog["done"]) or
+                                           __import__("time").sleep(0.1)
+                                           for _ in iter(lambda: prog["done"] < len(files_rel), False)],
+                           daemon=True).start()
+                    Parallel(n_jobs=os.cpu_count() // 2)(
+                        delayed(_copy)(f, dataset_path, cache_path, prog) for f in files_rel
+                    )
+        dataset_path = cache_path
+        print("[green]Dataset cached.")
+
+    # ── Normalizer (from model JSON) ──────────────────────────────────────────
+    norm_name = raw_model_cfg.get("parameters", {}).get("normalizer", "linear0_1")
+    if norm_name == "asinh_auto":
+        normalizer = _auto_tune_asinh(dataset_path, args.seed)
+    else:
+        normalizer = NormalizerConstructor.construct_by_name(norm_name)
+
+    # ── Data processings ──────────────────────────────────────────────────────
+    # MC floor noise removal runs AFTER OriginalGroundTruthPreservation snapshots the GT, so
+    # the cut is TRAINING-ONLY: the loss sees the cleaned field (noise floor removed) while
+    # the air-kerma metric scores against the ORIGINAL uncut GT.
+    #
+    # Why the order matters: the air-kerma accuracy is SMAPE-based and the `scatter` metric
+    # uses importance_threshold=0, i.e. it scores EVERY voxel. If MCFloorCut zeroes a voxel
+    # in the GT the metric sees, then SMAPE(small_pred, 0) = 2 (worst case) for the implicit
+    # MLP's small-but-nonzero prediction there — turning every cut voxel into an accuracy-0
+    # landmine and collapsing scatter accuracy (~0.10 in the r7t0nhoh run). Snapshotting the
+    # uncut GT first keeps the metric comparable to the published (no-MC-floor) 0.84 baseline.
+    dataprocessings = [OriginalGroundTruthPreservation()]
+    mc_floor = aug_cfg.get("mc_floor_cut", None)
+    if mc_floor:
+        from radfield3dnn.datasets.mc_floor_cut import MCFloorCut
+        # Either a single scalar (both channels) or a per-channel mapping
+        # {scatter: <rel>, direct: <rel>} — scatter is diffuse/low-DR (cut gently,
+        # keeps its spatial info) while the direct beam is sharp/high-DR (cut harder
+        # to strip the MC leakage floor). See radfield3dnn/datasets/mc_floor_cut.py.
+        if isinstance(mc_floor, dict) and mc_floor.get("use_error", False):
+            et = float(mc_floor.get("error_threshold", 0.5))
+            dataprocessings.append(MCFloorCut(use_error=True, error_threshold=et))
+            print(f"[green]MC floor cut (training target only, ERROR-based): zeroing per-channel voxels with MC error >= {et} (data-adaptive; joined keeps the union of confident voxels).")
+        elif isinstance(mc_floor, dict):
+            s_rel = float(mc_floor.get("scatter", 1e-4))
+            d_rel = float(mc_floor.get("direct", 1e-2))
+            dataprocessings.append(MCFloorCut(scatter_rel=s_rel, direct_rel=d_rel))
+            print(f"[green]MC floor cut (training target only): scatter < {s_rel:.0e}, direct < {d_rel:.0e} of per-channel per-field peak.")
+        else:
+            dataprocessings.append(MCFloorCut(rel_threshold=float(mc_floor)))
+            print(f"[green]MC floor cut enabled (training target only): zeroing GT voxels < {float(mc_floor):.0e} of per-field peak.")
+    epochs = train_cfg.get("epochs", 25)
+
+    if aug_cfg.get("enabled", False):
+        from radfield3dnn.preprocessing.augmentations.noise import GaussianFluenceNoise
+        from radfield3dnn.preprocessing.augmentations.smoothing import GaussianFluenceSmoothing
+        from radfield3dnn.preprocessing.augmentations.augmentation_limit import LimitedAugmentation
+        dataprocessings += [
+            LimitedAugmentation(GaussianFluenceNoise(1e-2, repeats_per_field=1.1, error_scaled_noise=False),
+                                end_epoch=epochs // 2),
+            LimitedAugmentation(GaussianFluenceSmoothing(kernel_size=3, sigma=0.75, p=0.75,
+                                                          dataset_multiplier=1.2, random_strength=True),
+                                end_epoch=epochs // 2),
+        ]
+
+    if aug_cfg.get("join_channels", False):
+        # Channel handling is selected by the normalizer:
+        #   * asinh_split  -> per-channel-relative split (each ÷ own per-field max, then asinh).
+        #   * linear_joint -> RAW split (both channels kept physical; the shared-scale normalizer
+        #                     preserves the scatter:direct relation, ChannelMaxBalancedLoss balances
+        #                     the gradient). The implicit relation-preservation stack.
+        #   * otherwise    -> join scatter + direct into a single flux target.
+        from radfield3dnn.preprocessing.normalizations import JointLinearNormalizer
+        if isinstance(normalizer, JointLinearNormalizer):
+            from radfield3dnn.datasets.channel_split_relative import ChannelsSplitRelative
+            dataprocessings.append(ChannelsSplitRelative(normalize_per_channel=False))
+        elif isinstance(normalizer, SplitChannelAsinhNormalizer):
+            from radfield3dnn.datasets.channel_split_relative import ChannelsSplitRelative
+            dataprocessings.append(ChannelsSplitRelative())
+        else:
+            dataprocessings.append(ChannelsJoin())
+
+    if aug_cfg.get("smooth_spectra", False):
+        from radfield3dnn.preprocessing.augmentations.smooth_spectra import SmoothingSpectra
+        from radfield3dnn.preprocessing.augmentations.augmentation_limit import LimitedAugmentation
+        dataprocessings.append(LimitedAugmentation(
+            SmoothingSpectra(kernel_size=3, sigma=1.0, p=0.75, dataset_multiplier=1.0),
+            end_epoch=epochs // 2,
+        ))
+
+    is_cfg = aug_cfg.get("importance_sampling", {})
+    if is_cfg.get("enabled", False):
+        from radfield3dnn.preprocessing.augmentations.importance_sampling import ErrorbasedImportanceSampler
+        from radfield3dnn.preprocessing.augmentations.augmentation_limit import LimitedAugmentation
+        # Importance sampling suppresses unreliable high-MC-error voxels only as a
+        # warmup. The background itself is a critical target, so the sampler must
+        # be deactivated for the fine-tuning phase (like the other augmentations)
+        # so the model is optimised on the full volume incl. the background.
+        # `end_epoch` defaults to the halfway point but is configurable.
+        # `max_drop_chance` is annealed from its start value down to
+        # `max_drop_chance_end` across the warmup window (high→low: denoise hard
+        # early, reintroduce voxels before the sampler switches off). No
+        # hand-tuning of a single drop rate needed.
+        is_end_epoch = is_cfg.get("end_epoch", epochs // 2)
+        dataprocessings.append(LimitedAugmentation(
+            ErrorbasedImportanceSampler(
+                max_drop_chance=is_cfg.get("max_drop_chance", 0.9),
+                max_drop_chance_end=is_cfg.get("max_drop_chance_end", 0.3),
+                high_fluence_keep_threshold=is_cfg.get("keep_flux_threshold", 0.8),
+            ),
+            end_epoch=is_end_epoch,
+        ))
+
+    mu_tr_file = args.mu_tr_file
+    if mu_tr_file and not os.path.isabs(mu_tr_file):
+        mu_tr_file = os.path.join(os.path.dirname(model_config), mu_tr_file)
+    if mu_tr_file and not os.path.exists(mu_tr_file):
+        raise FileNotFoundError(f"mu_tr_file not found: {mu_tr_file}")
+
+    if ds_cfg.get("use_airkerma", False):
+        if not mu_tr_file:
+            raise ValueError("--mu_tr_file required when use_airkerma=true")
+        dataprocessings.append(AirkermaProcessing(mu_tr_file=mu_tr_file, bins=32, max_energy_eV=1.5e+5))
+
+    # ── Model ─────────────────────────────────────────────────────────────────
+    torch.set_float32_matmul_precision('high')
+
+    import tempfile
+    # Inject the resolved normalizer back into the config for model construction
+    full_cfg = dict(raw_model_cfg)
+    full_cfg.setdefault("parameters", {})["normalizer"] = norm_name  # keep as string for ModelConstructor
+
+    precision = train_cfg.get("precision", "fp32")
+    if precision == "fp16":
+        full_cfg["parameters"]["precision"] = "fp16"
+
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tmp:
+        json.dump(full_cfg, tmp)
+        tmp_path = tmp.name
+
+    model_cls = ModelConstructor.create_model_from_config(tmp_path)
+    os.unlink(tmp_path)
+    model = model_cls().cuda()
+    model._normalizer = normalizer
+    # Reproducibility: `training: lr_finder: false` skips the per-seed LR sweep
+    # and trains at the model's configured LR (a fixed LR removes a variance source).
+    if not train_cfg.get("lr_finder", True):
+        model._use_lr_finder = False
+    # MTL ablation knob: `training: mtl_balancing: false` combines the flux/spectrum task losses
+    # by a plain equal-weight sum (no DB-MTL); default true keeps full DB-MTL balancing. Lets the
+    # same config be scored with and without MTL loss weighting.
+    model._use_mtl = train_cfg.get("mtl_balancing", True)
+    if not model._use_mtl:
+        print("[yellow]MTL loss weighting DISABLED (equal-weight task-loss sum).[/yellow]")
+
+    # ── Dataset ───────────────────────────────────────────────────────────────
+    dataset_type_str = ds_cfg.get("type", None)
+    if dataset_type_str is None:
+        dataset_type_str = ModelConstructor.get_dataset_type_for_model(model_name)
+
+    voxel_resolution = ds_cfg.get("voxel_resolution", None)
+    if voxel_resolution is not None:
+        voxel_resolution = tuple(voxel_resolution)
+
+    datamodule = construct_datamodule(
+        dataset_path=dataset_path,
+        batch_size=train_cfg.get("batch_size", 32),
+        num_workers=train_cfg.get("num_workers", 4),
+        use_geometry=ds_cfg.get("use_geometry", False),
+        use_beam_parameters=ds_cfg.get("use_beam_parameters", False),
+        dataprocessings=dataprocessings,
+        voxel_resolution=voxel_resolution,
+        prefetch_to_device=train_cfg.get("prefetch_to_device", True),
+        max_fields=ds_cfg.get("max_fields", None),
+        cache_to_ram=ds_cfg.get("cache_to_ram", False),
+        cache_ram_gb=ds_cfg.get("cache_ram_gb", None),
+    )
+    _, VOXEL_SIZE_M = get_dataset_dimensions_and_voxel_size(datamodule)
+
+    # Data-adaptive flux-head output-bias init: scan a few real fields, take the MIDPOINT of the
+    # observed normalized target range, and set the flux head's final bias there — the activation's
+    # high-gradient interior, far from the saturating floor (avoids the predict-0 lock-in). Adapts to
+    # the actual dataset + normalizer (linear0_1 [0,1]->0.5, log_scale [-9,0]->-4.5, asinh [0,1]->0.5).
+    # Disable with `training: auto_flux_bias_init: false` (then the model's configured flux_bias_init holds).
+    if train_cfg.get("auto_flux_bias_init", True):
+        _set_data_adaptive_flux_bias(model, datamodule)
+
+    dataset_type = DatasetType.Voxelwise if dataset_type_str == "Voxelwise" else DatasetType.Layerwise
+
+    # ── Logger ────────────────────────────────────────────────────────────────
+    logs_path = os.path.join(args.logs_path, experiment_name)
+    os.makedirs(logs_path, exist_ok=True)
+
+    logger_name = train_cfg.get("logger", "wandb").lower()
+    offline = train_cfg.get("offline", False)
+    # Experiment-tracking project. Override per-run via the YAML `training:
+    # project_name:` key to keep separate runs (e.g. ablations / loss changes)
+    # in their own project instead of the shared default.
+    project_name = train_cfg.get("project_name", "radiation-field-estimator")
+    if logger_name == "wandb":
+        logger: LoggerBase = WandBLogger(
+            project_name=project_name,
+            logs_dir=os.path.join(logs_path, "wandb"),
+            offline=offline,
+        )
+    elif logger_name == "mlflow":
+        logger: LoggerBase = MLFlowLogger(
+            project_name=project_name,
+            logs_dir=os.path.join(logs_path, "mlflow"),
+        )
+    else:
+        raise ValueError(f"Unknown logger: {logger_name}")
+
+    logger.setup_experiment(experiment_name, TrainingSettings(
+        batch_size=train_cfg.get("batch_size", 32),
+        num_workers=train_cfg.get("num_workers", 4),
+        epochs=epochs,
+        model_name=model_name,
+        dataset_path=dataset_path,
+        dataset_loading_mode=dataset_type_str,
+        hyper_parameters=raw_model_cfg.get("parameters", {}),
+        data_augmentations=[(aug.get_name(), aug.get_parameters()) for aug in dataprocessings],
+    ))
+
+    # ── Metrics plotter ───────────────────────────────────────────────────────
+    voxel_res_for_plot = tuple(voxel_resolution) if voxel_resolution else (50, 50, 50)
+    vx = VOXEL_SIZE_M if VOXEL_SIZE_M > 0.0 else 0.01
+    metrics_plotter = MetricsPlotter(
+        spectra_bins=32,
+        metrics={
+            'global_airkerma_accuracy': AirkermaAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5),
+            'top50_airkerma_accuracy': AirkermaAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, importance_threshold=0.5),
+            'top90_airkerma_accuracy': AirkermaAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, importance_threshold=0.1),
+            'airkerma_ssim': AirkermaSSIM(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, reduction='mean'),
+            'airkerma_onsphere_accuracy_radius25cm': AirkermaSphereAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, sphere_radius_m=0.25, voxel_size_m=vx),
+            'top50_airkerma_stddev': AirkermaRelDifferencesStdDev(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, importance_threshold=0.5),
+            'airkerma_accuracy_scatter': AirkermaScatterAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5),
+            'spectrum_accuracy': HistogramOverlapAccuracy(),
+            'top95_energy_weighted_airkerma_accuracy': AirkermaAccuracyEnergyWeighted(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, importance_threshold=0.05),
+            'global_airkerma_gamma_3pct_2cm': AirkermaAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, metric_type='gpr', voxel_size_m=vx, rel_dose_diff=0.03, dist_crit_mm=20.0),
+            'global_airkerma_gamma_3pct_4cm': AirkermaAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, metric_type='gpr', voxel_size_m=vx, rel_dose_diff=0.03, dist_crit_mm=40.0),
+            'global_airkerma_gamma_3pct_6cm': AirkermaAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, metric_type='gpr', voxel_size_m=vx, rel_dose_diff=0.03, dist_crit_mm=60.0),
+            'global_airkerma_gamma_10pct_4cm': AirkermaAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, metric_type='gpr', voxel_size_m=vx, rel_dose_diff=0.1, dist_crit_mm=40.0),
+        },
+        voxel_resolution=voxel_res_for_plot,
+    )
+
+    # ── Batch size / compile ───────────────────────────────────────────────────
+    test_mode = train_cfg.get("test_mode", False)
+    max_inner = train_cfg.get("max_inner_batch_size", None)
+
+    if test_mode:
+        model.max_inner_batch_size = max_inner or 4096
+    elif max_inner is None:
+        model._search_optimal_batch_size()
+    else:
+        print(f"[yellow] Override max_inner_batch_size to {max_inner}")
+        model.max_inner_batch_size = max_inner
+
+    if train_cfg.get("compile_model", False) and platform in ("linux", "linux2"):
+        try:
+            model = torch.compile(model, mode="default")
+            print("[green]Model compiled.")
+        except Exception as e:
+            print(f"[red]Compile failed: {e}")
+
+    # ── Trainer ───────────────────────────────────────────────────────────────
+    batch_size = train_cfg.get("batch_size", 32)
+    effective_batch_size = train_cfg.get("effective_batch_size", None)
+    mixed_precision = train_cfg.get("mixed_precision", False)
+
+    if effective_batch_size and effective_batch_size < batch_size:
+        raise ValueError(f"effective_batch_size ({effective_batch_size}) < batch_size ({batch_size})")
+    grad_accum = effective_batch_size // batch_size if effective_batch_size else None
+
+    callbacks = [
+        LearningRateMonitor("epoch"),
+        DeviceStatsMonitor(),
+        RichProgressBar(),
+        ModelSummary(),
+        metrics_plotter,
+    ] + NETWORK_TASK.get_trainer_callbacks(
+        logger=logger, epochs=epochs, logs_path=logs_path,
+        model_name=model_name, mu_tr_file=mu_tr_file,
+        voxel_resolution=voxel_resolution, voxel_size_m=VOXEL_SIZE_M,
+        dataset_path=dataset_path,
+    )
+
+    if grad_accum:
+        callbacks.append(GradientAccumulationScheduler(scheduling={0: grad_accum}))
+    if train_cfg.get("weight_ema", False):
+        # Evaluate an EMA of the recent weights instead of the noisy last-step
+        # weights — reduces seed-to-seed variance (see callbacks/ema.py).
+        from callbacks.ema import WeightEMA
+        callbacks.append(WeightEMA(decay=float(train_cfg.get("weight_ema_decay", 0.999))))
+    if train_cfg.get("validate_gt", False):
+        callbacks.append(ValidateGroundTruth())
+
+    trainer = pl.Trainer(
+        max_epochs=epochs,
+        log_every_n_steps=50,
+        accelerator="gpu",
+        devices=1,
+        # Optional fast-iteration caps (default 1.0 = full). Useful for quickly
+        # smoke-testing a new model end-to-end before a full run.
+        limit_train_batches=train_cfg.get("limit_train_batches", 1.0),
+        limit_val_batches=train_cfg.get("limit_val_batches", 1.0),
+        # Validation runs the full-volume assembly + the heavy HTML plotters, so on long runs
+        # validating every epoch dominates wall-clock (and can wedge the online media upload).
+        # Default 1 (every epoch); set check_val_every_n_epoch in the YAML to throttle it.
+        check_val_every_n_epoch=int(train_cfg.get("check_val_every_n_epoch", 1)),
+        num_sanity_val_steps=0,
+        precision="16-mixed" if mixed_precision else "32-true",
+        profiler=os.environ.get("RF_PROFILER", "simple"),  # ON by default; set RF_PROFILER=advanced for op-level, or "" to disable
+        logger=logger.get_lightning_callback(),
+        enable_checkpointing=(args.task == "train"),
+        gradient_clip_val=1.0,
+        callbacks=callbacks,
+    )
+    logger.log_model(model)
+
+    if dataset_type == DatasetType.Voxelwise:
+        datamodule.batch_size = model.max_inner_batch_size // 8
+
+    NETWORK_TASK.run_task(trainer, model, datamodule)
+    logger.finalize_logging()
