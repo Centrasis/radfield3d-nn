@@ -188,30 +188,112 @@ class AirkermaSphereAccuracy(MetricBase):
         return accuracy.mean()
 
 
+class AirkermaSupervoxelScatterAccuracy(AirkermaAccuracy):
+    """Scatter accuracy on SUPERVOXEL-aggregated air-kerma (sv³ voxels summed = dose in a volume).
+
+    The per-voxel scatter metrics are MC-noise-bounded: the bulk's relative noise is ~400% median,
+    so even a PERFECT model caps at ≈0.66 per-voxel. Aggregating sv³ voxels divides the noise by
+    ~sv^{3/2} (sv=8 → ÷22, bulk rel-noise → ~20%, perfect-model ceiling ≈0.92), which is where the
+    >0.85–0.9 accuracy goal (10–15% uncertainty in the occupied region) is physically measurable —
+    and it is the clinically meaningful quantity (dose accumulated in a shoulder-sized volume),
+    the same philosophy as the gamma pass-rate's distance tolerance.
+
+    Mask: supervoxels whose direct-beam content exceeds ``max_relative_flux`` of the direct max are
+    excluded (the beam is scored by top90/gamma); everything else is scored.
+    """
+
+    def __init__(self, mu_tr_file: str, spectra_bins: int, max_energy_eV: float, supervoxel: int = 8,
+                 max_relative_flux: float = 5e-2, weight_with_error: bool = False):
+        super().__init__(mu_tr_file, spectra_bins, max_energy_eV, weight_with_error,
+                         importance_threshold=0.0, keep_dim=False, metric_type='smape')
+        self.sv = int(supervoxel)
+        self.max_relative_flux = float(max_relative_flux)
+
+    def _pool(self, vol: Tensor) -> Tensor:
+        """Sum-pool the spatial dims by sv (crop the remainder)."""
+        v = vol
+        while v.dim() < 5:
+            v = v.unsqueeze(0)
+        D, H, W = v.shape[-3:]
+        d, h, w = D // self.sv, H // self.sv, W // self.sv
+        v = v[..., :d * self.sv, :h * self.sv, :w * self.sv]
+        return torch.nn.functional.avg_pool3d(v, self.sv) * (self.sv ** 3)
+
+    def forward(self, target, prediction, input: TrainingInputData = None) -> Tensor:
+        # air-kerma volumes of GT and prediction
+        t_ak = self.airkerma.forward(target.spectrum, target.flux) if isinstance(target, RadiationFieldChannel) \
+            else (target.air_kerma if isinstance(target, AirKermaField) else target)
+        p_ak = self.airkerma.forward(prediction.spectrum, prediction.flux) if isinstance(prediction, RadiationFieldChannel) \
+            else (prediction.air_kerma if isinstance(prediction, AirKermaField) else prediction)
+        t_sv, p_sv = self._pool(t_ak), self._pool(p_ak)
+
+        # beam exclusion from the (unjoined) direct channel, pooled with the same kernel
+        xgt = None
+        if input is not None:
+            src = input.original_ground_truth if getattr(input, "original_ground_truth", None) is not None else input.ground_truth
+            if isinstance(src, RadiationField) and src.direct_beam is not None:
+                xgt = src.direct_beam.flux
+        if xgt is not None:
+            x_sv = self._pool(xgt)
+            beam_sv = x_sv > x_sv.max() * self.max_relative_flux
+            t_sv = t_sv.masked_fill(beam_sv, -torch.inf)
+            p_sv = p_sv.masked_fill(beam_sv, -torch.inf)
+
+        return self.metric.forward(t_sv, p_sv, input)
+
+
 class AirkermaScatterAccuracy(AirkermaAccuracy):
-    def __init__(self, mu_tr_file: str, spectra_bins: int, max_energy_eV: float, weight_with_error: bool = False, keep_dim: bool = False, max_relative_flux: float = 5e-2, min_relative_flux: float = 5e-3, metric_type: Union[Literal['smape'], Literal['log_rmse'], Literal['ncc']] = 'smape'):
+    def __init__(self, mu_tr_file: str, spectra_bins: int, max_energy_eV: float, weight_with_error: bool = False, keep_dim: bool = False, max_relative_flux: float = 5e-2, min_relative_flux: float = 5e-3, metric_type: Union[Literal['smape'], Literal['log_rmse'], Literal['ncc']] = 'smape',
+                 use_error: bool = True, error_threshold: float = 0.5):
+        """Scatter-field air-kerma accuracy (beam excluded). Two low-signal masking modes:
+
+        * ``use_error=True`` (DEFAULT — THE scatter-volume definition, the same volume the
+          loss-normalizer study + MC-floor analysis visualize): voxels whose **per-voxel MC
+          statistical error** marks the GT as noise-dominated (``error >= error_threshold``;
+          the DS03 error layer is ~binary {0,1}) are excluded. This scores the REAL scatter
+          field — ~86–91% of DS03 voxels — without rewarding/punishing the unfittable MC noise.
+        * ``use_error=False`` (LEGACY — the published bright-ring definition): voxels below
+          ``min_relative_flux`` of the total-flux max are excluded — only the bright-scatter
+          ring (~3% of DS03 voxels) scores. Kept for comparability with the published 0.84.
+
+        The beam exclusion (direct > ``max_relative_flux``·direct_max) applies in both modes.
+        """
         super().__init__(mu_tr_file, spectra_bins, max_energy_eV, weight_with_error, importance_threshold=0.0, keep_dim=keep_dim, metric_type=metric_type)
         self.max_relative_flux = max_relative_flux
         self.min_relative_flux = min_relative_flux
+        self.use_error = bool(use_error)
+        self.error_threshold = float(error_threshold)
 
     def forward(self, target: Union[RadiationFieldChannel, AirKermaField, Tensor], prediction: Union[RadiationFieldChannel, AirKermaField, Tensor], input: TrainingInputData = None) -> Tensor:
         assert (isinstance(input.ground_truth, RadiationField) and input.ground_truth.direct_beam is not None) or (input.original_ground_truth is not None and input.original_ground_truth.direct_beam is not None), "Input TrainingInputData must contain direct_beam for scatter field accuracy."
 
-        xgt = input.original_ground_truth.direct_beam if input.original_ground_truth is not None and input.original_ground_truth.direct_beam is not None else input.ground_truth.direct_beam
-        xgt = xgt.flux if isinstance(xgt, RadiationFieldChannel) else xgt
-        sgt = input.original_ground_truth.scatter_field if input.original_ground_truth is not None and input.original_ground_truth.scatter_field is not None else input.ground_truth.scatter_field
-        sgt = sgt.flux if isinstance(sgt, RadiationFieldChannel) else sgt
+        xgt_ch = input.original_ground_truth.direct_beam if input.original_ground_truth is not None and input.original_ground_truth.direct_beam is not None else input.ground_truth.direct_beam
+        xgt = xgt_ch.flux if isinstance(xgt_ch, RadiationFieldChannel) else xgt_ch
+        sgt_ch = input.original_ground_truth.scatter_field if input.original_ground_truth is not None and input.original_ground_truth.scatter_field is not None else input.ground_truth.scatter_field
+        sgt = sgt_ch.flux if isinstance(sgt_ch, RadiationFieldChannel) else sgt_ch
         fgt = sgt + xgt
 
         beam_mask = xgt > xgt.max() * self.max_relative_flux  # ignore areas with > max_relative_flux of max primary flux
-        low_flux_mask_gt = fgt < fgt.max() * self.min_relative_flux  # ignore areas with < min_relative_flux of max total flux
-        if isinstance(prediction, RadiationFieldChannel):
-            low_flux_mask = prediction.flux < prediction.flux.max() * self.min_relative_flux  # ignore areas with < min_relative_flux of max predicted flux
-        elif isinstance(prediction, AirKermaField):
-            low_flux_mask = prediction.air_kerma < prediction.air_kerma.max() * self.min_relative_flux  # ignore areas with < min_relative_flux of max predicted air kerma
+
+        scatter_error = sgt_ch.error if isinstance(sgt_ch, RadiationFieldChannel) else None
+        if self.use_error and scatter_error is not None:
+            # Noise-aware mode: exclude voxels where the MC statistical error marks the GT itself
+            # as noise-dominated; everything else (the real, reliable scatter field) is scored.
+            noise_mask = scatter_error >= self.error_threshold
+            if noise_mask.shape != fgt.shape and noise_mask.numel() == fgt.numel():
+                noise_mask = noise_mask.reshape(fgt.shape)
+            beam_mask = beam_mask | noise_mask
         else:
-            low_flux_mask = prediction < prediction.max() * self.min_relative_flux  # ignore areas with < min_relative_flux of max predicted value
-        beam_mask = beam_mask | (low_flux_mask & low_flux_mask_gt)  # combine masks
+            if self.use_error:
+                print("[yellow]AirkermaScatterAccuracy(use_error=True) but no scatter error layer present — falling back to the flux-threshold mask.[/yellow]")
+            low_flux_mask_gt = fgt < fgt.max() * self.min_relative_flux  # ignore areas with < min_relative_flux of max total flux
+            if isinstance(prediction, RadiationFieldChannel):
+                low_flux_mask = prediction.flux < prediction.flux.max() * self.min_relative_flux  # ignore areas with < min_relative_flux of max predicted flux
+            elif isinstance(prediction, AirKermaField):
+                low_flux_mask = prediction.air_kerma < prediction.air_kerma.max() * self.min_relative_flux  # ignore areas with < min_relative_flux of max predicted air kerma
+            else:
+                low_flux_mask = prediction < prediction.max() * self.min_relative_flux  # ignore areas with < min_relative_flux of max predicted value
+            beam_mask = beam_mask | (low_flux_mask & low_flux_mask_gt)  # combine masks
 
         if isinstance(target, RadiationFieldChannel):
             target.flux[beam_mask] = -torch.inf

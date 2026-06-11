@@ -23,6 +23,11 @@ from radfield3dnn.models.layers import FiLM, Concat, GatedFusion, ResidualFiLM, 
 from radfield3dnn.preprocessing.normalizations.base import Normalizer
 
 
+# Variance-preserving init gain for SiLU hidden layers: 1/sqrt(E[silu(x)^2]) for x~N(0,1)
+# (E[silu(x)^2] = 0.35577, measured to 5e-5; analogue of ReLU's sqrt(2)).
+SILU_GAIN = 1.6765
+
+
 class RFNetBase(FeedforwardPointwiseModel):
     @property
     def output_head_markers(self) -> tuple[str, ...]:
@@ -30,8 +35,11 @@ class RFNetBase(FeedforwardPointwiseModel):
         return ("spectra_decoder", "flux_decoder")
 
     def _init_weights(self, module: nn.Module):
+        # Hidden layers: SiLU-optimal gain (the trunk/decoder hidden activations are SiLU),
+        # biases plainly zero everywhere. The only special-cased bias is the flux OUTPUT
+        # layer, set from the flux activation in apply_weights_init.
         if isinstance(module, nn.Linear):
-            nn.init.xavier_uniform_(module.weight, gain=1.0)
+            nn.init.xavier_uniform_(module.weight, gain=SILU_GAIN)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
 
@@ -63,8 +71,10 @@ class RFBackboneModel(nn.Module):
                  location_encoding_params: dict = None,
                  direction_encoding_params: dict = None,
                  conditioning_params: dict = None,
-                 trunk_depth: int = 4):
+                 trunk_depth: int = 4,
+                 flux_head_hidden: int = 1):
         super().__init__()
+        self._flux_head_hidden = int(flux_head_hidden)
         self.d_model = d_model
         self.out_spectra_dim = out_spectra_dim
         self._precision = precision
@@ -104,7 +114,7 @@ class RFBackboneModel(nn.Module):
             nn.Identity() if not self.use_layer_norm else nn.LayerNorm(d_model),  # LayerNorm only if not using FiLM
             nn.SiLU(True),
             nn.Linear(d_model, d_model),
-            nn.Identity()  # no activation before FiLM (conditioning) — FiLM applies LayerNorm + its own non-linearity; the non-FiLM path activates in forward()
+            nn.SiLU(True) if self.use_conditioning else nn.Identity()
         )
 
         if self.use_layer_norm:
@@ -123,7 +133,7 @@ class RFBackboneModel(nn.Module):
             _block2_layers += [nn.Linear(d_model, d_model), nn.SiLU(True)]
         _block2_layers += [
             nn.Linear(d_model, d_model),
-            nn.Identity(),  # no activation before FiLM2
+            nn.SiLU(True) if self.use_conditioning else nn.Identity(),
         ]
         self.block2 = nn.Sequential(*_block2_layers)
 
@@ -134,27 +144,23 @@ class RFBackboneModel(nn.Module):
             nn.Linear(d_model // 2, self.out_spectra_dim)
         )
         # Flux head bumped from 1 Linear → Linear+SiLU+Linear (one hidden).
-        # HDR flux distribution (~87% empty + sharp peaks) is too non-linear
-        # for a single matrix-vector projection; one SiLU non-linearity lets
-        # the head model the bimodal "beam present / not present" decision
-        # before projecting to the scalar. Mirrors the symmetric CPP change
-        # to flux_projector (n_hidden_layers=0 → 1).
-        self.flux_decoder = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.SiLU(True),
-            nn.Linear(d_model, 1),
-        )
+        # Flux head depth = ``flux_head_hidden`` SiLU-separated hidden Linears before the scalar
+        # projection. Default 1 (Linear+SiLU+Linear): the HDR flux distribution (~87% empty +
+        # sharp peaks) is too non-linear for a single matrix-vector projection; one SiLU lets the
+        # head model the bimodal "beam present / not present" decision (mirrors the CPP
+        # flux_projector n_hidden_layers 0→1). ``flux_head_hidden=0`` reproduces the PUBLISHED
+        # single-Linear head (ablation C2).
+        _flux_layers: list[nn.Module] = []
+        for _ in range(self._flux_head_hidden):
+            _flux_layers += [nn.Linear(d_model, d_model), nn.SiLU(True)]
+        _flux_layers += [nn.Linear(d_model, 1)]
+        self.flux_decoder = nn.Sequential(*_flux_layers)
         
         self.spectra_activation = HistogramNormalize(dim=-1)  # nn.Softmax(dim=-1)
-        # Linear-clamp ([0,1] or [-1,1]) with gradient passing through. Replaces
-        # the previous Sigmoid branch — Sigmoid saturates near 0/1 and forces a
-        # nonlinear inverse the network has to learn; with ~95% of normalized
-        # targets in (0.25,0.75) the linear-clamp gives 4× the midpoint gradient
-        # and emits exact endpoints (Sigmoid's range is open). A constant
-        # additive offset (default 0.5 = codomain midpoint, joined-DS03 mean
-        # in normalized space is 0.582) starts the network at the data
-        # centroid; applied in decode_results.
-        # Two selectable flux activations (B-4):
+        # Flux activations. The output-layer bias is decided by the chosen activation
+        # (its `init_bias` = the pre-activation putting the initial output at the codomain
+        # midpoint / max-gradient point); see apply_weights_init.
+        # Selectable flux activations (B-4):
         #   "clamp"   — historic gradient-conserving hard clamp; matches the
         #               normalizer's exact codomain endpoints. Suffers from
         #               "predict 0 forever" lock-in once z is pushed below
@@ -196,7 +202,7 @@ class RFBackboneModel(nn.Module):
         elif isinstance(self._normalizer, AsinhTonemapNormalizer):
             # asinh tonemap codomain is [0,1] (y = asinh(x/σ)/asinh(1/σ), bounded), so the head clamps
             # to [0,1] — same range as linear0_1, but the targets are tonemapped (HDR-spread). The
-            # data-adaptive bias (≈0.5, midpoint) starts the head in the activation's high-gradient interior.
+            # activation's init_bias (0.5, midpoint) starts the head in its high-gradient interior.
             self.flux_activation = GradientConservingClamping(0.0, 1.0)
         else:
             print(f"Warning: Using default flux activation (0.0, 1.0) clamping for unknown normalizer: {self._normalizer.__class__}.")
@@ -357,8 +363,8 @@ class SRBFNet(RFNetBase):
         global_parameters = self.backbone_model.encode_additional_parameters(x)
         return super().forward2volume(x, voxel_counts, self.out_spectra_dim, mask=mask, global_parameters=global_parameters)
 
-    def __init__(self, d_model=256, out_spectra_dim=32, flux_loss="L1LogLoss", spectrum_loss="HistogramLoss", normalizer=None, precision: Literal["fp32", "fp16"] = "fp32", flux_activation: Literal["clamp", "softclip", "sigmoid"] = "clamp", flux_bias_init: float = 0.5,
-                 location_encoding_params: dict = None, direction_encoding_params: dict = None, conditioning_params: dict = None, training_params: dict = None, trunk_depth: int = 4):
+    def __init__(self, d_model=256, out_spectra_dim=32, flux_loss="L1LogLoss", spectrum_loss="HistogramLoss", normalizer=None, precision: Literal["fp32", "fp16"] = "fp32", flux_activation: Literal["clamp", "softclip", "sigmoid"] = "clamp",
+                 location_encoding_params: dict = None, direction_encoding_params: dict = None, conditioning_params: dict = None, training_params: dict = None, trunk_depth: int = 4, flux_head_hidden: int = 1):
         # Optimization/sampling knobs (learning_rate, max_lr, voxel-sampling flags) are folded into one
         # ``training_params`` dict; the individual values are unpacked here and threaded into the shared
         # FeedforwardPointwiseModel base (whose signature is kept stable for the other model families).
@@ -390,10 +396,10 @@ class SRBFNet(RFNetBase):
         self._precision = precision
         self._max_lr = float(max_lr)
         self._flux_activation_kind = flux_activation
-        self._flux_bias_init = float(flux_bias_init)   # output-bias prior (see apply_weights_init)
         self._location_encoding_params = location_encoding_params
         self._direction_encoding_params = direction_encoding_params
         self._trunk_depth = int(trunk_depth)
+        self._flux_head_hidden = int(flux_head_hidden)
 
         self.flux_loss_name = flux_loss
         self.spectrum_loss_name = spectrum_loss
@@ -411,6 +417,7 @@ class SRBFNet(RFNetBase):
             location_encoding_params=location_encoding_params,
             direction_encoding_params=direction_encoding_params,
             trunk_depth=trunk_depth,
+            flux_head_hidden=flux_head_hidden,
         )
 
         self.apply_weights_init()
@@ -420,26 +427,25 @@ class SRBFNet(RFNetBase):
         return self.backbone_model
         
     def apply_weights_init(self):
+        # One uniform scheme: SiLU-gain weights + zero bias everywhere (_init_weights). The
+        # FINAL Linear of each decoder is an output projection (no SiLU after it), so it gets
+        # the standard gain-1 init instead of the SiLU gain.
         self.apply(self._init_weights)
+        for head in (self.backbone_model.spectra_decoder, self.backbone_model.flux_decoder):
+            out_linears = [m for m in head.modules() if isinstance(m, nn.Linear)]
+            if out_linears:
+                nn.init.xavier_uniform_(out_linears[-1].weight, gain=1.0)
 
-        def _init_decoders(module):
-            if isinstance(module, nn.Linear):
-                # Use smaller initialization for better gradient flow
-                nn.init.xavier_uniform_(module.weight, gain=0.1)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-        self.backbone_model.spectra_decoder.apply(_init_decoders)
-        self.backbone_model.flux_decoder.apply(_init_decoders)
-
-        # Output-bias prior. _init_decoders zero-inits every bias; with no additive flux offset that
-        # leaves the flux head predicting ~0 (the clamp FLOOR), where the peak-crushed scatter band
-        # gets negligible absolute-error gradient -> predict-0 lock-in (scatter never learns; verified
-        # in claude-notes/hdr-analysis/_init_test.py). Best practice: set the OUTPUT bias so the initial
-        # prediction sits in the activation's high-gradient interior, i.e. at the target prior. The bias
-        # carries the prior — just initialized correctly (azdsp5fb's working value was 0.5).
+        # Flux OUTPUT bias is decided by the actual flux activation: each activation reports the
+        # pre-activation value (init_bias) that places the initial output at its codomain midpoint /
+        # maximum-gradient point — clamp(lo,hi) -> (lo+hi)/2, softclip -> 0 (output 0.5),
+        # sigmoid -> 0 (output 0.5). A zero bias on a clamp(0,1) head would start at the clamp
+        # FLOOR, where the peak-crushed scatter band gets no gradient -> predict-0 lock-in
+        # (verified in claude-notes/hdr-analysis/_init_test.py).
         flux_linears = [m for m in self.backbone_model.flux_decoder.modules() if isinstance(m, nn.Linear)]
         if flux_linears and flux_linears[-1].bias is not None:
-            nn.init.constant_(flux_linears[-1].bias, float(getattr(self, "_flux_bias_init", 0.5)))
+            bias = float(getattr(self.backbone_model.flux_activation, "init_bias", 0.0))
+            nn.init.constant_(flux_linears[-1].bias, bias)
 
         if self.backbone_model.beam_conditioner1 is not None:
             self.backbone_model.beam_conditioner1.initialize()
@@ -457,13 +463,13 @@ class SRBFNet(RFNetBase):
             "flux_loss": self.flux_loss_name,
             "spectrum_loss": self.spectrum_loss_name,
             "training_params": self._training_params,
-            "flux_bias_init": self._flux_bias_init,
             "normalizer": self._normalizer.get_type() if self._normalizer is not None else None,
             "precision": self._precision,
             "flux_activation": self._flux_activation_kind,
             "location_encoding_params": self._location_encoding_params,
             "direction_encoding_params": self._direction_encoding_params,
             "trunk_depth": self._trunk_depth,
+            "flux_head_hidden": self._flux_head_hidden,
         }
 
 
@@ -477,8 +483,8 @@ class SPERFNet(SRBFNet):
     class BackboneModel(RFBackboneModel):
         def __init__(self, d_model=256, out_spectra_dim=32, normalizer=None, precision: Literal["fp32", "fp16"] = "fp32", flux_activation: Literal["clamp", "softclip", "sigmoid"] = "clamp",
                      location_encoding_params: dict = None, direction_encoding_params: dict = None,
-                     spectra_encoding_params: dict = None, conditioning_params: dict = None, trunk_depth: int = 4):
-            super().__init__(d_model=d_model, out_spectra_dim=out_spectra_dim, normalizer=normalizer, conditioning_params=conditioning_params, precision=precision, flux_activation=flux_activation, location_encoding_params=location_encoding_params, direction_encoding_params=direction_encoding_params, trunk_depth=trunk_depth)
+                     spectra_encoding_params: dict = None, conditioning_params: dict = None, trunk_depth: int = 4, flux_head_hidden: int = 1):
+            super().__init__(d_model=d_model, out_spectra_dim=out_spectra_dim, normalizer=normalizer, conditioning_params=conditioning_params, precision=precision, flux_activation=flux_activation, location_encoding_params=location_encoding_params, direction_encoding_params=direction_encoding_params, trunk_depth=trunk_depth, flux_head_hidden=flux_head_hidden)
             # Spectrum encoder built from a self-contained ``{"type", **kwargs}`` dict via the spectra
             # factory; the chosen encoder exposes its output width as ``encoded_dims`` (``projector``
             # keeps the raw-spectrum dim — the old use_spectra_encoding=False path; ``simple`` bottlenecks).
@@ -500,8 +506,8 @@ class SPERFNet(SRBFNet):
             beam_params = self.beam_encoder([dir_enc, spectrum])
             return beam_params
 
-    def __init__(self, d_model=256, out_spectra_dim=32, flux_loss="L1LogLoss", spectrum_loss="HistogramLoss", normalizer=None, precision: Literal["fp32", "fp16"] = "fp32", flux_activation: Literal["clamp", "softclip", "sigmoid"] = "clamp", flux_bias_init: float = 0.5,
-                 location_encoding_params: dict = None, direction_encoding_params: dict = None, spectra_encoding_params: dict = None, conditioning_params: dict = None, training_params: dict = None, trunk_depth: int = 4):
+    def __init__(self, d_model=256, out_spectra_dim=32, flux_loss="L1LogLoss", spectrum_loss="HistogramLoss", normalizer=None, precision: Literal["fp32", "fp16"] = "fp32", flux_activation: Literal["clamp", "softclip", "sigmoid"] = "clamp",
+                 location_encoding_params: dict = None, direction_encoding_params: dict = None, spectra_encoding_params: dict = None, conditioning_params: dict = None, training_params: dict = None, trunk_depth: int = 4, flux_head_hidden: int = 1):
         super().__init__(
             d_model=d_model,
             out_spectra_dim=out_spectra_dim,
@@ -510,10 +516,9 @@ class SPERFNet(SRBFNet):
             training_params=training_params,
             conditioning_params=conditioning_params,
             normalizer=normalizer,
-            flux_bias_init=flux_bias_init,
             precision=precision,
             flux_activation=flux_activation,
-            location_encoding_params=location_encoding_params, direction_encoding_params=direction_encoding_params, trunk_depth=trunk_depth,
+            location_encoding_params=location_encoding_params, direction_encoding_params=direction_encoding_params, trunk_depth=trunk_depth, flux_head_hidden=flux_head_hidden,
         )
 
         self.backbone_model = SPERFNet.BackboneModel(
@@ -524,7 +529,7 @@ class SPERFNet(SRBFNet):
             out_spectra_dim=out_spectra_dim,
             precision=precision,
             flux_activation=flux_activation,
-            location_encoding_params=location_encoding_params, direction_encoding_params=direction_encoding_params, trunk_depth=trunk_depth,
+            location_encoding_params=location_encoding_params, direction_encoding_params=direction_encoding_params, trunk_depth=trunk_depth, flux_head_hidden=flux_head_hidden,
         )
         self.d_encoded_spectra = self.backbone_model.d_encoded_spectra
         self.d_beam_parameters_features = self.backbone_model.positional_direction_encoding.encoded_dims + self.d_encoded_spectra
@@ -548,8 +553,8 @@ class PBRFNet(SPERFNet):
     class BackboneModel(SPERFNet.BackboneModel):
         def __init__(self, d_model=256, out_spectra_dim=32, normalizer=None, scalar_encoding_dims=16, precision: Literal["fp32", "fp16"] = "fp32", flux_activation: Literal["clamp", "softclip", "sigmoid"] = "clamp",
                      location_encoding_params: dict = None, direction_encoding_params: dict = None,
-                     spectra_encoding_params: dict = None, conditioning_params: dict = None, trunk_depth: int = 4):
-            super().__init__(d_model=d_model, out_spectra_dim=out_spectra_dim, normalizer=normalizer, conditioning_params=conditioning_params, spectra_encoding_params=spectra_encoding_params, precision=precision, flux_activation=flux_activation, location_encoding_params=location_encoding_params, direction_encoding_params=direction_encoding_params, trunk_depth=trunk_depth)
+                     spectra_encoding_params: dict = None, conditioning_params: dict = None, trunk_depth: int = 4, flux_head_hidden: int = 1):
+            super().__init__(d_model=d_model, out_spectra_dim=out_spectra_dim, normalizer=normalizer, conditioning_params=conditioning_params, spectra_encoding_params=spectra_encoding_params, precision=precision, flux_activation=flux_activation, location_encoding_params=location_encoding_params, direction_encoding_params=direction_encoding_params, trunk_depth=trunk_depth, flux_head_hidden=flux_head_hidden)
             # use_beam_shape lives in conditioning_params (folded with the fusion ``type``).
             use_beam_shape = bool(self._conditioning_params.get("use_beam_shape", False))
             self.opening_angle_encoder = nn.Sequential(
@@ -604,13 +609,12 @@ class PBRFNet(SPERFNet):
             return beam
 
     def __init__(self, d_model=256, out_spectra_dim=32, scalar_encoding_dims=16, flux_loss="L1LogLoss", spectrum_loss="HistogramLoss", normalizer=None, precision: Literal["fp32", "fp16"] = "fp32", flux_activation: Literal["clamp", "softclip", "sigmoid"] = "clamp",
-                 flux_bias_init: float = 0.5,
-                 location_encoding_params: dict = None, direction_encoding_params: dict = None, spectra_encoding_params: dict = None, conditioning_params: dict = None, training_params: dict = None, trunk_depth: int = 4):
+                 location_encoding_params: dict = None, direction_encoding_params: dict = None, spectra_encoding_params: dict = None, conditioning_params: dict = None, training_params: dict = None, trunk_depth: int = 4, flux_head_hidden: int = 1):
         if conditioning_params is None:
             conditioning_params = {"type": "None"}
         conditioning_params = dict(conditioning_params)
         conditioning_params.setdefault("use_beam_shape", True)   # PBRFNet historically defaults beam-shape ON
-        super().__init__(d_model=d_model, out_spectra_dim=out_spectra_dim, flux_loss=flux_loss, spectrum_loss=spectrum_loss, training_params=training_params, conditioning_params=conditioning_params, normalizer=normalizer, precision=precision, flux_activation=flux_activation, flux_bias_init=flux_bias_init, location_encoding_params=location_encoding_params, direction_encoding_params=direction_encoding_params, spectra_encoding_params=spectra_encoding_params, trunk_depth=trunk_depth)
+        super().__init__(d_model=d_model, out_spectra_dim=out_spectra_dim, flux_loss=flux_loss, spectrum_loss=spectrum_loss, training_params=training_params, conditioning_params=conditioning_params, normalizer=normalizer, precision=precision, flux_activation=flux_activation, location_encoding_params=location_encoding_params, direction_encoding_params=direction_encoding_params, spectra_encoding_params=spectra_encoding_params, trunk_depth=trunk_depth, flux_head_hidden=flux_head_hidden)
         self.scalar_encoding_dims = scalar_encoding_dims
         self.use_beam_shape = bool(conditioning_params.get("use_beam_shape", True))
 
@@ -625,7 +629,7 @@ class PBRFNet(SPERFNet):
             scalar_encoding_dims=scalar_encoding_dims,
             precision=precision,
             flux_activation=flux_activation,
-            location_encoding_params=location_encoding_params, direction_encoding_params=direction_encoding_params, trunk_depth=trunk_depth,
+            location_encoding_params=location_encoding_params, direction_encoding_params=direction_encoding_params, trunk_depth=trunk_depth, flux_head_hidden=flux_head_hidden,
         )
 
         self.apply_weights_init()

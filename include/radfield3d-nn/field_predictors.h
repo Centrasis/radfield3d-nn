@@ -97,6 +97,16 @@ public:
     bool is_voxelwise() const { return voxelwise_; }   // trunk graph has a per-point position input
     int  spectrum_bins() const { return out_bins_; }
 
+    // Register the [min,max] metric range of a beam parameter (taken from the RF3M ModelDomain).
+    // Parameters the model trained on in NORMALIZED form — i.e. a metric input it does not normalise
+    // itself (e.g. "distance" in metres, "opening_angle" in degrees) — are clipped to this range and
+    // linearly mapped to [0,1] before encoding, matching the training-time BeamParametersNormalization.
+    // Self-normalised inputs (the "direction" unit vector, the "spectrum" histogram) are left untouched.
+    // rfnn::io::V1::LoadedModel::build() calls this for every domain parameter; without it, metric
+    // inputs reach the graph un-normalised and the prediction is wrong (the deployed beam latent does
+    // not match training).
+    void set_parameter_range(const std::string& name, float min, float max);
+
     // Whole-field prediction. Field-wise models emit the volume in one Run(); VoxelFieldPredictor
     // overrides this to tile per-voxel queries over the grid in `max_inner_batch` chunks.
     virtual FieldPrediction predict_volume(const BeamParameters& beam, std::array<int, 3> dims,

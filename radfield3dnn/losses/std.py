@@ -1,3 +1,4 @@
+import math
 from .base import Loss
 from torch import Tensor, nn
 from radfield3dnn.rftypes import TrainingInputData
@@ -248,6 +249,234 @@ class PlainL2Loss(Loss):
             vf = valid_mask.to(per_voxel.dtype)
             return (per_voxel * vf).sum(dim=reduce_dims) / vf.sum(dim=reduce_dims).clamp(min=1.0)
         return per_voxel.mean(dim=reduce_dims)
+
+
+class SMAPERegionBalancedLoss(Loss):
+    """Metric-targeted, region-balanced SMAPE loss (the pipeline-audit P0 fix).
+
+    Trains the SAME functional the evaluation scores (per-voxel SMAPE = 2|p−t|/(|p|+|t|+eps)) and
+    rebalances the gradient across the three regions the metrics actually score, instead of letting
+    voxel counts decide (DS03: bulk:ring:beam ≈ 92% : 3% : <0.1%):
+
+      * beam  — t ≥ beam_rel · max(t)   (drives top90 + the GPR high-dose criterion)
+      * ring  — ring_rel ≤ t < beam_rel (the legacy bright-ring scatter metric region)
+      * bulk  — t < ring_rel AND statistically reliable (drives the noise-aware scatter metric)
+      * noise — MC-noise voxels (joined error ≥ err_threshold) get a ONE-SIDED HINGE instead of a
+        fit: zero cost while the prediction stays below hinge_rel · max(t), SMAPE-style cost above.
+        Masked-out ≠ unconstrained: with no term at all the smooth MLP freely extrapolated radiation
+        blobs into the noise region (observed: box-corner hallucinations, |rel err| ≈ 1.0 at the
+        corners). The hinge pins the noise region down ("we don't know the exact value, but we know
+        it is small") without fitting the MC noise itself.
+
+    Each region's per-voxel cost is averaged separately and the region means are averaged, so every
+    region receives the same total gradient mass per field. After ChannelsJoin the bulk error sits at
+    ≈0.5 (reliable scatter + leakage direct) and true noise at ≈1.0 — hence the 0.75 default
+    threshold. SMAPE is scale-invariant, so under LinearNormalizer(0,1) this optimizes physical
+    relative accuracy directly — exactly what SMAPE-accuracy and the gamma pass-rate reward.
+    """
+
+    def __init__(self, eps: float = 1e-4, beam_rel: float = 5e-2, ring_rel: float = 5e-3,
+                 err_threshold: float = 0.75, hinge_rel: float = None, weight_with_error: bool = False,
+                 core: str = "smape"):
+        super().__init__()
+        # eps must sit AT/BELOW the reliable-bulk median (~6e-5 normalized), not above it: with
+        # eps=1e-3 the bulk denominator was eps-dominated -> near-absolute (damped) treatment -> the
+        # bulk level was never anchored and oscillated with the LR (observed: val_loss monotone down
+        # while the bulk-dominated noise-aware scatter metric swung 0.19->0.08). Noise amplification
+        # is already guarded by the reliability mask + hinge, so eps only needs to bound the deepest
+        # reliable voxels (x10 at t=1e-5).
+        self.eps = float(eps)
+        # Per-voxel core:
+        #   "smape"    — 2|p−t|/(|p|+|t|+eps): the metric's own functional, BUT saturates on the
+        #                over-prediction side (grad ≈ 4t/(p+t)² → ~4e-4 for a ghost at p=0.3, t=1e-4)
+        #                so misplaced/rotated bright structure is nearly FREE to keep. Observed at
+        #                ep153: bright-region IoU 0.29, 63% of predicted beam mass outside the GT
+        #                beam (ghost/rotated beams).
+        #   "logratio" — |log10((p+eps)/(t+eps))| clamped to 6 decades: non-saturating relative
+        #                error; gradient ~ 1/(p+eps) pushes ghosts down at full strength (~1.4 at
+        #                p=0.3 — ~3500x SMAPE's) while keeping strong under-prediction gradients.
+        #                Monotone in relative error, so it still optimizes the SMAPE metrics.
+        assert core in ("smape", "logratio"), f"Unknown core {core!r}"
+        self.core = core
+        self.beam_rel = float(beam_rel)
+        self.ring_rel = float(ring_rel)
+        self.err_threshold = float(err_threshold)
+        # Hinge threshold for the noise region (relative to per-field max). Defaults to ring_rel:
+        # a noise voxel predicting above the bright-ring threshold is unambiguously wrong.
+        self.hinge_rel = float(hinge_rel) if hinge_rel is not None else float(ring_rel)
+        self.weight_with_error = weight_with_error  # kept for interface parity; masking supersedes it
+
+    def _gt_error(self, input: TrainingInputData, like: Tensor):
+        gt = getattr(input, "ground_truth", None) if input is not None else None
+        err = None
+        if gt is not None:
+            if hasattr(gt, "scatter_field") and gt.scatter_field is not None and getattr(gt.scatter_field, "error", None) is not None:
+                err = gt.scatter_field.error
+                if hasattr(gt, "direct_beam") and gt.direct_beam is not None and getattr(gt.direct_beam, "error", None) is not None:
+                    err = (err + gt.direct_beam.error) / 2.0
+            elif getattr(gt, "error", None) is not None:
+                err = gt.error
+        if err is None:
+            return None
+        if err.shape != like.shape and err.numel() == like.numel():
+            err = err.reshape(like.shape)
+        elif err.shape != like.shape:
+            return None
+        return err
+
+    def forward(self, target: Tensor, prediction: Tensor, input: TrainingInputData) -> Tensor:
+        if prediction.shape != target.shape:
+            if prediction.ndim == target.ndim + 1 and prediction.shape[-1] == 1:
+                prediction = prediction.squeeze(-1)
+            elif target.ndim == prediction.ndim + 1 and target.shape[-1] == 1:
+                target = target.squeeze(-1)
+        valid = torch.isfinite(target) & torch.isfinite(prediction)
+        t = target.masked_fill(~valid, 0.0)
+        p = prediction.masked_fill(~valid, 0.0)
+
+        if self.core == "logratio":
+            # |log10 ratio|, clamped at 6 decades (NaN guard only; never active from the median-bias
+            # init, which starts <4 decades from the beam peak).
+            smape = (torch.log10(p.abs() + self.eps) - torch.log10(t.abs() + self.eps)).abs().clamp(max=6.0)
+        else:
+            smape = (2.0 * (p - t).abs()) / (p.abs() + t.abs() + self.eps)   # per-voxel metric core, [0,2]
+        smape = torch.nan_to_num(smape, nan=0.0, posinf=0.0, neginf=0.0)
+
+        if smape.ndim <= 1:                      # row mode (no spatial structure): plain mean
+            return smape
+
+        reduce_dims = tuple(range(1, smape.ndim))
+        tmax = t.amax(dim=reduce_dims, keepdim=True).clamp(min=1e-12)
+        rel = t / tmax
+
+        err = self._gt_error(input, t)
+        reliable = (err < self.err_threshold) if err is not None else torch.ones_like(valid)
+
+        beam = valid & (rel >= self.beam_rel)
+        ring = valid & (rel >= self.ring_rel) & (rel < self.beam_rel)
+        bulk = valid & (rel < self.ring_rel) & reliable
+        noise = valid & (rel < self.ring_rel) & ~reliable
+
+        # One-sided hinge for the noise region: free below tau = hinge_rel * max(t), cost above.
+        # Prevents the "masked = unconstrained" corner hallucination while still not fitting the MC
+        # noise values themselves. Core-matched: log-ratio hinge under the logratio core (gradient
+        # ~1/p — full-strength ghost suppression), SMAPE-style otherwise.
+        tau = self.hinge_rel * tmax
+        if self.core == "logratio":
+            hinge = (torch.log10(p.abs() + self.eps) - torch.log10(tau + self.eps)).clamp(min=0.0, max=6.0)
+        else:
+            over = (p - tau).clamp(min=0.0)
+            hinge = (2.0 * over) / (p.abs() + tau + self.eps)
+        hinge = torch.nan_to_num(hinge, nan=0.0, posinf=0.0, neginf=0.0)
+
+        def region_mean(values, mask):
+            cnt = mask.to(values.dtype).sum(dim=reduce_dims)
+            s = (values * mask.to(values.dtype)).sum(dim=reduce_dims)
+            return s / cnt.clamp(min=1.0), (cnt > 0)
+
+        means, present = zip(*(region_mean(v, m) for v, m in
+                               ((smape, beam), (smape, ring), (smape, bulk), (hinge, noise))))
+        means = torch.stack(means, dim=0)                    # [4, B]
+        present = torch.stack(present, dim=0).to(smape.dtype)
+        # average over the regions PRESENT in each field (equal gradient mass per present region)
+        return (means * present).sum(dim=0) / present.sum(dim=0).clamp(min=1.0)
+
+
+class MuLawL2Loss(Loss):
+    """μ-law tone-mapped L2 — the standard HDR-reconstruction training loss (Kalantari &
+    Ramamoorthi, SIGGRAPH 2017, "Deep High Dynamic Range Imaging of Dynamic Scenes"; used across
+    single-image HDR reconstruction, e.g. ExpandNet, HDR-GAN):
+
+        L = ( T(p) − T(t) )²   with   T(x) = log(1 + μ·x) / log(1 + μ)
+
+    One smooth formula, NO branches, NO masks, NO per-field statistics — differentiable everywhere.
+    T compresses the HDR range so every decade contributes (T linear near 0, log above 1/μ), and the
+    gradient  ∂L/∂p ∝ μ/(1+μ·p)  is non-saturating for over-prediction (≈1/p — ghosts/rotated beams
+    are pushed down at full strength) and bounded by μ at p→0 (no explosion). μ=5000 spreads the
+    DS03 normalized range [1e-4, 1] over T ∈ [0.05, 1]."""
+
+    def __init__(self, mu: float = 5000.0, weight_with_error: bool = False):
+        super().__init__()
+        self.mu = float(mu)
+        self.weight_with_error = weight_with_error
+
+    def _tonemap(self, x: Tensor) -> Tensor:
+        return torch.log1p(self.mu * x.clamp_min(0.0)) / math.log1p(self.mu)
+
+    def forward(self, target: Tensor, prediction: Tensor, input: TrainingInputData) -> Tensor:
+        if prediction.shape != target.shape:
+            if prediction.ndim == target.ndim + 1 and prediction.shape[-1] == 1:
+                prediction = prediction.squeeze(-1)
+            elif target.ndim == prediction.ndim + 1 and target.shape[-1] == 1:
+                target = target.squeeze(-1)
+        valid = torch.isfinite(target) & torch.isfinite(prediction)
+        t = target.masked_fill(~valid, 0.0)
+        p = prediction.masked_fill(~valid, 0.0)
+        per_voxel = (self._tonemap(p) - self._tonemap(t)) ** 2
+        per_voxel = torch.nan_to_num(per_voxel, nan=0.0, posinf=0.0, neginf=0.0)
+        if per_voxel.ndim <= 1:
+            return per_voxel
+        reduce_dims = tuple(range(1, per_voxel.ndim))
+        vf = valid.to(per_voxel.dtype)
+        return (per_voxel * vf).sum(dim=reduce_dims) / vf.sum(dim=reduce_dims).clamp(min=1.0)
+
+
+class RawNeRFLoss(Loss):
+    """RawNeRF HDR loss (Mildenhall et al., CVPR 2022, "NeRF in the Dark"): linear-space L2 weighted
+    by a stop-gradient relative factor, ``((p − t) / (sg(p) + eps))²``. Behaves like a relative error
+    (every decade gets gradient) while staying in LINEAR space — the proven recipe for training
+    multi-decade HDR radiance without a log transform and without the log-recipe peak underfit.
+    Pair with LinearNormalizer(0,1); eps in normalized units."""
+
+    def __init__(self, eps: float = 1e-3, weight_with_error: bool = False):
+        super().__init__()
+        self.eps = float(eps)
+        self.weight_with_error = weight_with_error
+
+    def forward(self, target: Tensor, prediction: Tensor, input: TrainingInputData) -> Tensor:
+        if prediction.shape != target.shape:
+            if prediction.ndim == target.ndim + 1 and prediction.shape[-1] == 1:
+                prediction = prediction.squeeze(-1)
+            elif target.ndim == prediction.ndim + 1 and target.shape[-1] == 1:
+                target = target.squeeze(-1)
+        valid = torch.isfinite(target) & torch.isfinite(prediction)
+        t = target.masked_fill(~valid, 0.0)
+        p = prediction.masked_fill(~valid, 0.0)
+        w = 1.0 / (p.detach().abs() + self.eps)              # sg(p): self-normalizing HDR weight
+        per_voxel = ((p - t) * w) ** 2
+        per_voxel = torch.nan_to_num(per_voxel, nan=0.0, posinf=0.0, neginf=0.0)
+        if per_voxel.ndim <= 1:
+            return per_voxel
+        reduce_dims = tuple(range(1, per_voxel.ndim))
+        vf = valid.to(per_voxel.dtype)
+        return (per_voxel * vf).sum(dim=reduce_dims) / vf.sum(dim=reduce_dims).clamp(min=1.0)
+
+
+class RawNeRFSharpLoss(RawNeRFLoss):
+    """RawNeRF + α·plain-L1 — the beam-sharpening hybrid (reconstruction-eval finding, 2026-06-11).
+
+    The deployed-model eval measured RawNeRF's failure mode: the beam is PLACED correctly but stays
+    blurred (high-dose region 10–34× too large, peak 0.05–0.2× as sharp) because the self-weight
+    ``1/(sg(p)+ε)²`` anneals ∝p⁻² as the beam forms — the refinement gradient vanishes exactly where
+    sharpening is needed. Plain absolute L1 has the complementary profile (the published sharp-beam
+    recipe): its per-voxel gradient is ±1 forever, the near-fit bulk's sign-gradients CANCEL while
+    the beam's coherent error survives — so it keeps polishing the beam to convergence, but alone it
+    starves the scatter field. The sum keeps both: RawNeRF trains every decade + erases ghosts;
+    α·L1 restores the non-annealing beam-sharpening pressure.
+
+    α=10 puts the L1 term's beam gradient at parity with RawNeRF's at the measured converged-blur
+    state (|p−t|≈0.5, p≈0.3 → RawNeRF grad ≈ 11/N vs α·L1 ≈ 10/N) and lets L1 dominate the beam as
+    RawNeRF anneals further. One smooth formula, no branches, fully differentiable.
+    """
+
+    def __init__(self, eps: float = 1e-3, alpha: float = 10.0, weight_with_error: bool = False):
+        super().__init__(eps=eps, weight_with_error=weight_with_error)
+        self.alpha = float(alpha)
+        self._l1 = PlainL1Loss(weight_with_error=False)
+
+    def forward(self, target: Tensor, prediction: Tensor, input: TrainingInputData) -> Tensor:
+        return super().forward(target, prediction, input) \
+            + self.alpha * self._l1.forward(target, prediction, input)
 
 
 class ChannelMaxBalancedLoss(Loss):

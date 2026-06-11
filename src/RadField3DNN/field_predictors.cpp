@@ -8,8 +8,10 @@
 #include <RadFiled3D/Voxel.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
+#include <map>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -36,6 +38,9 @@ struct VolumeFieldPredictor::Impl {
     Ort::MemoryInfo mem{Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)};
     std::vector<std::string> in_names, out_names;
     std::vector<std::vector<int64_t>> in_shapes;  // graph-declared shapes (dyn dims < 0)
+    // Metric [min,max] ranges per beam-parameter name (from the RF3M ModelDomain). Used to
+    // clip+normalise the inputs the model trained on in normalised form (e.g. "distance").
+    std::map<std::string, std::array<float, 2>> param_ranges;
 };
 
 // Append the TensorRT EP (V2 API). Engines are compiled per ONNX subgraph + input shape and
@@ -136,14 +141,33 @@ void VolumeFieldPredictor::introspect() {
 
 VolumeFieldPredictor::~VolumeFieldPredictor() = default;
 
+void VolumeFieldPredictor::set_parameter_range(const std::string& name, float min, float max) {
+    impl_->param_ranges[name] = {min, max};
+}
+
 static bool is_position_input(const std::string& n) {
     return name_is(n, {"position", "pos", "query", "xyz"});
 }
 
+// Clip `v` to a registered metric range and map it to [0,1]; if no range is registered for `name`
+// the value passes through unchanged (a degenerate min==max range also passes through, mapping to 0).
+static float normalize_metric(const std::string& name, float v,
+                              const std::map<std::string, std::array<float, 2>>& ranges) {
+    auto it = ranges.find(name);
+    if (it == ranges.end()) return v;
+    const float lo = it->second[0], hi = it->second[1];
+    if (hi - lo <= 1e-12f) return 0.0f;
+    const float c = std::min(std::max(v, lo), hi);
+    return (c - lo) / (hi - lo);
+}
+
 // Bind one tensor for a *beam-parameter* graph input `n`, broadcasting the beam over `rows`
 // rows. Returns false for the per-point position input (the caller binds that); throws for
-// an input it does not recognize. `dist` is the precomputed source distance.
+// an input it does not recognize. `dist` is the precomputed (metric) source distance; `ranges`
+// holds the ModelDomain [min,max] per parameter for the metric inputs the model trained on in
+// normalised form ("distance", "opening_angle"/"rect").
 static bool make_beam_input(const std::string& n, int rows, const BeamParameters& beam, float dist,
+                     const std::map<std::string, std::array<float, 2>>& ranges,
                      Ort::MemoryInfo& mem, std::vector<std::vector<float>>& buffers,
                      std::vector<Ort::Value>& inputs) {
     auto make = [&](std::vector<float>&& data, std::vector<int64_t> shape) {
@@ -157,7 +181,9 @@ static bool make_beam_input(const std::string& n, int rows, const BeamParameters
         for (int i = 0; i < rows; ++i) std::memcpy(&d[3*i], beam.direction.data(), 3*sizeof(float));
         make(std::move(d), {rows, 3});
     } else if (name_is(n, {"distance"})) {
-        make(std::vector<float>(rows, dist), {rows, 1});
+        // metric source distance -> clip to the model's [min,max]m and map to [0,1] (matches the
+        // training-time BeamParametersNormalization; without it the trunk gets an out-of-range value).
+        make(std::vector<float>(rows, normalize_metric("distance", dist, ranges)), {rows, 1});
     } else if (name_is(n, {"origin", "src"})) {
         std::vector<float> d(static_cast<size_t>(rows) * 3);
         for (int i = 0; i < rows; ++i) std::memcpy(&d[3*i], beam.origin.data(), 3*sizeof(float));
@@ -219,7 +245,8 @@ static std::vector<Ort::Value> run_positions(VolumeFieldPredictor::Impl& im,
             inputs.emplace_back(Ort::Value::CreateTensor<float>(
                 im.mem, buffers.back().data(), buffers.back().size(), shape, 2));
         } else {
-            make_beam_input(n, rows, beam.beam, source_distance(beam.beam), im.mem, buffers, inputs);
+            make_beam_input(n, rows, beam.beam, source_distance(beam.beam), im.param_ranges,
+                            im.mem, buffers, inputs);
         }
     }
     return run_graph(im, inputs);
@@ -237,7 +264,7 @@ static std::vector<Ort::Value> run_field(VolumeFieldPredictor::Impl& im, const B
         if (is_position_input(n))
             throw std::runtime_error("run_field: model expects a per-point '" + n +
                                      "' input — use predict_voxelwise/predict_volume");
-        make_beam_input(n, /*rows=*/1, beam, dist, im.mem, buffers, inputs);
+        make_beam_input(n, /*rows=*/1, beam, dist, im.param_ranges, im.mem, buffers, inputs);
     }
     return run_graph(im, inputs);
 }
@@ -499,18 +526,30 @@ std::unique_ptr<radfield3dnn::VolumeFieldPredictor> LoadedModel::build(bool use_
         throw std::runtime_error("model_io: package has no '" + std::string(kTrunkGraph) + "' graph");
     const std::vector<uint8_t>& trunk = it->second;
 
+    // The ModelDomain carries the [min,max] metric range of each beam parameter; register them on a
+    // predictor so its metric inputs (e.g. "distance") are clipped+normalised to [0,1] before
+    // encoding, matching training. Applied to whichever predictor consumes the beam parameters
+    // (the beam encoder for a two-graph model, else the trunk).
+    auto apply_ranges = [this](radfield3dnn::VolumeFieldPredictor& p) {
+        for (const auto& bp : domain.beam_parameters)
+            p.set_parameter_range(bp.name, bp.range.min, bp.range.max);
+    };
+
     // Build the trunk once (this is the expensive step — TRT engine build). If it is a per-voxel
     // model, adopt that already-built session into a VoxelFieldPredictor (no re-load) and wire the
     // beam-encoder graph if the package carries one; otherwise it stays a VolumeFieldPredictor.
     auto trunk_pred = std::make_unique<radfield3dnn::VolumeFieldPredictor>(trunk.data(), trunk.size(), use_cuda);
+    apply_ranges(*trunk_pred);  // single-graph models bind the beam params on the trunk
     if (!trunk_pred->is_voxelwise())
         return trunk_pred;
 
     std::shared_ptr<radfield3dnn::VolumeFieldPredictor> encoder;
     auto eit = graphs.find(kBeamEncoderGraph);
-    if (eit != graphs.end())
+    if (eit != graphs.end()) {
         encoder = std::make_shared<radfield3dnn::VolumeFieldPredictor>(
             eit->second.data(), eit->second.size(), use_cuda);
+        apply_ranges(*encoder);  // two-graph models bind the beam params on the encoder
+    }
 
     return std::make_unique<radfield3dnn::VoxelFieldPredictor>(std::move(*trunk_pred), std::move(encoder));
 }

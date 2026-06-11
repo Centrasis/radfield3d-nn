@@ -196,8 +196,12 @@ class ModelExporter:
         if use_beam_shape:
             args.append(inp.beam_shape_parameters)
             names.append("beam_shape_parameters")
+        # Dynamic batch axis: without it dynamo freezes the traced batch (=2) into the graph and
+        # the deployed ONNX rejects any other batch size (observed via the rfnn_deploy bindings).
+        batch = torch.export.Dim("batch")
+        dyn = tuple({0: batch} for _ in args)
         torch.onnx.export(model=_BeamEnc(core), args=tuple(args), input_names=names,
-                          dynamo=True).save(path)
+                          dynamic_shapes=dyn, dynamo=True).save(path)
 
     @staticmethod
     def onnx_export_trunk(model: BaseNeuralRadFieldModel, path: str):
@@ -216,5 +220,9 @@ class ModelExporter:
                     spectrum=position[..., :1] * 0, position=position),
                     global_parameters=latent)
 
+        # Dynamic batch on BOTH inputs: position rows vary per inner batch at deploy time, and the
+        # latent is broadcast to the same row count by the caller.
+        batch = torch.export.Dim("batch")
         torch.onnx.export(model=_Trunk(core), args=(inp.position, latent),
-                          input_names=["position", "latent"], dynamo=True).save(path)
+                          input_names=["position", "latent"],
+                          dynamic_shapes=({0: batch}, {0: batch}), dynamo=True).save(path)

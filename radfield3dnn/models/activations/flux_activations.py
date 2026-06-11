@@ -9,6 +9,13 @@ class GradientConservingClamping(nn.Module):
         self.min_value = min_value
         self.max_value = max_value
 
+    @property
+    def init_bias(self) -> float:
+        # Clamp is the identity inside its range, so the pre-activation bias that places the
+        # initial output at the codomain midpoint (max distance from both saturating floors)
+        # is the midpoint itself.
+        return 0.5 * (self.min_value + self.max_value)
+
     def forward(self, x: Tensor) -> Tensor:
         clamped_x = torch.clamp(x, min=self.min_value, max=self.max_value)
         return x + (clamped_x - x).detach()
@@ -41,6 +48,11 @@ class SoftClip(nn.Module):
         super().__init__()
         self.k = float(k)
 
+    @property
+    def init_bias(self) -> float:
+        # tanh is centered at 0: output 0.5 (codomain midpoint), maximum gradient k/2.
+        return 0.0
+
     def forward(self, x: Tensor) -> Tensor:
         return 0.5 * (torch.tanh(self.k * x) + 1.0)
 
@@ -61,14 +73,19 @@ class LogitSigmoid(nn.Module):
     finite (sigmoid saturates to exact 0/1 in fp beyond that, killing the tail gradient) while
     still passing an identity gradient back if the network overshoots, so it can recover.
 
-    Pairs with a (0,1)-codomain normalizer (``LinearNormalizer(0,1)``). The data-adaptive
-    flux-bias init sets the head bias to ``logit(center)`` so the network starts at the data
-    centroid rather than a saturated tail.
+    Pairs with a (0,1)-codomain normalizer (``LinearNormalizer(0,1)``). The output-layer bias
+    is zero-initialized (``init_bias``), starting the head at sigmoid(0)=0.5 — the maximum-
+    gradient point — matching the published ``_init_decoders`` zero-bias.
     """
 
     def __init__(self, logit_range: float = 30.0):
         super().__init__()
         self.logit_range = float(logit_range)
+
+    @property
+    def init_bias(self) -> float:
+        # sigmoid(0) = 0.5: codomain midpoint and maximum-gradient point of the logistic.
+        return 0.0
 
     def forward(self, x: Tensor) -> Tensor:
         z = x + (torch.clamp(x, -self.logit_range, self.logit_range) - x).detach()

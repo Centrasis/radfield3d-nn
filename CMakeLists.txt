@@ -175,6 +175,23 @@ set_target_properties(libRadField3DNNDeploy PROPERTIES
   ARCHIVE_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/lib"
   LIBRARY_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/lib")
 
+# ── Deploy python bindings (rfnn_deploy) — RF3M loader + ONNX predictors, NO torch/CUDA ────────
+option(Build_DeployPyBindings "Build the rfnn_deploy python module (RF3M + ONNX predictors)" OFF)
+if(Build_DeployPyBindings)
+  if(DEFINED ENV{PYTHON_EXECUTABLE} AND NOT Python_EXECUTABLE)
+    set(Python_EXECUTABLE "$ENV{PYTHON_EXECUTABLE}")
+  endif()
+  find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
+  # use the pip-installed pybind11 of that interpreter (no network fetch)
+  execute_process(COMMAND "${Python_EXECUTABLE}" -m pybind11 --cmakedir
+                  OUTPUT_VARIABLE pybind11_DIR OUTPUT_STRIP_TRAILING_WHITESPACE)
+  find_package(pybind11 CONFIG REQUIRED)
+  pybind11_add_module(rfnn_deploy src/RadField3DNN/python_deploy_api.cpp)
+  set_target_properties(rfnn_deploy PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON
+    LIBRARY_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/lib")
+  target_link_libraries(rfnn_deploy PRIVATE libRadField3DNNDeploy)
+endif()
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Training / tcnn half — libRadField3DNN (CUDA) + torch pybindings (gated)
 # ══════════════════════════════════════════════════════════════════════════════

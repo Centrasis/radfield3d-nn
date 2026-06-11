@@ -1,5 +1,4 @@
 import os
-import math
 import json
 import argparse
 import multiprocessing as mp
@@ -28,6 +27,7 @@ from radfield3dnn.datasets.channel_join import ChannelsJoin
 from radfield3dnn.metrics.airkerma_accuracy import (
     AirkermaAccuracy, AirkermaRelDifferencesStdDev,
     AirkermaSphereAccuracy, AirkermaScatterAccuracy, AirkermaAccuracyEnergyWeighted,
+    AirkermaSupervoxelScatterAccuracy,
 )
 from radfield3dnn.metrics.ssim import AirkermaSSIM
 from radfield3dnn.metrics import HistogramOverlapAccuracy
@@ -44,78 +44,6 @@ from tasks.base import Task
 def load_config(path: str) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
-
-
-def _set_data_adaptive_flux_bias(model, datamodule) -> None:
-    """Set the flux head's output-bias prior from the actual dataset, before training.
-
-    Scans one batch of real fields, applies the same processings + normalizer the training step uses,
-    and sets the flux head's FINAL Linear bias to the MIDPOINT of the observed normalized target
-    range. The midpoint is the activation's high-gradient interior — maximally far from the saturating
-    boundaries — so the flux head does not start pinned at the clamp floor (which starves the
-    peak-crushed scatter band of gradient -> the predict-0 lock-in). Adapts to the dataset AND the
-    normalizer: linear0_1 [0,1]->0.5, log_scale [-9,0]->-4.5, asinh [0,1]->0.5. Best-effort; on any
-    problem it leaves the model's configured ``flux_bias_init`` in place.
-    """
-    import torch
-    from radfield3dnn.rftypes import RadiationField
-    from lightning_utilities.core.apply_func import apply_to_collection
-    core = model.get_core_model()
-    if not hasattr(core, "flux_decoder"):
-        return
-    try:
-        with torch.no_grad():
-            batch = next(iter(datamodule.train_dataloader()))
-            dev = next(model.parameters()).device
-            batch = apply_to_collection(batch, torch.Tensor, lambda t: t.to(dev))
-            batch = datamodule.on_after_batch_transfer(batch, 0)
-            batch = model._normalizer.forward(batch)
-            gt = batch.ground_truth
-            flux = gt.scatter_field.flux if (isinstance(gt, RadiationField) and gt.scatter_field is not None) \
-                else getattr(gt, "flux", None)
-            if flux is None:
-                return
-            f = flux[torch.isfinite(flux)].float().flatten()
-            if f.numel() < 100:
-                return
-            lo, hi = float(f.min()), float(f.max())
-            # Prior = where the flux SIGNAL actually concentrates.
-            #  * LogScaleNormalizer: the targets are log10 flux in [log_min, log_max] plus a
-            #    zero-sentinel (~-7) carrying the ~87% occluded/background voxels. The MEAN over the
-            #    signal band (targets above the sentinel dead-zone) lands ~-3 for DS03 — the center of
-            #    the HDR scatter distribution — instead of being dragged to the -7 floor (the
-            #    predict-0 lock-in) by the background mass.
-            #  * Linear/asinh ([0,1]): the crushed scatter mean is ~0 (near the floor), so the MEAN
-            #    would re-introduce the lock-in; the codomain MIDPOINT is the anti-lock-in prior.
-            from radfield3dnn.preprocessing.normalizations.logscale import LogScaleNormalizer
-            if isinstance(model._normalizer, LogScaleNormalizer):
-                signal = f[f > model._normalizer.inverse_zero_threshold]
-                center = float(signal.mean()) if signal.numel() >= 100 else 0.5 * (lo + hi)
-            else:
-                center = 0.5 * (lo + hi)
-            # activation pre-image: set the head bias so the activation OUTPUT starts at `center`.
-            #  * clamp: identity in-range -> bias = center.
-            #  * softclip (0.5*(tanh z+1)): centered at z=0 -> bias = 0.
-            #  * sigmoid: invert -> bias = logit(center) = ln(center/(1-center)); for a crushed
-            #    linear0_1 center (~1e-3) this is a large negative logit (~-7), exactly the wide
-            #    [-30,30] split the sigmoid is meant to use, with live gradient (no clamp floor).
-            kind = getattr(core, "_flux_activation_kind", "clamp")
-            if kind == "softclip":
-                bias = 0.0
-            elif kind == "sigmoid":
-                c = min(max(center, 1e-13), 1.0 - 1e-13)
-                bias = float(max(-30.0, min(30.0, math.log(c / (1.0 - c)))))
-            else:
-                bias = center
-            flux_lins = [m for m in core.flux_decoder.modules() if isinstance(m, torch.nn.Linear)]
-            if flux_lins and flux_lins[-1].bias is not None:
-                torch.nn.init.constant_(flux_lins[-1].bias, float(bias))
-                model._flux_bias_init = float(bias)
-                print(f"[green]Data-adaptive flux-bias init: normalized target range "
-                      f"[{lo:.3f}, {hi:.3f}] -> output-bias {bias:.3f} (activation={kind}).[/green]")
-    except Exception as e:
-        print(f"[yellow]Data-adaptive flux-bias init skipped ({type(e).__name__}: {e}); "
-              f"keeping configured flux_bias_init={getattr(model, '_flux_bias_init', 0.5)}.[/yellow]")
 
 
 def _auto_tune_asinh(dataset_path: str, seed: int) -> SplitChannelAsinhNormalizer:
@@ -397,6 +325,19 @@ if __name__ == "__main__":
     model._use_mtl = train_cfg.get("mtl_balancing", True)
     if not model._use_mtl:
         print("[yellow]MTL loss weighting DISABLED (equal-weight task-loss sum).[/yellow]")
+    # Step-2 knob: `training: mtl_gradient_balancing: false` keeps DB-MTL's loss-SCALE balancing
+    # (step 1, scale-invariant, single backward — the right tool for a large task-magnitude gap,
+    # e.g. SMAPEBalanced flux ~1.0 vs HistogramLoss spectrum ~0.025 = 40x) while skipping the
+    # per-task trunk-gradient balancing (step 2, N_tasks extra full backwards on refresh steps —
+    # also a peak-memory risk on full-volume training).
+    model._mtl_gradient_balancing = train_cfg.get("mtl_gradient_balancing", True)
+    if model._use_mtl and not model._mtl_gradient_balancing:
+        print("[yellow]DB-MTL step 1 only (loss-scale balancing); gradient-magnitude balancing off.[/yellow]")
+    # Fixed spectrum-task multiplier (`training: spectrum_loss_weight`, default 1.0) — the safe
+    # (non-adaptive) fix for the flux/spectrum magnitude gap with self-weighted flux losses.
+    model._spectrum_loss_weight = float(train_cfg.get("spectrum_loss_weight", 1.0))
+    if model._spectrum_loss_weight != 1.0:
+        print(f"[yellow]Fixed spectrum loss weight: x{model._spectrum_loss_weight}.[/yellow]")
 
     # ── Dataset ───────────────────────────────────────────────────────────────
     dataset_type_str = ds_cfg.get("type", None)
@@ -422,13 +363,8 @@ if __name__ == "__main__":
     )
     _, VOXEL_SIZE_M = get_dataset_dimensions_and_voxel_size(datamodule)
 
-    # Data-adaptive flux-head output-bias init: scan a few real fields, take the MIDPOINT of the
-    # observed normalized target range, and set the flux head's final bias there — the activation's
-    # high-gradient interior, far from the saturating floor (avoids the predict-0 lock-in). Adapts to
-    # the actual dataset + normalizer (linear0_1 [0,1]->0.5, log_scale [-9,0]->-4.5, asinh [0,1]->0.5).
-    # Disable with `training: auto_flux_bias_init: false` (then the model's configured flux_bias_init holds).
-    if train_cfg.get("auto_flux_bias_init", True):
-        _set_data_adaptive_flux_bias(model, datamodule)
+    # Flux-head output-bias init is decided by the flux activation itself (its `init_bias`
+    # property), inside the model's apply_weights_init — no external/data-adaptive override.
 
     dataset_type = DatasetType.Voxelwise if dataset_type_str == "Voxelwise" else DatasetType.Layerwise
 
@@ -479,7 +415,21 @@ if __name__ == "__main__":
             'airkerma_ssim': AirkermaSSIM(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, reduction='mean'),
             'airkerma_onsphere_accuracy_radius25cm': AirkermaSphereAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, sphere_radius_m=0.25, voxel_size_m=vx),
             'top50_airkerma_stddev': AirkermaRelDifferencesStdDev(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, importance_threshold=0.5),
-            'airkerma_accuracy_scatter': AirkermaScatterAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5),
+            # THE scatter metric: scores the scatter-field volume — every voxel the MC error layer
+            # marks statistically reliable (~86-91% of DS03 voxels), beam excluded. Same volume as
+            # visualized in results/loss_normalizer_study.html and results/mc_floor_analysis.html.
+            # The PUBLISHED bright-ring definition (joined >= 5e-3*max, ~3% of voxels) is kept as
+            # the explicit legacy metric for comparability with the published 0.84.
+            'airkerma_accuracy_scatter': AirkermaScatterAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, use_error=True, error_threshold=0.5),
+            'legacy_airkerma_accuracy_scatter': AirkermaScatterAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, use_error=False),
+            # THE goal metric (10-15% per-voxel uncertainty in the occupational ROI): per-voxel SMAPE
+            # accuracy over every voxel with air-kerma >= 1e-2*max — beam INCLUDED + bright scatter,
+            # full spatial resolution. Measured perfect-model ceiling on DS03: ~0.92 (the GT's own MC
+            # noise certifies 10-15% only down to ~1e-2*max; deeper claims need more MC primaries).
+            'airkerma_accuracy_roi': AirkermaAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, importance_threshold=0.01),
+            # Secondary: supervoxel-aggregated dose (8^3 sums = 16.7cm blocks; coarse spatially but
+            # noise/22 -> ceiling ~0.92 over the WHOLE field incl. the diffuse bulk).
+            'airkerma_accuracy_scatter_sv8': AirkermaSupervoxelScatterAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, supervoxel=8),
             'spectrum_accuracy': HistogramOverlapAccuracy(),
             'top95_energy_weighted_airkerma_accuracy': AirkermaAccuracyEnergyWeighted(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, importance_threshold=0.05),
             'global_airkerma_gamma_3pct_2cm': AirkermaAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, metric_type='gpr', voxel_size_m=vx, rel_dose_diff=0.03, dist_crit_mm=20.0),

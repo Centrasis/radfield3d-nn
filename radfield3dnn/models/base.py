@@ -29,6 +29,29 @@ class ModuleBuilder:
             # Plain L2 (MSE) on the normalised targets. In a tonemapped space (asinh/log) it spreads
             # gradient across the dynamic range; pairs with asinh in the loss-effectiveness study.
             return std.PlainL2Loss(weight_with_error=False)
+        elif loss_fn_name == "LogRatioBalanced":
+            # Region-balanced LOG-RATIO L1 (SMAPEBalanced's regions/masks/hinge with a non-saturating
+            # relative core): fixes SMAPE's over-prediction saturation, which left misplaced/rotated
+            # ghost beams nearly gradient-free (ep153 evidence: bright-IoU 0.29, 63% ghost mass).
+            return std.SMAPERegionBalancedLoss(core="logratio")
+        elif loss_fn_name == "SMAPEBalanced":
+            # Metric-targeted region-balanced SMAPE (pipeline-audit P0): trains the metric's own
+            # functional with equal gradient mass on beam / bright-ring / reliable-bulk regions and
+            # MC-noise voxels masked out. Pair with normalizer="linear0_1" (SMAPE is scale-invariant).
+            return std.SMAPERegionBalancedLoss()
+        elif loss_fn_name == "RawNeRF":
+            # RawNeRF HDR loss (Mildenhall CVPR 2022): linear-space L2 / (sg(pred)+eps)^2 — the
+            # relative-weighted linear recipe between the linear+abs and log+abs corners.
+            return std.RawNeRFLoss()
+        elif loss_fn_name == "RawNeRFSharp":
+            # RawNeRF + alpha*L1 beam-sharpening hybrid (reconstruction-eval finding: RawNeRF's
+            # self-weight anneals ~p^-2 -> blurred beam; the L1 term restores the non-annealing
+            # coherent beam gradient of the published sharp-beam recipe).
+            return std.RawNeRFSharpLoss(alpha=10.0)
+        elif loss_fn_name == "MuLawL2":
+            # mu-law tone-mapped L2 (Kalantari & Ramamoorthi, SIGGRAPH 2017) — the standard HDR-
+            # reconstruction loss: one smooth branch-free formula, non-saturating ghost suppression.
+            return std.MuLawL2Loss(mu=5000.0)
         elif loss_fn_name == "L1MagWeighted":
             # Log-space L1 weighted by physical flux magnitude (air-kerma-aligned).
             # Fixes the HDR imbalance where the near-zero background drowns out the
@@ -61,6 +84,10 @@ class ModuleBuilder:
             return std.ChannelMaxBalancedLoss(comb_loss.FluxLoss(weight_with_error=False, log_scale=False))
         elif loss_fn_name == "FluxLoss":
             return comb_loss.FluxLoss(weight_with_error=False, log_scale=False)
+        elif loss_fn_name == "FluxLossNoSSIM":
+            # Ablation A1: the published FluxLoss core (Huber = 0.5*(L1+L2)) with the SSIM3D
+            # structural term removed (ssim_weight=0) — isolates the only spatial/sharpness term.
+            return comb_loss.FluxLoss(weight_with_error=False, log_scale=False, ssim_weight=0.0)
         elif loss_fn_name == "FluxLossRelative":
             return comb_loss.FluxLoss(weight_with_error=False, log_scale=False, relative_weighting=True)
         elif loss_fn_name == "FluxLossFocalR":
@@ -760,7 +787,13 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
             task_losses["scatter_flux"] = metrics.scatter_field.flux_loss
             self.log(f'{stage}_scatter_flux_loss', metrics.scatter_field.flux_loss.mean(), on_epoch=on_epoch, on_step=on_step, logger=True, batch_size=self.batch_size)
             if metrics.scatter_field.spectrum_loss is not None:
-                task_losses["scatter_spectrum"] = metrics.scatter_field.spectrum_loss
+                # Fixed spectrum-task weight (YAML `training: spectrum_loss_weight`). The DB-MTL
+                # experiment showed ADAPTIVE balancing is incompatible with self-weighted flux
+                # losses (their magnitude IS their imbalance correction); a FIXED multiplier is the
+                # safe way to lift the undertrained spectrum head (flux/spectrum scale gap ~40-1000x),
+                # which leaks into every air-kerma metric via the mu_tr-weighted integral.
+                spec_w = float(getattr(self, "_spectrum_loss_weight", 1.0))
+                task_losses["scatter_spectrum"] = metrics.scatter_field.spectrum_loss * spec_w
                 self.log(f'{stage}_scatter_spectrum_loss', metrics.scatter_field.spectrum_loss.mean(), on_epoch=on_epoch, on_step=on_step, logger=True, batch_size=self.batch_size)
 
         if metrics.direct_beam is not None:

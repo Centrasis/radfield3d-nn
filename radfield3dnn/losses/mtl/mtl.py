@@ -43,7 +43,7 @@ from torch import Tensor, nn
 
 class MultiTaskLossBalancer(nn.Module):
     def __init__(self, ema_momentum: float = 0.9, max_weight: float = 10.0, eps: float = 1e-8,
-                 update_every: int = 16):
+                 update_every: int = 16, loss_floor: float = 1e-3):
         """
         Args:
             ema_momentum: smoothing for the per-task gradient norms in [0, 1).
@@ -56,11 +56,21 @@ class MultiTaskLossBalancer(nn.Module):
                 the **cached** weights in between. The norms are EMA-smoothed and drift
                 slowly, so this keeps full DB-MTL balancing at ~1/N the cost (the per-
                 task `autograd.grad` was N_tasks extra full-network backwards/step).
+            loss_floor: GRADIENT guard for the log transform. ``∇ log L = (1/L)·∇L``
+                amplifies a task's gradient by 1/L, unbounded as the task is solved
+                (at the old eps=1e-8 numerical floor that is up to 1e8×). Step 2's
+                EMA+clamp guards bound the *relative* weights, but the **step-1-only
+                path had no guard at all**. Clamping the loss at ``loss_floor`` before
+                the log bounds the amplification at 1/loss_floor and — because clamp
+                kills the gradient below the floor — stops pushing a task once it is
+                solved past the floor (correct behaviour: a solved task should release
+                the shared trunk, not dominate it).
         """
         super().__init__()
         self.ema_momentum = ema_momentum
         self.max_weight = max_weight
         self.eps = eps
+        self.loss_floor = float(loss_floor)
         self.update_every = int(update_every)
         self._calls = 0                       # training-step counter (grad-enabled calls)
         self._cached_weights: dict[str, float] | None = None  # last computed balancing weights
@@ -78,7 +88,9 @@ class MultiTaskLossBalancer(nn.Module):
         self.overflow_count: int = 0
 
     def _log_losses(self, task_losses: dict[str, Tensor]) -> dict[str, Tensor]:
-        return {n: torch.log(l.mean().clamp_min(self.eps)) for n, l in task_losses.items()}
+        # loss_floor (not eps) is the clamp: bounds the 1/L gradient amplification of the log
+        # transform at 1/loss_floor and zeroes the push on tasks solved below the floor.
+        return {n: torch.log(l.mean().clamp_min(self.loss_floor)) for n, l in task_losses.items()}
 
     def combine(self, task_losses: dict[str, Tensor], balance_parameters: list[nn.Parameter] | None,
                 balance_limits: list[int | None] | None = None) -> Tensor:

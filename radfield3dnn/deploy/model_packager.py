@@ -5,9 +5,11 @@ ranges of the beam parameters and the physical meaning, in metric units, of the 
 inputs/outputs), lightweight provenance and the test metrics — everything a deployment (e.g. UE5)
 needs to run the model and interpret its I/O without the training stack.
 
-The binary layout is defined and consumed by the C++ side `rfnn::io::V1::ModelFactory`
-(include/radfield3d-nn/model_io.h / src/RadField3DNN/model_io.cpp) — that header is the
-authoritative format. This module writes the identical layout (RF3M version 2).
+The byte layout is owned by the C++ side `rfnn::io::V1::ModelFactory::save_to_memory`
+(include/radfield3d-nn/model_io.h / src/RadField3DNN/model_io.cpp) — the single source of truth.
+This module gathers the metadata (domain / provenance / metrics) and exports the ONNX graphs, then
+hands them to that serialiser through the `rfnn_deploy` python bindings, so the format is never
+re-implemented here.
 
 A model generalises over a *range* of beam parameters, so we deliberately store that range and
 the normalisation mappings (what the model's [0..1] source-distance scalar maps to in metres,
@@ -19,25 +21,12 @@ from __future__ import annotations
 import glob
 import json
 import os
-import struct
 import tempfile
 from typing import Mapping
 
 import torch
 
 from radfield3dnn.models import ModelExporter
-
-RF3M_MAGIC = b"RF3M"
-RF3M_VERSION = 2
-
-
-def _u32(v: int) -> bytes:
-    return struct.pack("<I", int(v))
-
-
-def _str(s: str) -> bytes:
-    b = (s or "").encode("utf-8")
-    return _u32(len(b)) + b
 
 
 def _metric_value(v) -> float:
@@ -159,47 +148,35 @@ class ModelPackager:
                 print(f"[yellow]ModelPackager: two-graph export failed ({e}); using single trunk[/yellow]")
         return {"trunk": self._export_bytes(ModelExporter.onnx_export)}
 
-    # ── serialisation (mirrors rfnn::io::V1::ModelFactory::save_to_memory) ─────
-    def to_bytes(self) -> bytes:
-        sample = self._sample_rf3()
+    # ── serialisation: delegate the byte layout to the C++ rfnn::io::V1::ModelFactory ─────────────
+    def _rf3m_metadata(self):
+        """Assemble the C++ ModelDomain/ModelProvenance from the gathered metadata + ONNX graphs.
+        Imported lazily via the deploy loader (which preloads the matching ONNX Runtime), so merely
+        importing this module never requires the compiled deploy bindings."""
+        from radfield3dnn.deploy.onnx_runtime import rfnn_deploy as rd
         domain = self._domain()
-        prov = self._provenance(sample)
-        graphs = self._graphs()
+        prov = self._provenance(self._sample_rf3())
+        rd_domain = rd.ModelDomain(
+            spectrum_bins=int(domain["spectrum_bins"]),
+            spectrum_max_energy_ev=float(domain["spectrum_max_energy_ev"]),
+            beam_parameters=[
+                rd.BeamParameterSpec(str(name), int(count),
+                                     rd.ParameterRange(float(rmin), float(rmax), str(unit)))
+                for name, count, rmin, rmax, unit in domain["beam_parameters"]
+            ],
+        )
+        rd_prov = rd.ModelProvenance(dataset_name=prov["dataset_name"],
+                                     software_version=prov["software_version"], physics=prov["physics"])
+        metrics = {str(k): float(v) for k, v in self.metrics.items()}
+        return rd, rd_domain, rd_prov, metrics
 
-        out = bytearray()
-        out += RF3M_MAGIC
-        out += _u32(RF3M_VERSION)
-        out += _str(prov["dataset_name"])
-        out += _str(prov["software_version"])
-        out += _str(prov["physics"])
-        # ModelDomain block (must match put_domain in model_io.cpp byte-for-byte).
-        d = domain
-        out += struct.pack("<i", d["spectrum_bins"])
-        out += struct.pack("<f", d["spectrum_max_energy_ev"])
-        out += _u32(len(d["beam_parameters"]))
-        for name, count, rmin, rmax, unit in d["beam_parameters"]:
-            out += _str(name)
-            out += struct.pack("<i", int(count))
-            out += struct.pack("<f", float(rmin))
-            out += struct.pack("<f", float(rmax))
-            out += _str(unit)
-        # metrics
-        out += _u32(len(self.metrics))
-        for k, v in self.metrics.items():
-            out += _str(k)
-            out += struct.pack("<f", float(v))
-        # payload: named ONNX graphs
-        out += _u32(len(graphs))
-        for name, data in graphs.items():
-            out += _str(name)
-            out += struct.pack("<Q", len(data))
-            out += data
-        return bytes(out)
+    def to_bytes(self) -> bytes:
+        rd, domain, prov, metrics = self._rf3m_metadata()
+        return rd.save_to_memory(self._graphs(), domain, prov, metrics)
 
     def save(self, path: str) -> str:
-        data = self.to_bytes()
+        rd, domain, prov, metrics = self._rf3m_metadata()
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        with open(path, "wb") as f:
-            f.write(data)
-        print(f"[green]Wrote RF3M model package -> {path} ({len(data)/1e6:.2f} MB)[/green]")
+        rd.save(path, self._graphs(), domain, prov, metrics)   # C++ writes the bytes
+        print(f"[green]Wrote RF3M model package -> {path} ({os.path.getsize(path)/1e6:.2f} MB)[/green]")
         return path
