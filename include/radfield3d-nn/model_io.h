@@ -8,9 +8,12 @@
 //                                to the RadFiled3D field geometry it predicts plus the model's
 //                                *validity domain* (parameter ranges + the physical meaning of
 //                                the normalised inputs/outputs, in metric units) and the test
-//                                metrics. Saves/loads a single self-contained "RF3M" artifact,
-//                                to disk OR to/from memory. No tiny-cuda-nn / libtorch / CUDA
-//                                dependency — it lives in the deploy lib (libRadField3DNNDeploy).
+//                                metrics. Saves a single self-contained "RF3M" artifact, and
+//                                loads one STRAIGHT to a runnable predictor (the parse + build is
+//                                one step — load() returns the VoxelFieldPredictor /
+//                                VolumeFieldPredictor, carrying the package metadata on it). No
+//                                tiny-cuda-nn / libtorch / CUDA dependency — lives in the deploy
+//                                lib (libRadField3DNNDeploy).
 //
 //   * rfnn::tcnn::ModelFactory — the legacy serialiser for the fused tcnn models
 //                                (encoder+predictor raw network_precision_t weights). Only built
@@ -48,46 +51,14 @@
 #include <string>
 #include <vector>
 
+#include <radfield3d-nn/model_domain.h>   // rfnn::io::{ParameterRange,BeamParameter,ModelDomain,ModelProvenance}
+
 namespace radfield3dnn {
 class VolumeFieldPredictor;   // field_predictors.h (fwd-decl; base predictor, defined in the deploy lib)
 }  // namespace radfield3dnn
 
 namespace rfnn {
 namespace io {
-
-// Valid range + physical unit of one beam parameter (a segment of the model's input vector).
-struct ParameterRange {
-    float       min  = 0.f;
-    float       max  = 0.f;
-    std::string unit;        // e.g. "m", "deg", "eV", "" (dimensionless, e.g. a unit direction)
-};
-
-// One entry of the model's beam-parameter input vector: its name, how many scalar slots of the
-// input vector it occupies, and the metric range/unit those slots are valid over. The ordered
-// list describes the whole beam-parameter vector passed to volume prediction.
-struct BeamParameter {
-    std::string    name;     // e.g. "direction", "distance", "spectrum", "opening_angle"
-    int            count = 0;  // number of input-vector slots this parameter spans
-    ParameterRange range;
-};
-
-// The model's fixed I/O domain, in metric units. A model generalises over a *range* of beam
-// parameters, so we store that range and how the normalised inputs/outputs map to physical units
-// rather than any single simulation's tube settings. The spatial field geometry (resolution /
-// voxel size) is NOT part of the model — it is chosen at inference and may vary across a dataset.
-struct ModelDomain {
-    int                        spectrum_bins = 0;            // output spectrum histogram bins …
-    float                      spectrum_max_energy_ev = 0.f; // … bin i spans [i, i+1)·max/bins eV
-    std::vector<BeamParameter> beam_parameters;              // ordered model input-vector layout
-};
-
-// Lightweight provenance — what the model was trained on. No per-simulation tube metadata.
-struct ModelProvenance {
-    std::string dataset_name;
-    std::string software_version;
-    std::string physics;
-};
-
 namespace V1 {
 
 // A model is one or more named ONNX graphs. They compose around a shared "trunk" (which consumes
@@ -97,20 +68,6 @@ using NamedGraphs = std::map<std::string, std::vector<uint8_t>>;
 inline constexpr const char* kTrunkGraph           = "trunk";             // consumes beam parameters
 inline constexpr const char* kBeamEncoderGraph     = "beam_encoder";      // beam vector → latent
 inline constexpr const char* kGeometryEncoderGraph = "geometry_encoder";  // (future) geometry → latent
-
-struct LoadedModel {
-    NamedGraphs                  graphs;       // name → ONNX bytes ("trunk", "beam_encoder", …)
-    ModelDomain                  domain;
-    ModelProvenance              provenance;
-    std::map<std::string, float> metrics;
-
-    bool has(const std::string& name) const { return graphs.find(name) != graphs.end(); }
-
-    // Construct the runnable predictor from the embedded graphs (never touching disk). The factory
-    // decides by the "trunk" graph type: a per-voxel trunk -> VoxelFieldPredictor (wired with the
-    // "beam_encoder" graph if present); a field-wise trunk -> VolumeFieldPredictor (trunk only).
-    std::unique_ptr<radfield3dnn::VolumeFieldPredictor> build(bool use_cuda = true) const;
-};
 
 class ModelFactory {
 public:
@@ -131,11 +88,17 @@ public:
                      const ModelProvenance& provenance,
                      const std::map<std::string, float>& metrics);
 
-    // Parse a package: the named ONNX graphs (kept as bytes; build runnable models on demand via
-    // LoadedModel::build), the validity domain, provenance and metrics. Never touches disk for
-    // the graphs.
-    static LoadedModel load_from_memory(const void* bytes, size_t n);
-    static LoadedModel load(const std::string& path);
+    // Parse a package AND build its runnable predictor in one step (no intermediate handle, never
+    // touching disk for the graphs). The "trunk" graph type decides the predictor: a per-voxel
+    // trunk -> VoxelFieldPredictor (wired with the "beam_encoder" graph if present); a field-wise
+    // trunk -> VolumeFieldPredictor (trunk only). The package's domain (parameter ranges applied),
+    // provenance, metrics and graph names are carried ON the returned predictor (see its
+    // domain()/provenance()/metrics()/graph_names()). Dynamic type is VoxelFieldPredictor for
+    // per-voxel models; the static return type is the base.
+    static std::unique_ptr<radfield3dnn::VolumeFieldPredictor>
+        load_from_memory(const void* bytes, size_t n, bool use_cuda = true);
+    static std::unique_ptr<radfield3dnn::VolumeFieldPredictor>
+        load(const std::string& path, bool use_cuda = true);
 };
 
 }  // namespace V1

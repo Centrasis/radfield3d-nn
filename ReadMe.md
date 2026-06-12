@@ -78,8 +78,17 @@ augmentations:
   join_channels: false
   importance_sampling:
     enabled: false
+    method: error            # "error" (default) or "roi" — selects the voxel sampler
+    # --- method: error (ErrorbasedImportanceSampler) ---
     max_drop_chance: 0.9
     keep_flux_threshold: 0.8
+    # --- method: roi (ROIbasedSampler — keep beam, sample scatter/floor by the metric ROIs) ---
+    beam_rel: 0.05           # beam = direct >= 0.05*direct_max (matches the scatter metric + loss)
+    scatter_lo: 5.0e-5       # scatter floor = joined >= 5e-5*joined_max
+    beam_keep_ratio: 1.0     # fraction of beam voxels kept (0..1, default 1 = keep all)
+    scatter_ratio: 2.0       # scatter voxels sampled per kept beam voxel (0..inf)
+    floor_ratio: 1.0         # floor voxels sampled per kept beam voxel (capped by what exists)
+    field_multiplier: 3.0    # repeat each field ×N/epoch; beam always kept, fresh scatter subset each repeat
 
 tune:
   n_trials: 50

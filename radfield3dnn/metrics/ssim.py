@@ -51,8 +51,12 @@ class SSIM3D(MetricBase):
         return ssim
 
     def _calc_metric(self, target: Tensor, prediction: Tensor) -> Tensor:
+        # sanitize on a clone — in-place mutation here leaks into metrics evaluated after
+        # this one on the same tensors (same class of bug as the scatter-metric -inf leak)
         mask = torch.isinf(prediction) & (prediction < 0)
-        prediction[mask] = 0.0
+        if mask.any():
+            prediction = prediction.clone()
+            prediction[mask] = 0.0
 
         target = target / (target.max() + self.eps)
         prediction = prediction / (prediction.max() + self.eps)

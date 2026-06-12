@@ -94,6 +94,14 @@ class ModuleBuilder:
             # Huber core × Focal-R modulator. Use for absolute-error work
             # where the 99% near-zero background otherwise dominates the loss.
             return comb_loss.FluxLoss(weight_with_error=False, log_scale=False, focal_r=True)
+        elif loss_fn_name == "HotspotAwareFluxLoss":
+            return std.HotspotAwareFluxLoss()
+        elif loss_fn_name == "TwoROIGammaLoss":
+            # ROI thresholds MATCH the air-kerma scatter metric + the ROI sampler
+            # (radfield3dnn.roi): beam = >=0.05*max, scatter floor = 5e-5*max (DS03 sweep,
+            # 2026-06-12). Per-ROI means equalise beam/scatter/floor influence by target voxel count.
+            from radfield3dnn.roi import BEAM_REL_DEFAULT, SCATTER_LO_DEFAULT
+            return std.TwoROIGammaLoss(beam_rel=BEAM_REL_DEFAULT, scatter_lo=SCATTER_LO_DEFAULT)
         elif loss_fn_name == "FluxLossRelativeFocalR":
             # Relative-error core × Focal-R modulator. Use when relative
             # accuracy in [0,1] codomain matters AND the dataset is imbalanced
@@ -540,132 +548,157 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
     def forward(self, x: Union[DirectionalInput, PositionalInput]) -> RadiationField:
         raise NotImplementedError("This method must be implemented by the subclass.")
 
+    # ── channel-eval dispatch ────────────────────────────────────────────────────────────────
+    # How many channels the model PREDICTS (1 = single/joined, 2 = scatter+direct, AirKermaField)
+    # is a fixed property of the architecture, so it is determined ONCE by a tiny test run of
+    # forward and the matching plain eval method is bound for the lifetime of the instance —
+    # replacing the per-step isinstance/None-check maze the old calculate_metrics carried.
+    _calc_metrics_impl = None   # bound on first use (test-run probe or first real prediction)
+
+    def _probe_prediction_channels(self, batch: TrainingInputData, is_complete_volume: bool):
+        """TEST RUN of the model's forward — a tiny no_grad pass on the REAL batch inputs
+        (a 2x2x2 volume for volume-trained models, the first 2 rows for pointwise ones) whose
+        only purpose is to observe what the model emits (one channel, two channels, or an
+        AirKermaField). Returns that probe prediction."""
+        with torch.no_grad():
+            if is_complete_volume:
+                bins = self.out_spectra_dim if hasattr(self, "out_spectra_dim") else 32
+                return self.forward2volume(batch.input, torch.tensor([2, 2, 2]), spectra_bins=bins)
+            x = batch.input
+            x2 = type(x)(*[(v[:2] if isinstance(v, Tensor) else v) for v in x])
+            return self(x2)
+
+    def _select_metrics_impl(self, pred_field, y):
+        """Pick the plain eval method matching (predicted channels, GT channels)."""
+        if isinstance(pred_field, AirKermaField):
+            return self._calculate_metrics_airkerma
+        if not isinstance(pred_field, RadiationField):
+            raise ValueError("pred_field must be of type RadiationField or AirKermaField.")
+        pred_two = pred_field.scatter_field is not None and pred_field.direct_beam is not None
+        gt_two = isinstance(y, RadiationField) and y.direct_beam is not None
+        if pred_two and gt_two:
+            return self._calculate_metrics_two_channel
+        if pred_two:                       # two-head model, single/joined GT -> join the prediction
+            return self._calculate_metrics_join_pred
+        if gt_two:                         # single-head model, split GT -> join the GT
+            return self._calculate_metrics_join_gt
+        return self._calculate_metrics_single_channel
+
+    def _join_field(self, field):
+        """Physically join a split RadiationField (inverse -> sum channels -> re-normalise)."""
+        field = self._normalizer.inverse(field)
+        field = self._channels_join(field)
+        return self._normalizer.forward(field)
+
+    def _calculate_metrics_single_channel(self, pred_field: RadiationField, y, batch: TrainingInputData) -> TrainingMetrics:
+        """Plain single-channel eval: one predicted channel vs a single-channel GT."""
+        scatter_field_gt = y.scatter_field if isinstance(y, RadiationField) else y
+
+        loss_spec = None
+        if pred_field.scatter_field.spectrum is not None:
+            loss_spec = self._spectrum_loss_fn.forward(prediction=pred_field.scatter_field.spectrum, target=scatter_field_gt.spectrum, input=batch)
+            if not torch.isfinite(loss_spec).all():
+                print(f"[red] Spectrum loss is not finite — letting downstream fallback set total to 1.")
+
+        loss_flux = self._flux_loss_fn.forward(prediction=pred_field.scatter_field.flux, target=scatter_field_gt.flux, input=batch)
+        if not torch.isfinite(loss_flux).all():
+            print(f"[red] Flux loss is not finite — letting downstream fallback set total to 1.")
+
+        # Debug-probe capture seam (callbacks/debug_probe.py): stash detached references to
+        # exactly what went through the loss this step. Enabled by the TrainingDebugProbe
+        # callback (YAML `training: debug_probe: true`); zero cost when disabled.
+        if getattr(self, "_debug_probe_enabled", False):
+            self._debug_capture = {
+                "pred_flux": pred_field.scatter_field.flux.detach(),
+                "target_flux": scatter_field_gt.flux.detach(),
+                "pred_spectrum": pred_field.scatter_field.spectrum.detach() if pred_field.scatter_field.spectrum is not None else None,
+                "flux_loss": float(loss_flux.detach().mean()),
+                "spectrum_loss": float(loss_spec.detach().mean()) if loss_spec is not None else None,
+                "flux_loss_terms": dict(getattr(self._flux_loss_fn, "last_terms", {})),
+                "batch_input": batch.input,
+            }
+
+        return TrainingMetrics(
+            scatter_field=ChannelMetrics(flux_loss=loss_flux, spectrum_loss=loss_spec),
+            direct_beam=None,
+        )
+
+    def _calculate_metrics_join_gt(self, pred_field: RadiationField, y: RadiationField, batch: TrainingInputData) -> TrainingMetrics:
+        """Single-channel prediction vs a SPLIT GT: physically join the GT (and the batch the
+        loss receives as `input`), then evaluate as plain single-channel."""
+        batch = self._normalizer.forward(self._channels_join(self._normalizer.inverse(batch)))
+        y = self._join_field(y)
+        return self._calculate_metrics_single_channel(pred_field, y, batch)
+
+    def _calculate_metrics_join_pred(self, pred_field: RadiationField, y, batch: TrainingInputData) -> TrainingMetrics:
+        """Two-head prediction vs a single-channel GT: physically join the PREDICTION
+        (inverse -> scatter+direct -> re-normalise), then evaluate as plain single-channel."""
+        inv = self._normalizer.inverse(pred_field)
+        joined = RadiationField(
+            scatter_field=RadiationFieldChannel(
+                flux=inv.scatter_field.flux + inv.direct_beam.flux,
+                spectrum=inv.scatter_field.spectrum,
+                error=inv.scatter_field.error,
+            ),
+            direct_beam=None,
+        )
+        return self._calculate_metrics_single_channel(self._normalizer.forward(joined), y, batch)
+
+    def _calculate_metrics_two_channel(self, pred_field: RadiationField, y: RadiationField, batch: TrainingInputData) -> TrainingMetrics:
+        """Plain two-channel eval: scatter (flux+spectrum) and direct (flux) scored separately.
+
+        NOTE: a manual `loss_flux *= direct_flux.sum() / scatter_flux.sum()` rescaling used to
+        live here. It assumed a log-space normaliser where the per-channel flux sums are large
+        and same-signed; under `asinh_split` the scatter sum crosses zero, so the ratio blew up
+        to inf/NaN and poisoned the DB-MTL surrogate. The cross-task flux balancing it tried to
+        do is exactly what `MultiTaskLossBalancer` now does (scale-invariantly, in log space).
+        """
+        single = self._calculate_metrics_single_channel(pred_field, y, batch)
+        loss_direct = self._flux_loss_fn.forward(prediction=pred_field.direct_beam.flux, target=y.direct_beam.flux, input=batch)
+        return TrainingMetrics(
+            scatter_field=single.scatter_field,
+            direct_beam=ChannelMetrics(flux_loss=loss_direct, spectrum_loss=None),
+        )
+
+    def _calculate_metrics_airkerma(self, pred_field: AirKermaField, y, batch: TrainingInputData) -> TrainingMetrics:
+        assert isinstance(y, AirKermaField), "Ground truth must be of type AirKermaField when predicting AirKermaField."
+        loss_airkerma = self._flux_loss_fn.forward(prediction=pred_field.air_kerma, target=y.air_kerma, input=batch)
+        return TrainingMetrics(airkerma_field=loss_airkerma)
+
     def evaluate_forward(self, batch: TrainingInputData) -> TrainingMetrics:
         batch = self._normalizer.forward(batch)
         y = batch.ground_truth
         x = batch.input
         self.batch_size = int(x.direction.shape[0])
-        if isinstance(y, RadiationField) or isinstance(y, RadiationFieldChannel):
-            has_multi_channel = y.direct_beam is not None if isinstance(y, RadiationField) else False
+        if isinstance(y, (RadiationField, RadiationFieldChannel)):
             scatter_field_gt = y.scatter_field if isinstance(y, RadiationField) else y
             is_complete_volume = (len(scatter_field_gt.flux.shape) == 4 or (len(scatter_field_gt.flux.shape) == 5 and scatter_field_gt.flux.shape[1] == 1)) and len(scatter_field_gt.spectrum.shape) == 5
         elif isinstance(y, AirKermaField):
-            has_multi_channel = False
-            is_complete_volume = (len(y.air_kerma.shape) == 4 or (len(y.air_kerma.shape) == 5 and y.air_kerma.shape[1] == 1))
             scatter_field_gt = batch.original_ground_truth.scatter_field if batch.original_ground_truth is not None and isinstance(batch.original_ground_truth, RadiationField) else None
+            is_complete_volume = (len(y.air_kerma.shape) == 4 or (len(y.air_kerma.shape) == 5 and y.air_kerma.shape[1] == 1))
         else:
             raise ValueError("Ground truth must be of type RadiationField, RadiationFieldChannel, or AirKermaField.")
+
+        # One-time test run of forward: count the predicted channels and bind the matching plain
+        # eval method for the rest of the instance's lifetime.
+        if self._calc_metrics_impl is None:
+            probe = self._probe_prediction_channels(batch, is_complete_volume)
+            self._calc_metrics_impl = self._select_metrics_impl(probe, y)
 
         if is_complete_volume:
             pred_field: RadiationField | AirKermaField = self.forward2volume_from_training_input(batch, spectra_bins=scatter_field_gt.spectrum.shape[1] if scatter_field_gt.spectrum is not None else 32)
         else:
             pred_field: RadiationField | AirKermaField = self(x)
 
-        if isinstance(y, RadiationField) or isinstance(y, RadiationFieldChannel):
-            if has_multi_channel and (pred_field.scatter_field is None and pred_field.direct_beam is None):
-                raise ValueError("The model should not return both scatter_field and direct_beam in the same forward pass when has_multi_channel is True.")
-            elif not has_multi_channel and ((pred_field.scatter_field is not None) and (pred_field.direct_beam is not None)):
-                # 3.8: the two-head model returns BOTH channels, but the GT is
-                # single-channel (joined-flux contract). Join the two predicted
-                # flux heads in PHYSICAL space — inverse-normalise, sum, then
-                # re-normalise — mirroring the GT channel-join below in
-                # calculate_metrics. The previous code summed in *normalised*
-                # space, which is not the inverse of how the GT is joined (it
-                # can leave the codomain and double-counts the normaliser
-                # offset). Spectrum stays single-head (scatter), per the
-                # two-head design constraint.
-                inv = self._normalizer.inverse(pred_field)
-                joined_flux_phys = inv.scatter_field.flux + inv.direct_beam.flux
-                joined = RadiationField(
-                    scatter_field=RadiationFieldChannel(
-                        flux=joined_flux_phys,
-                        spectrum=inv.scatter_field.spectrum,
-                        error=inv.scatter_field.error,
-                    ),
-                    direct_beam=None,
-                )
-                pred_field = self._normalizer.forward(joined)
+        return self._calc_metrics_impl(pred_field, y, batch)
 
-        return self.calculate_metrics(pred_field, y, batch)
-
-    def calculate_metrics(self, pred_field: RadiationField | AirKermaField, y: RadiationField | AirKermaField, batch: TrainingInputData, ignore_scatter: bool = False, ignore_direct_beam: bool = False) -> TrainingMetrics:
-        scatter_metrics: ChannelMetrics = None
-        direct_metrics: ChannelMetrics = None
-
-        if isinstance(pred_field, RadiationField):
-            has_multi_channel = y.direct_beam is not None if isinstance(y, RadiationField) else False
-            scatter_field_gt = y.scatter_field if isinstance(y, RadiationField) else y
-
-            if not has_multi_channel and (pred_field.scatter_field is not None and pred_field.direct_beam is not None):
-                raise ValueError("The model should return either scatter_field or direct_beam, but not both when has_multi_channel is False.")
-            
-            if has_multi_channel and (pred_field.scatter_field is None or pred_field.direct_beam is None):
-                # if network is only predicting one channel, join channels for loss calculation
-                batch = self._normalizer.inverse(batch)
-                y = self._normalizer.inverse(y)
-                batch = self._channels_join(batch)
-                batch = self._normalizer.forward(batch)
-                y = self._channels_join(y)
-                y = self._normalizer.forward(y)
-                scatter_field_gt = y
-                has_multi_channel = False
-
-            if pred_field.direct_beam is not None and has_multi_channel and not ignore_direct_beam:
-                # The direct beam's spectrum is never scored separately: the
-                # two-head model shares a single joined spectrum (in the scatter
-                # slot), and a split direct spectrum is too inaccurate to be
-                # useful. Only the direct flux is scored.
-                loss_flux = self._flux_loss_fn.forward(prediction=pred_field.direct_beam.flux, target=y.direct_beam.flux, input=batch)
-
-                direct_metrics = ChannelMetrics(
-                    flux_loss=loss_flux,
-                    spectrum_loss=None,
-                )
-
-            if pred_field.scatter_field is not None and not ignore_scatter:
-                loss_spec = None
-                if pred_field.scatter_field.spectrum is not None:
-                    loss_spec = self._spectrum_loss_fn.forward(prediction=pred_field.scatter_field.spectrum, target=scatter_field_gt.spectrum, input=batch)
-                    if not torch.isfinite(loss_spec).all():
-                        # During lr_find on fp16, the high-LR end of the sweep
-                        # overflows the fp16 weights and produces a non-finite
-                        # loss. The downstream total_loss fallback in
-                        # process_metrics replaces it with 1.0 so lr_find can
-                        # read this as the divergence signal and pick a safe
-                        # LR — raising here would abort the sweep.
-                        print(f"[red] Spectrum loss is not finite — letting downstream fallback set total to 1.")
-
-                loss_flux = self._flux_loss_fn.forward(prediction=pred_field.scatter_field.flux, target=scatter_field_gt.flux, input=batch)
-
-                if not torch.isfinite(loss_flux).all():
-                    print(f"[red] Flux loss is not finite — letting downstream fallback set total to 1.")
-
-                # NOTE: a manual `loss_flux *= direct_flux.sum() / scatter_flux.sum()`
-                # rescaling used to live here (multi-channel/two-head only). It
-                # assumed a log-space normaliser where the per-channel flux sums
-                # are large and same-signed; under `asinh_split` the scatter sum
-                # crosses zero, so the ratio blew up to inf/NaN and poisoned the
-                # DB-MTL surrogate every step. The cross-task flux balancing it
-                # tried to do is exactly what `MultiTaskLossBalancer` now does
-                # (scale-invariantly, in log space), so it has been removed.
-
-                scatter_metrics = ChannelMetrics(
-                    flux_loss=loss_flux,
-                    spectrum_loss=loss_spec
-                )
-
-            return TrainingMetrics(
-                scatter_field=scatter_metrics,
-                direct_beam=direct_metrics
-            )
-        elif isinstance(pred_field, AirKermaField):
-            assert isinstance(y, AirKermaField), "Ground truth must be of type AirKermaField when predicting AirKermaField."
-            loss_airkerma = self._flux_loss_fn.forward(prediction=pred_field.air_kerma, target=y.air_kerma, input=batch)
-            return TrainingMetrics(
-                airkerma_field=loss_airkerma
-            )
-        else:
-            raise ValueError("pred_field must be of type RadiationField or AirKermaField.")
+    def calculate_metrics(self, pred_field: RadiationField | AirKermaField, y: RadiationField | AirKermaField, batch: TrainingInputData) -> TrainingMetrics:
+        """Public seam (subclasses with their own evaluate_forward call this with their
+        prediction). Binds the matching plain eval method on first use — here the first real
+        prediction IS the test run — then dispatches straight to it."""
+        if self._calc_metrics_impl is None:
+            self._calc_metrics_impl = self._select_metrics_impl(pred_field, y)
+        return self._calc_metrics_impl(pred_field, y, batch)
     
     @property
     def output_head_markers(self) -> tuple[str, ...]:

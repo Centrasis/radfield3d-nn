@@ -5,9 +5,11 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <vector>
 
 #include "radfield3d-nn/model_io.h"
@@ -18,7 +20,7 @@
 #endif
 
 using namespace rfnn::io;       // ParameterRange, BeamParameter, ModelDomain, ModelProvenance
-using namespace rfnn::io::V1;    // NamedGraphs, LoadedModel, ModelFactory, k*Graph
+using namespace rfnn::io::V1;    // NamedGraphs, ModelFactory, k*Graph
 using radfield3dnn::BeamParameters;
 using radfield3dnn::PredictorType;
 using radfield3dnn::VoxelFieldPredictor;
@@ -65,38 +67,41 @@ TEST(ModelIo, RoundTripDomainMetricsAndModel) {
     const std::string pkg = std::string(RFNN_TEST_DATA_DIR) + "/roundtrip.rf3m";
     ModelFactory::save(pkg, graphs, domain, prov, metrics);
 
-    LoadedModel loaded = ModelFactory::load(pkg);
+    // load() parses the container AND builds the runnable predictor in one step, carrying the
+    // package metadata on the returned predictor.
+    std::unique_ptr<radfield3dnn::VolumeFieldPredictor> model =
+        ModelFactory::load(pkg, /*use_cuda=*/false);
+    ASSERT_TRUE(model != nullptr);
 
     // Provenance.
-    EXPECT_EQ(loaded.provenance.dataset_name, prov.dataset_name);
-    EXPECT_EQ(loaded.provenance.software_version, prov.software_version);
-    EXPECT_EQ(loaded.provenance.physics, prov.physics);
+    EXPECT_EQ(model->provenance().dataset_name, prov.dataset_name);
+    EXPECT_EQ(model->provenance().software_version, prov.software_version);
+    EXPECT_EQ(model->provenance().physics, prov.physics);
 
     // Metrics.
-    ASSERT_EQ(loaded.metrics.size(), metrics.size());
+    ASSERT_EQ(model->metrics().size(), metrics.size());
     for (const auto& [k, v] : metrics)
-        EXPECT_NEAR(loaded.metrics.at(k), v, 1e-5f);
+        EXPECT_NEAR(model->metrics().at(k), v, 1e-5f);
 
     // Domain (metric units; no spatial geometry stored).
-    EXPECT_EQ(loaded.domain.spectrum_bins, domain.spectrum_bins);
-    EXPECT_NEAR(loaded.domain.spectrum_max_energy_ev, domain.spectrum_max_energy_ev, 1e-3f);
+    EXPECT_EQ(model->domain().spectrum_bins, domain.spectrum_bins);
+    EXPECT_NEAR(model->domain().spectrum_max_energy_ev, domain.spectrum_max_energy_ev, 1e-3f);
 
     // Beam-parameter descriptor list (name, slot count, range, unit).
-    ASSERT_EQ(loaded.domain.beam_parameters.size(), 4u);
-    const auto& dist = loaded.domain.beam_parameters[1];
+    ASSERT_EQ(model->domain().beam_parameters.size(), 4u);
+    const auto& dist = model->domain().beam_parameters[1];
     EXPECT_EQ(dist.name, "distance");
     EXPECT_EQ(dist.count, 1);
     EXPECT_NEAR(dist.range.min, 0.2f, 1e-6f);
     EXPECT_NEAR(dist.range.max, 1.5f, 1e-6f);
     EXPECT_EQ(dist.range.unit, "m");
-    EXPECT_EQ(loaded.domain.beam_parameters[3].name, "spectrum");
-    EXPECT_EQ(loaded.domain.beam_parameters[3].count, 32);
+    EXPECT_EQ(model->domain().beam_parameters[3].name, "spectrum");
+    EXPECT_EQ(model->domain().beam_parameters[3].count, 32);
 
-    // The package rebuilds into a VoxelFieldPredictor (the trunk graph is per-voxel) whose
-    // prediction matches the same ONNX loaded directly.
-    ASSERT_TRUE(loaded.has(kTrunkGraph));
-    auto model = loaded.build(/*use_cuda=*/false);
-    ASSERT_TRUE(model != nullptr);
+    // The package built into a VoxelFieldPredictor (the trunk graph is per-voxel) whose prediction
+    // matches the same ONNX loaded directly. The trunk graph name is carried in graph_names().
+    const auto& names = model->graph_names();
+    ASSERT_NE(std::find(names.begin(), names.end(), kTrunkGraph), names.end());
     ASSERT_EQ(model->type(), PredictorType::VoxelField);
     auto* voxel = static_cast<VoxelFieldPredictor*>(model.get());
 

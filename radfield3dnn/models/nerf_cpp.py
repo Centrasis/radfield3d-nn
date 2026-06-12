@@ -5,7 +5,20 @@ from .nerf import RFNetBase
 from radfield3dnn.rftypes import PositionalInput, RadiationField, RadiationFieldChannel
 from torch import nn, Tensor
 from typing import Union
-import radfield3dnn.radfield3dnn as rfnn
+try:
+    # The tiny-cuda-nn native module. OPTIONAL: tcnn is deactivated by default (a plain
+    # `pip install` is pure-Python), so this import may be absent. The cpp-backed model classes
+    # below are still defined and self-register; only CONSTRUCTING one touches `rfnn` and then
+    # raises the clear error below. Build the module with `RFNN_WITH_TCNN=1 pip install -e .`.
+    import radfield3dnn.radfield3dnn as rfnn
+except ImportError:
+    class _TcnnUnavailable:
+        def __getattr__(self, name):
+            raise ImportError(
+                "radfield3dnn.radfield3dnn (the tiny-cuda-nn native module) is not built — the "
+                "cpp-backed models (PBRFNetCPP, SPERFNetCPP, …) are deactivated. Reinstall with "
+                "`RFNN_WITH_TCNN=1 pip install -e .` to enable them.")
+    rfnn = _TcnnUnavailable()
 from radfield3dnn.preprocessing.normalizations import NormalizerConstructor
 from radfield3dnn.utils.mean_sampling import resample_histogram_bilinear
 from radfield3dnn.models.activations.HistogramNormalize import HistogramNormalize

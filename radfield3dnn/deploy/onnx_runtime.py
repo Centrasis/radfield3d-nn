@@ -7,9 +7,8 @@ to :class:`~radfield3dnn.deploy.model_packager.ModelPackager`, which writes the 
 loads.
 
     from radfield3dnn.deploy import load_rf3m
-    model = load_rf3m("PBRFNet.rf3m")            # LoadedModel
-    pred  = model.build(use_cuda=False)          # Volume/VoxelFieldPredictor
-    out   = pred.predict_volume(beam, (48,48,48))
+    pred = load_rf3m("PBRFNet.rf3m")             # RF3M -> Volume/VoxelFieldPredictor (built)
+    out  = pred.predict_volume(beam, (48,48,48))
 
 Build the bindings once with::
 

@@ -40,6 +40,18 @@ class CMakeBuild(build_ext):
         if not isinstance(ext, CMakeExtension):
             return super().build_extension(ext)
 
+        # The only native extension is the tiny-cuda-nn module
+        # (radfield3dnn.radfield3dnn, used by models/nerf_cpp). It needs CUDA +
+        # tiny-cuda-nn + libtorch and is OPTIONAL — tcnn is deactivated by
+        # default, so a plain `pip install` is a pure-Python install (the
+        # cpp-backed models in nerf_cpp are simply unavailable, and their tests
+        # self-skip). Enable the native build explicitly with RFNN_WITH_TCNN=1.
+        if os.environ.get("RFNN_WITH_TCNN", "").strip().lower() not in ("1", "on", "true", "yes"):
+            print("radfield3d-nn: tcnn deactivated — skipping the native "
+                  "radfield3dnn.radfield3dnn build (set RFNN_WITH_TCNN=1 to enable it). "
+                  "Pure-Python install.")
+            return
+
         # extdir: the directory inside the wheel where the .so for this
         # Extension must land. For ext.name == "radfield3dnn.radfield3dnn"
         # this is ``build/lib.<plat>-<py>/radfield3dnn/``.
@@ -72,6 +84,15 @@ class CMakeBuild(build_ext):
             f"-DPython_EXECUTABLE={sys.executable}",
             f"-DPython_ROOT_DIR={sys.exec_prefix}",
             f"-DPYTHON_VERSION={sys.version_info.major}.{sys.version_info.minor}",
+            # Build the tcnn module + its python bindings. RFNN_WITH_TCNN is
+            # forced here (not left to the CMake cache) so a persistent build/
+            # dir previously configured for the deploy lib — which leaves
+            # RFNN_WITH_TCNN=OFF, making the `radfield3dnn` target vanish
+            # ("ninja: error: unknown target 'radfield3dnn'") — still produces
+            # the target. The whole native build is gated by the opt-in check
+            # above, so a plain `pip install` never reaches here.
+            "-DRFNN_WITH_TCNN=ON",
+            "-DBuild_PyBindings=ON",
             # tiny-cuda-nn's JIT-fused MLP device-code path is __half-only;
             # turning this OFF disables the JIT and the fused model errors
             # with "Use JIT!". This is a hard constraint of the C++ path.
@@ -128,7 +149,14 @@ setup(
     ],
     packages=packages,
     package_data={"radfield3dnn": ["*.pyi", "py.typed"]},
-    ext_modules=[CMakeExtension("radfield3dnn.radfield3dnn", sourcedir=str(HERE))],
+    # The tiny-cuda-nn native extension is OPTIONAL and OFF by default (tcnn deactivated → a
+    # pure-Python install). It is declared ONLY when RFNN_WITH_TCNN is enabled, so setuptools
+    # never expects a .so that the build skipped. Build it with `RFNN_WITH_TCNN=1 pip install -e .`.
+    ext_modules=(
+        [CMakeExtension("radfield3dnn.radfield3dnn", sourcedir=str(HERE))]
+        if os.environ.get("RFNN_WITH_TCNN", "").strip().lower() in ("1", "on", "true", "yes")
+        else []
+    ),
     cmdclass={"build_ext": CMakeBuild},
     zip_safe=False,
 )

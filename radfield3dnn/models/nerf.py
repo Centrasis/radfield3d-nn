@@ -1,11 +1,6 @@
-import math
 import torch
 import torch.nn as nn
 from torch import Tensor
-from radfield3dnn.models.encoders.spherical_hamonics import SphericalHarmonics
-from radfield3dnn.models.encoders.sinusoidal_encoding import SinusoidalFrequencyEncoding
-from radfield3dnn.models.encoders.hash_encoding import HashGridEncoding
-from radfield3dnn.models.encoders.rff_encoding import RandomFourierFeatures
 from radfield3dnn.models.encoders.factory import build_encoding
 from radfield3dnn.models.encoders.spectra_factory import build_spectra_encoding
 from .feedforward import FeedforwardPointwiseModel
@@ -15,7 +10,6 @@ from .base import ModuleBuilder
 from radfield3dnn.optim import OptimizerBehaviour, CosineWithWarmup
 from typing import Union, Literal
 from radfield3dnn.models.activations.flux_activations import GradientConservingClamping, SoftClip, LogitSigmoid
-from .encoders.spectra_encoder import SpectraProjector, SimpleSpectraEncoder
 from radfield3dnn.preprocessing.normalizations.linear import LinearNormalizer
 from radfield3dnn.preprocessing.normalizations.logscale import LogScaleNormalizer
 from radfield3dnn.preprocessing.normalizations.asinh import AsinhTonemapNormalizer

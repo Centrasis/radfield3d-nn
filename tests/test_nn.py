@@ -1,5 +1,7 @@
+import pytest
 import torch
-import radfield3dnn.radfield3dnn as rfnn
+# tcnn-only test: skip the whole module when the native module is deactivated/not built.
+rfnn = pytest.importorskip("radfield3dnn.radfield3dnn")
 from torch import nn
 from torch import optim
 import math

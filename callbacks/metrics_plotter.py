@@ -56,8 +56,15 @@ class MetricsPlotter(Callback):
                                       f"{type(pl_module).__name__} — logged as NaN.", RuntimeWarning)
                         self._warned_none.add(name)
                     continue
-                if val.ndim == 1:
-                    val = val.squeeze(0)
+                if val.ndim >= 1:
+                    # Metrics return an EMPTY tensor (torch.zeros(0), see smape.py) when their
+                    # mask selects no voxels in this batch — the batch carries no information
+                    # for that metric, so skip it (don't count it into the epoch mean). Adding
+                    # an empty tensor to the scalar accumulator crashed with "output with shape
+                    # [] doesn't match the broadcast shape [0]" (killed e0/a2/b1/c3 mid-sweep).
+                    if val.numel() == 0:
+                        continue
+                    val = val.mean()
                 self.metrics_accumulator[name] += val
                 self.metrics_count[name] += 1
 

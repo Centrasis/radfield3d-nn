@@ -145,6 +145,16 @@ void VolumeFieldPredictor::set_parameter_range(const std::string& name, float mi
     impl_->param_ranges[name] = {min, max};
 }
 
+void VolumeFieldPredictor::set_package_metadata(rfnn::io::ModelDomain domain,
+                                                rfnn::io::ModelProvenance provenance,
+                                                std::map<std::string, float> metrics,
+                                                std::vector<std::string> graph_names) {
+    domain_      = std::move(domain);
+    provenance_  = std::move(provenance);
+    metrics_     = std::move(metrics);
+    graph_names_ = std::move(graph_names);
+}
+
 static bool is_position_input(const std::string& n) {
     return name_is(n, {"position", "pos", "query", "xyz"});
 }
@@ -513,47 +523,6 @@ void VoxelFieldPredictor::predict_into_field(const BeamParameters& beam,
 
 }  // namespace radfield3dnn
 
-// ── Factory dispatch ─────────────────────────────────────────────────────────────────────────
-// Defined here (not in model_io.cpp) because it needs the predictor classes + ONNX Runtime, keeping
-// model_io.cpp free of any ORT dependency.
-namespace rfnn {
-namespace io {
-namespace V1 {
-
-std::unique_ptr<radfield3dnn::VolumeFieldPredictor> LoadedModel::build(bool use_cuda) const {
-    auto it = graphs.find(kTrunkGraph);
-    if (it == graphs.end())
-        throw std::runtime_error("model_io: package has no '" + std::string(kTrunkGraph) + "' graph");
-    const std::vector<uint8_t>& trunk = it->second;
-
-    // The ModelDomain carries the [min,max] metric range of each beam parameter; register them on a
-    // predictor so its metric inputs (e.g. "distance") are clipped+normalised to [0,1] before
-    // encoding, matching training. Applied to whichever predictor consumes the beam parameters
-    // (the beam encoder for a two-graph model, else the trunk).
-    auto apply_ranges = [this](radfield3dnn::VolumeFieldPredictor& p) {
-        for (const auto& bp : domain.beam_parameters)
-            p.set_parameter_range(bp.name, bp.range.min, bp.range.max);
-    };
-
-    // Build the trunk once (this is the expensive step — TRT engine build). If it is a per-voxel
-    // model, adopt that already-built session into a VoxelFieldPredictor (no re-load) and wire the
-    // beam-encoder graph if the package carries one; otherwise it stays a VolumeFieldPredictor.
-    auto trunk_pred = std::make_unique<radfield3dnn::VolumeFieldPredictor>(trunk.data(), trunk.size(), use_cuda);
-    apply_ranges(*trunk_pred);  // single-graph models bind the beam params on the trunk
-    if (!trunk_pred->is_voxelwise())
-        return trunk_pred;
-
-    std::shared_ptr<radfield3dnn::VolumeFieldPredictor> encoder;
-    auto eit = graphs.find(kBeamEncoderGraph);
-    if (eit != graphs.end()) {
-        encoder = std::make_shared<radfield3dnn::VolumeFieldPredictor>(
-            eit->second.data(), eit->second.size(), use_cuda);
-        apply_ranges(*encoder);  // two-graph models bind the beam params on the encoder
-    }
-
-    return std::make_unique<radfield3dnn::VoxelFieldPredictor>(std::move(*trunk_pred), std::move(encoder));
-}
-
-}  // namespace V1
-}  // namespace io
-}  // namespace rfnn
+// The RF3M parse+build (ModelFactory::load[/_from_memory]) lives in model_io.cpp now: it drives
+// this file's predictor ctors / set_parameter_range through their public declarations, so the
+// parse+build needs no ORT headers and the predictor it returns carries the package metadata.

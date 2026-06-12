@@ -11,7 +11,7 @@ from .gpr import GammaPassingRate
 
 
 class AirkermaAccuracy(MetricBase):
-    def __init__(self, mu_tr_file: str, spectra_bins: int, max_energy_eV: float, weight_with_error: bool = False, importance_threshold: float = 0.0, keep_dim: bool = False, metric_type: Union[Literal['smape'], Literal['log_rmse'], Literal['ncc'], Literal['gpr']] = 'smape', voxel_size_m: float = 0.01, rel_dose_diff: float = 0.03, dist_crit_mm: float = 3.0):
+    def __init__(self, mu_tr_file: str, spectra_bins: int, max_energy_eV: float, weight_with_error: bool = False, importance_threshold: float = 0.0, keep_dim: bool = False, metric_type: Union[Literal['smape'], Literal['log_rmse'], Literal['ncc'], Literal['gpr']] = 'smape', voxel_size_m: float = 0.01, rel_dose_diff: float = 0.03, dist_crit_mm: float = 3.0, dose_threshold: float = 0.1):
         super().__init__(layer_name=None, weight_with_error=weight_with_error)
         self.airkerma = Airkerma(Airkerma.load_mu_tr_table(mu_tr_file), spectra_bins, max_energy_eV)
         if metric_type == 'smape':
@@ -21,7 +21,13 @@ class AirkermaAccuracy(MetricBase):
         elif metric_type == 'ncc':
             self.metric = NCCAccuracy(layer_name=None, reduction='mean', weight_with_error=weight_with_error, importance_threshold=importance_threshold)
         elif metric_type == 'gpr':
-            self.metric = GammaPassingRate(layer_name=None, reduction='mean', weight_with_error=weight_with_error, keep_dim=keep_dim, voxel_size_m=voxel_size_m, rel_dose_diff=rel_dose_diff, dist_crit_mm=dist_crit_mm)
+            # dose_threshold = the gamma low-dose cutoff (fraction of per-field max that a GT voxel
+            # must exceed to be SCORED). Default 0.1 = the clinical 10% convention. The previous
+            # effective value (GammaPassingRate's 1e-5 default, never forwarded) scored ~99% of
+            # voxels with a GLOBAL 3%-of-max dose tolerance — a ZERO prediction passed at GPR 0.992
+            # (measured on 8 DS03 fields), so models predicting "tiny everywhere" started at ~0.98
+            # GPR and stayed there regardless of quality. At 0.1 the same zero prediction scores 0.
+            self.metric = GammaPassingRate(layer_name=None, reduction='mean', weight_with_error=weight_with_error, keep_dim=keep_dim, voxel_size_m=voxel_size_m, rel_dose_diff=rel_dose_diff, dist_crit_mm=dist_crit_mm, dose_threshold=dose_threshold)
         else:
             raise ValueError(f"Unknown metric_type: {metric_type}")
 
@@ -244,25 +250,30 @@ class AirkermaSupervoxelScatterAccuracy(AirkermaAccuracy):
 
 class AirkermaScatterAccuracy(AirkermaAccuracy):
     def __init__(self, mu_tr_file: str, spectra_bins: int, max_energy_eV: float, weight_with_error: bool = False, keep_dim: bool = False, max_relative_flux: float = 5e-2, min_relative_flux: float = 5e-3, metric_type: Union[Literal['smape'], Literal['log_rmse'], Literal['ncc']] = 'smape',
-                 use_error: bool = True, error_threshold: float = 0.5):
-        """Scatter-field air-kerma accuracy (beam excluded). Two low-signal masking modes:
+                 use_error: bool = True, error_threshold: float = 0.5,
+                 use_roi: bool = False, scatter_lo: float = 5e-5):
+        """Scatter-field air-kerma accuracy (beam excluded). Low-signal masking modes:
 
-        * ``use_error=True`` (DEFAULT — THE scatter-volume definition, the same volume the
-          loss-normalizer study + MC-floor analysis visualize): voxels whose **per-voxel MC
-          statistical error** marks the GT as noise-dominated (``error >= error_threshold``;
-          the DS03 error layer is ~binary {0,1}) are excluded. This scores the REAL scatter
-          field — ~86–91% of DS03 voxels — without rewarding/punishing the unfittable MC noise.
-        * ``use_error=False`` (LEGACY — the published bright-ring definition): voxels below
-          ``min_relative_flux`` of the total-flux max are excluded — only the bright-scatter
-          ring (~3% of DS03 voxels) scores. Kept for comparability with the published 0.84.
+        * ``use_roi=True`` (THE shared ROI definition — matches radfield3dnn.roi, TwoROIGammaLoss
+          and the ROI sampler): scores exactly the scatter ROI = NOT beam AND joined >=
+          ``scatter_lo``·joined_max. The beam is excluded (direct > ``max_relative_flux``·direct_max)
+          and the floor (joined < ``scatter_lo``·max) is excluded. On DS03 (scatter_lo=5e-5) this
+          scores ~80% of voxels with ~3.8% MC-noise (perfect-model SMAPE ceiling ≈0.985).
+        * ``use_error=True``: voxels whose per-voxel MC error marks the GT noise-dominated
+          (error >= error_threshold) are excluded instead — ~86–91% of voxels.
+        * ``use_error=False`` (LEGACY bright-ring): voxels below ``min_relative_flux`` of the
+          total-flux max are excluded — only the bright ring (~3%). Kept for the published 0.84.
 
-        The beam exclusion (direct > ``max_relative_flux``·direct_max) applies in both modes.
+        The beam exclusion (direct > ``max_relative_flux``·direct_max) applies in every mode.
+        ``use_roi`` takes precedence over ``use_error``.
         """
         super().__init__(mu_tr_file, spectra_bins, max_energy_eV, weight_with_error, importance_threshold=0.0, keep_dim=keep_dim, metric_type=metric_type)
         self.max_relative_flux = max_relative_flux
         self.min_relative_flux = min_relative_flux
         self.use_error = bool(use_error)
         self.error_threshold = float(error_threshold)
+        self.use_roi = bool(use_roi)
+        self.scatter_lo = float(scatter_lo)
 
     def forward(self, target: Union[RadiationFieldChannel, AirKermaField, Tensor], prediction: Union[RadiationFieldChannel, AirKermaField, Tensor], input: TrainingInputData = None) -> Tensor:
         assert (isinstance(input.ground_truth, RadiationField) and input.ground_truth.direct_beam is not None) or (input.original_ground_truth is not None and input.original_ground_truth.direct_beam is not None), "Input TrainingInputData must contain direct_beam for scatter field accuracy."
@@ -276,7 +287,12 @@ class AirkermaScatterAccuracy(AirkermaAccuracy):
         beam_mask = xgt > xgt.max() * self.max_relative_flux  # ignore areas with > max_relative_flux of max primary flux
 
         scatter_error = sgt_ch.error if isinstance(sgt_ch, RadiationFieldChannel) else None
-        if self.use_error and scatter_error is not None:
+        if self.use_roi:
+            # Shared ROI scatter mask: exclude beam ∪ floor -> scored = NOT beam AND joined >=
+            # scatter_lo*max. Same regions as radfield3dnn.roi / TwoROIGammaLoss / the ROI sampler.
+            floor_mask = fgt < fgt.max() * self.scatter_lo
+            beam_mask = beam_mask | floor_mask
+        elif self.use_error and scatter_error is not None:
             # Noise-aware mode: exclude voxels where the MC statistical error marks the GT itself
             # as noise-dominated; everything else (the real, reliable scatter field) is scored.
             noise_mask = scatter_error >= self.error_threshold
@@ -295,19 +311,18 @@ class AirkermaScatterAccuracy(AirkermaAccuracy):
                 low_flux_mask = prediction < prediction.max() * self.min_relative_flux  # ignore areas with < min_relative_flux of max predicted value
             beam_mask = beam_mask | (low_flux_mask & low_flux_mask_gt)  # combine masks
 
-        if isinstance(target, RadiationFieldChannel):
-            target.flux[beam_mask] = -torch.inf
-        elif isinstance(target, AirKermaField):
-            target.air_kerma[beam_mask] = -torch.inf
-        else:
-            target[beam_mask] = -torch.inf
+        # Mask on CLONES — never mutate the caller's tensors. The previous in-place
+        # `target.flux[beam_mask] = -inf` leaked the mask into every metric evaluated
+        # AFTER this one on the same gt/pred objects (MetricsPlotter passes them
+        # sequentially), silently corrupting roi/sv8/gamma/legacy values downstream.
+        def _masked(x):
+            if isinstance(x, RadiationFieldChannel):
+                f = x.flux.clone(); f[beam_mask] = -torch.inf
+                return x._replace(flux=f)
+            elif isinstance(x, AirKermaField):
+                a = x.air_kerma.clone(); a[beam_mask] = -torch.inf
+                return x._replace(air_kerma=a)
+            x = x.clone(); x[beam_mask] = -torch.inf
+            return x
 
-
-        if isinstance(prediction, RadiationFieldChannel):
-            prediction.flux[beam_mask] = -torch.inf
-        elif isinstance(prediction, AirKermaField):
-            prediction.air_kerma[beam_mask] = -torch.inf
-        else:
-            prediction[beam_mask] = -torch.inf
-
-        return super().forward(target, prediction, input)
+        return super().forward(_masked(target), _masked(prediction), input)

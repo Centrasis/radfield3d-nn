@@ -4,8 +4,8 @@
 // would run it (the Python-side test of the deploy path).
 //
 //   import rfnn_deploy
-//   lm   = rfnn_deploy.load("PBRFNet.rf3m")             # parse the RF3M container
-//   pred = lm.build(use_cuda=False)                      # VolumeFieldPredictor | VoxelFieldPredictor
+//   pred = rfnn_deploy.ModelFactory.load("PBRFNet.rf3m") # RF3M -> runnable predictor (Voxel|Volume)
+//   pred.domain, pred.metrics, pred.graph_names          # package metadata, carried on the predictor
 //   out  = pred.predict_volume(beam, (48,48,48))         # -> dict(flux=np[D,H,W], spectrum=np[D,H,W,B])
 //   enc  = pred.encode_beam(beam)                        # voxel models: beam latent (cached)
 //   out  = pred.predict_voxelwise(positions_np, enc)     # per-voxel queries, positions in [0,1]^3
@@ -91,13 +91,18 @@ PYBIND11_MODULE(rfnn_deploy, m) {
         .value("VolumeField", PredictorType::VolumeField)
         .value("VoxelField", PredictorType::VoxelField);
 
-    // dynamic_attr: ModelFactory.load attaches the package metadata (.domain/.provenance/.metrics/
-    // .graph_names) directly onto the returned predictor object.
+    // The package metadata is carried ON the predictor (set by ModelFactory::load), exposed as
+    // read-only properties .domain / .provenance / .metrics / .graph_names (inherited by
+    // VoxelFieldPredictor). dynamic_attr stays so callers may still attach their own attributes.
     py::class_<VolumeFieldPredictor, std::shared_ptr<VolumeFieldPredictor>>(m, "VolumeFieldPredictor", py::dynamic_attr())
         .def(py::init<const std::string&, bool>(), py::arg("onnx_path"), py::arg("use_cuda") = false)
         .def_property_readonly("type", &VolumeFieldPredictor::type)
         .def_property_readonly("is_voxelwise", &VolumeFieldPredictor::is_voxelwise)
         .def_property_readonly("spectrum_bins", &VolumeFieldPredictor::spectrum_bins)
+        .def_property_readonly("domain", &VolumeFieldPredictor::domain)
+        .def_property_readonly("provenance", &VolumeFieldPredictor::provenance)
+        .def_property_readonly("metrics", &VolumeFieldPredictor::metrics)
+        .def_property_readonly("graph_names", &VolumeFieldPredictor::graph_names)
         .def("predict_volume",
              [](const VolumeFieldPredictor& self, const BeamParameters& beam,
                 std::array<int, 3> dims, int max_inner_batch) {
@@ -127,7 +132,6 @@ PYBIND11_MODULE(rfnn_deploy, m) {
              py::arg("positions"), py::arg("encoded_beam"));
 
     // ── RF3M container (rfnn::io::V1) ────────────────────────────────────────
-    using rfnn::io::V1::LoadedModel;
     using rfnn::io::V1::ModelFactory;
 
     // Read/WRITE + constructible: these double as the SAVE-side metadata builders, so the Python
@@ -164,33 +168,19 @@ PYBIND11_MODULE(rfnn_deploy, m) {
         .def_readwrite("software_version", &rfnn::io::ModelProvenance::software_version)
         .def_readwrite("physics", &rfnn::io::ModelProvenance::physics);
 
-    // ── ModelFactory: loads an RF3M package STRAIGHT to the runnable predictor (the C++
-    //    LoadedModel is an internal detail; the package metadata is attached to the predictor
-    //    python object as `.domain` / `.provenance` / `.metrics` / `.graph_names`). ──────────────
-    auto build_predictor = [](const LoadedModel& lm, bool use_cuda) {
-        std::shared_ptr<VolumeFieldPredictor> p(lm.build(use_cuda).release());
-        py::object obj = py::cast(p);    // downcasts to VoxelFieldPredictor automatically
-        obj.attr("domain") = py::cast(lm.domain);
-        obj.attr("provenance") = py::cast(lm.provenance);
-        obj.attr("metrics") = py::cast(lm.metrics);
-        std::vector<std::string> names;
-        for (auto& kv : lm.graphs) names.push_back(kv.first);
-        obj.attr("graph_names") = py::cast(names);
-        return obj;
-    };
-
+    // ── ModelFactory: parses an RF3M package AND builds the runnable predictor in one call (no
+    //    LoadedModel handle). pybind transfers the returned unique_ptr into the shared_ptr holder
+    //    and downcasts a per-voxel model to VoxelFieldPredictor automatically; the package metadata
+    //    rides along as the predictor's `.domain` / `.provenance` / `.metrics` / `.graph_names`. ──
     py::class_<ModelFactory>(m, "ModelFactory")
-        .def_static("load",
-                    [build_predictor](const std::string& path, bool use_cuda) {
-                        return build_predictor(ModelFactory::load(path), use_cuda);
-                    },
+        .def_static("load", &ModelFactory::load,
                     py::arg("path"), py::arg("use_cuda") = false,
                     "Load an RF3M package and return the runnable predictor "
                     "(VoxelFieldPredictor for per-voxel models, VolumeFieldPredictor for field-wise).")
         .def_static("load_from_memory",
-                    [build_predictor](py::bytes data, bool use_cuda) {
+                    [](py::bytes data, bool use_cuda) {
                         std::string s = data;
-                        return build_predictor(ModelFactory::load_from_memory(s.data(), s.size()), use_cuda);
+                        return ModelFactory::load_from_memory(s.data(), s.size(), use_cuda);
                     },
                     py::arg("data"), py::arg("use_cuda") = false);
 

@@ -14,6 +14,12 @@ head + histogram-normalized spectrum head.
 import os
 import math
 
+import pytest
+# PBRFNetCPP needs the tiny-cuda-nn native module; skip this whole module when tcnn is
+# deactivated/not built (its import succeeds via the stub, but constructing PBRFNetCPP would
+# raise ImportError).
+pytest.importorskip("radfield3dnn.radfield3dnn")
+
 import torch
 from torch import optim, nn
 from torch.utils.data import Dataset, DataLoader

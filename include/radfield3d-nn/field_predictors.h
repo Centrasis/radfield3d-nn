@@ -19,9 +19,12 @@
 // (Class formerly named TrainedModel; the file keeps its name.)
 
 #include <array>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
+
+#include <radfield3d-nn/model_domain.h>   // rfnn::io::{ModelDomain,ModelProvenance} carried by a loaded predictor
 
 namespace Ort { struct Env; struct Session; struct MemoryInfo; }  // fwd-decl (onnxruntime_cxx_api.h in .cpp)
 
@@ -102,10 +105,23 @@ public:
     // itself (e.g. "distance" in metres, "opening_angle" in degrees) — are clipped to this range and
     // linearly mapped to [0,1] before encoding, matching the training-time BeamParametersNormalization.
     // Self-normalised inputs (the "direction" unit vector, the "spectrum" histogram) are left untouched.
-    // rfnn::io::V1::LoadedModel::build() calls this for every domain parameter; without it, metric
+    // rfnn::io::V1::ModelFactory::load() calls this for every domain parameter; without it, metric
     // inputs reach the graph un-normalised and the prediction is wrong (the deployed beam latent does
     // not match training).
     void set_parameter_range(const std::string& name, float min, float max);
+
+    // ── RF3M package metadata ───────────────────────────────────────────────────────────────────
+    // Populated by rfnn::io::V1::ModelFactory::load[/_from_memory] from the package the predictor
+    // was loaded from (so the factory returns the runnable predictor directly, carrying its own
+    // domain/provenance/metrics + the names of the graphs it was composed from). A predictor built
+    // straight from a bare ONNX path/buffer leaves these empty. The factory is the only writer.
+    const rfnn::io::ModelDomain&        domain() const { return domain_; }
+    const rfnn::io::ModelProvenance&    provenance() const { return provenance_; }
+    const std::map<std::string, float>& metrics() const { return metrics_; }
+    const std::vector<std::string>&     graph_names() const { return graph_names_; }
+    void set_package_metadata(rfnn::io::ModelDomain domain, rfnn::io::ModelProvenance provenance,
+                              std::map<std::string, float> metrics,
+                              std::vector<std::string> graph_names);
 
     // Whole-field prediction. Field-wise models emit the volume in one Run(); VoxelFieldPredictor
     // overrides this to tile per-voxel queries over the grid in `max_inner_batch` chunks.
@@ -132,6 +148,13 @@ protected:
     std::unique_ptr<Impl> impl_;
     bool voxelwise_ = false;
     int  out_bins_  = 32;
+
+    // RF3M package metadata (empty unless set by the factory). Plain members so the defaulted
+    // move-adopt ctor carries them when the factory wraps a built trunk into a VoxelFieldPredictor.
+    rfnn::io::ModelDomain        domain_;
+    rfnn::io::ModelProvenance    provenance_;
+    std::map<std::string, float> metrics_;
+    std::vector<std::string>     graph_names_;
 };
 
 // VoxelFieldPredictor — a per-voxel implicit model. IS-A VolumeFieldPredictor (it assembles a whole

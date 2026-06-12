@@ -263,26 +263,38 @@ if __name__ == "__main__":
 
     is_cfg = aug_cfg.get("importance_sampling", {})
     if is_cfg.get("enabled", False):
-        from radfield3dnn.preprocessing.augmentations.importance_sampling import ErrorbasedImportanceSampler
         from radfield3dnn.preprocessing.augmentations.augmentation_limit import LimitedAugmentation
-        # Importance sampling suppresses unreliable high-MC-error voxels only as a
-        # warmup. The background itself is a critical target, so the sampler must
-        # be deactivated for the fine-tuning phase (like the other augmentations)
-        # so the model is optimised on the full volume incl. the background.
-        # `end_epoch` defaults to the halfway point but is configurable.
-        # `max_drop_chance` is annealed from its start value down to
-        # `max_drop_chance_end` across the warmup window (high→low: denoise hard
-        # early, reintroduce voxels before the sampler switches off). No
-        # hand-tuning of a single drop rate needed.
         is_end_epoch = is_cfg.get("end_epoch", epochs // 2)
-        dataprocessings.append(LimitedAugmentation(
-            ErrorbasedImportanceSampler(
+        # `method`: "error" (default) = ErrorbasedImportanceSampler (drop high-MC-error voxels);
+        #           "roi" = ROIbasedSampler (keep all beam, sample scatter relative to beam count,
+        #                   sample a capped floor — matches the air-kerma scatter ROI + TwoROIGammaLoss).
+        method = str(is_cfg.get("method", "error")).lower()
+        if method == "roi":
+            from radfield3dnn.preprocessing.augmentations.roi_sampling import ROIbasedSampler
+            from radfield3dnn.roi import BEAM_REL_DEFAULT, SCATTER_LO_DEFAULT
+            sampler = ROIbasedSampler(
+                beam_rel=is_cfg.get("beam_rel", BEAM_REL_DEFAULT),
+                scatter_lo=is_cfg.get("scatter_lo", SCATTER_LO_DEFAULT),
+                beam_keep_ratio=is_cfg.get("beam_keep_ratio", 1.0),
+                scatter_ratio=is_cfg.get("scatter_ratio", 2.0),
+                floor_ratio=is_cfg.get("floor_ratio", 1.0),
+                field_multiplier=is_cfg.get("field_multiplier", 3.0),
+            )
+            print(f"[green]ROI-based voxel sampling: keep {is_cfg.get('beam_keep_ratio',1.0)}·beam "
+                  f"(>= {is_cfg.get('beam_rel',BEAM_REL_DEFAULT):.0e}·direct_max) + "
+                  f"{is_cfg.get('scatter_ratio',2.0)}×beam scatter + {is_cfg.get('floor_ratio',1.0)}×beam floor; "
+                  f"field ×{is_cfg.get('field_multiplier',3.0)}.")
+        else:
+            # ErrorbasedImportanceSampler: drop unreliable high-MC-error voxels as a WARMUP, then
+            # switch off for fine-tuning (the background is a real target). `max_drop_chance` anneals
+            # from its start value to `max_drop_chance_end` across the active window.
+            from radfield3dnn.preprocessing.augmentations.importance_sampling import ErrorbasedImportanceSampler
+            sampler = ErrorbasedImportanceSampler(
                 max_drop_chance=is_cfg.get("max_drop_chance", 0.9),
                 max_drop_chance_end=is_cfg.get("max_drop_chance_end", 0.3),
                 high_fluence_keep_threshold=is_cfg.get("keep_flux_threshold", 0.8),
-            ),
-            end_epoch=is_end_epoch,
-        ))
+            )
+        dataprocessings.append(LimitedAugmentation(sampler, end_epoch=is_end_epoch))
 
     mu_tr_file = args.mu_tr_file
     if mu_tr_file and not os.path.isabs(mu_tr_file):
@@ -410,28 +422,24 @@ if __name__ == "__main__":
         spectra_bins=32,
         metrics={
             'global_airkerma_accuracy': AirkermaAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5),
-            'top50_airkerma_accuracy': AirkermaAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, importance_threshold=0.5),
             'top90_airkerma_accuracy': AirkermaAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, importance_threshold=0.1),
             'airkerma_ssim': AirkermaSSIM(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, reduction='mean'),
-            'airkerma_onsphere_accuracy_radius25cm': AirkermaSphereAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, sphere_radius_m=0.25, voxel_size_m=vx),
-            'top50_airkerma_stddev': AirkermaRelDifferencesStdDev(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, importance_threshold=0.5),
-            # THE scatter metric: scores the scatter-field volume — every voxel the MC error layer
-            # marks statistically reliable (~86-91% of DS03 voxels), beam excluded. Same volume as
-            # visualized in results/loss_normalizer_study.html and results/mc_floor_analysis.html.
-            # The PUBLISHED bright-ring definition (joined >= 5e-3*max, ~3% of voxels) is kept as
-            # the explicit legacy metric for comparability with the published 0.84.
-            'airkerma_accuracy_scatter': AirkermaScatterAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, use_error=True, error_threshold=0.5),
+            #'airkerma_onsphere_accuracy_radius25cm': AirkermaSphereAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, sphere_radius_m=0.25, voxel_size_m=vx),
+            'airkerma_accuracy_scatter': AirkermaScatterAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, use_roi=True, scatter_lo=5e-5),
+            'noiseaware_airkerma_accuracy_scatter': AirkermaScatterAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, use_error=True, error_threshold=0.5),
             'legacy_airkerma_accuracy_scatter': AirkermaScatterAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, use_error=False),
-            # THE goal metric (10-15% per-voxel uncertainty in the occupational ROI): per-voxel SMAPE
-            # accuracy over every voxel with air-kerma >= 1e-2*max — beam INCLUDED + bright scatter,
-            # full spatial resolution. Measured perfect-model ceiling on DS03: ~0.92 (the GT's own MC
-            # noise certifies 10-15% only down to ~1e-2*max; deeper claims need more MC primaries).
             'airkerma_accuracy_roi': AirkermaAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, importance_threshold=0.01),
             # Secondary: supervoxel-aggregated dose (8^3 sums = 16.7cm blocks; coarse spatially but
             # noise/22 -> ceiling ~0.92 over the WHOLE field incl. the diffuse bulk).
             'airkerma_accuracy_scatter_sv8': AirkermaSupervoxelScatterAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, supervoxel=8),
             'spectrum_accuracy': HistogramOverlapAccuracy(),
-            'top95_energy_weighted_airkerma_accuracy': AirkermaAccuracyEnergyWeighted(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, importance_threshold=0.05),
+            #'top95_energy_weighted_airkerma_accuracy': AirkermaAccuracyEnergyWeighted(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, importance_threshold=0.05),
+            # Gammas now use the clinical 10% low-dose cutoff (AirkermaAccuracy dose_threshold=0.1
+            # default; the old un-forwarded 1e-5 cutoff let a ZERO prediction pass at GPR 0.992 —
+            # values logged before 2026-06-12 are trivially inflated (post-mutation-fix runs) or
+            # mutation-contaminated (before)). The _cut1pct variant scores down into the bright
+            # scatter ring (>=1% of max), which the clinical cutoff excludes.
+            'global_airkerma_gamma_3pct_4cm_cut1pct': AirkermaAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, metric_type='gpr', voxel_size_m=vx, rel_dose_diff=0.03, dist_crit_mm=40.0, dose_threshold=0.01),
             'global_airkerma_gamma_3pct_2cm': AirkermaAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, metric_type='gpr', voxel_size_m=vx, rel_dose_diff=0.03, dist_crit_mm=20.0),
             'global_airkerma_gamma_3pct_4cm': AirkermaAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, metric_type='gpr', voxel_size_m=vx, rel_dose_diff=0.03, dist_crit_mm=40.0),
             'global_airkerma_gamma_3pct_6cm': AirkermaAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, metric_type='gpr', voxel_size_m=vx, rel_dose_diff=0.03, dist_crit_mm=60.0),
@@ -480,6 +488,16 @@ if __name__ == "__main__":
         voxel_resolution=voxel_resolution, voxel_size_m=VOXEL_SIZE_M,
         dataset_path=dataset_path,
     )
+
+    # Listed per-step debug view of training (inputs → outputs → per-ROI loss terms → DB-MTL
+    # weights), printed and appended to <logs>/debug_probe.log. `training: debug_probe: true`.
+    if train_cfg.get("debug_probe", False):
+        from callbacks.debug_probe import TrainingDebugProbe
+        callbacks.append(TrainingDebugProbe(
+            every_n_steps=int(train_cfg.get("debug_probe_every", 50)),
+            log_path=os.path.join(logs_path, "debug_probe.log"),
+        ))
+        print(f"[green]TrainingDebugProbe enabled (every {train_cfg.get('debug_probe_every', 50)} steps).")
 
     if grad_accum:
         callbacks.append(GradientAccumulationScheduler(scheduling={0: grad_accum}))

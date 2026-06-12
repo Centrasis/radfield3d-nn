@@ -10,10 +10,10 @@ C++ → Python mapping:
     rfnn::io::V1::ModelFactory              → ModelFactory  (loads an RF3M STRAIGHT to a predictor)
     rfnn::io::ModelDomain / ModelProvenance / BeamParameter / ParameterRange → metadata classes
 
-There is deliberately NO LoadedModel on the Python side: ``ModelFactory.load(path)`` returns the
-runnable :class:`VoxelFieldPredictor` (per-voxel models) or :class:`VolumeFieldPredictor`
-(field-wise models) directly, with the package metadata attached as attributes
-(``.domain``, ``.provenance``, ``.metrics``, ``.graph_names``).
+There is deliberately NO LoadedModel: ``ModelFactory.load(path)`` parses the RF3M container AND
+builds the runnable predictor in one step, returning the :class:`VoxelFieldPredictor` (per-voxel
+models) or :class:`VolumeFieldPredictor` (field-wise models) directly, with the package metadata
+exposed as read-only properties (``.domain``, ``.provenance``, ``.metrics``, ``.graph_names``).
 
 Quick start::
 

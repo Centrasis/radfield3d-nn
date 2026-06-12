@@ -789,3 +789,135 @@ class L1WithSSIM3DLoss(StdLossWeighted):
                 if per_voxel.ndim > 1 else per_voxel.mean()
 
         return core * self.l1_weight + ssim * self.ssim_weight
+
+
+class HotspotAwareFluxLoss(Loss):
+    """Composite loss for HDR flux volumes where ~90% of voxels are low
+    (1e-2..1e-4) but sparse high voxels must be reconstructed accurately.
+
+    Term 1: power-weighted relative L2 (prediction-normalized, stop-grad):
+            (pred-target)^2 / (sg(pred)^(2-beta) + eps)
+            beta=0   -> NRC relative-L2 (per-decade equal; low voxels dominate
+                        when they are 90% of the volume)
+            beta=2   -> plain L2 (hotspots dominate)
+            beta~0.5-1 -> biased toward high voxels but background still learns
+            eps      -> regime boundary: below ~eps^(1/(2-beta)) errors count
+                        absolutely. Set near max(MC noise floor, 1e-2 normalized),
+                        NOT an arbitrary tiny number.
+    Term 2: optional hotspot L1 on voxels above a target-percentile threshold
+            (pins maxima; analogous to Dmax/D1% in dosimetry QA).
+
+    Inputs assumed in linear space, normalized so max/median is O(1)."""
+    def __init__(self, beta=0.75, eps=1e-2,
+                 hotspot_quantile=0.995, hotspot_weight=0.1):
+        super().__init__()
+        self.beta, self.eps = beta, eps
+        self.hq, self.hw = hotspot_quantile, hotspot_weight
+
+    def forward(self, target: Tensor, prediction: Tensor, input: TrainingInputData) -> Tensor:
+        denom = prediction.detach().clamp_min(0).pow(2.0 - self.beta) + self.eps
+        loss = ((prediction - target) ** 2 / denom).mean()
+        if self.hw > 0:
+            thr = torch.quantile(target.detach().flatten().float(), self.hq)
+            mask = target >= thr
+            if mask.any():
+                loss = loss + self.hw * (prediction[mask] - target[mask]).abs().mean()
+        return loss
+
+
+class TwoROIGammaLoss(nn.Module):
+    """Loss over the shared beam / scatter / floor ROIs (radfield3dnn.roi.compute_roi_masks),
+    matched 1:1 to the air-kerma scatter metric and the ROI voxel sampler.
+
+    The three ROIs are derived FROM THE TARGET (the joined flux the model is trained on; in the
+    beam, joined ≈ direct so the beam ROI agrees with the metric's direct-channel definition):
+      beam    = target >= beam_rel  * max(target)                  (≈0.55% of voxels at 0.05)
+      scatter = NOT beam AND target >= scatter_lo * max(target)    (≈80% at 5e-5; SMAPE surrogate)
+      floor   = the rest (the MC-noise floor; light smoothness glue)
+
+    Each term is the MEAN over its ROI's voxels, i.e. normalised by the number of TARGET voxels in
+    that ROI — so a ~700-voxel beam and an ~80000-voxel scatter region contribute EQUALLY to the
+    total (per-ROI influence equalised by the target voxel count). Non-sampled voxels carry -inf
+    (the ROI-sampler / masking convention shared with the other losses) and are excluded everywhere.
+
+    beam term = L1 (absolute, matches the beam air-kerma SMAPE); scatter/floor = bounded symmetric
+    SMAPE |p−t|/(|p|+|t|+eps) (≤1 per voxel — the metric's own functional; v2, see __init__ note).
+    Optional 1-voxel-DTA soft gamma (w_gamma>0, stage3). Expects pred/target as full volumes
+    (B, X, Y, Z) in linear, normalised units (needed for the spatial shifts).
+    """
+    def __init__(self, beam_rel=0.05, scatter_lo=5e-5,
+                 w_beam=1.0, w_scatter=1.0, w_floor=0.05, w_gamma=0.0,
+                 gamma_crit_beam=0.03, gamma_crit_scatter=0.10,
+                 eps_scatter=5e-5, softmin_tau=0.1):
+        # v2 core (2026-06-12, after concat-tworoi v1 hard-stuck at val scatter ~0.05 with the
+        # flux loss oscillating 5..125): the v1 scatter/floor term |p-t|/(sg(p)+1e-5) was
+        # UNBOUNDED in value (t/eps ≈ 5e3 per voxel when under-predicting) with a constant 1/eps
+        # gradient on the whole under-prediction side and a weak over-prediction side → violent
+        # up-pumping then drift, no convergence. v2 uses the bounded symmetric SMAPE core
+        # |p-t|/(p+t+eps) (≤1 per voxel — the metric's own functional), eps_scatter at the ROI
+        # floor (5e-5 ≈ scatter_lo·max in normalised units), and w_floor back to 0.05 (the floor
+        # is ~60% MC noise; v1's 1.0 forced noise-fitting at full weight).
+        super().__init__()
+        self.beam_rel, self.scatter_lo = beam_rel, scatter_lo
+        self.w = dict(beam=w_beam, scatter=w_scatter, floor=w_floor, gamma=w_gamma)
+        self.cb, self.cs = gamma_crit_beam, gamma_crit_scatter
+        self.eps, self.tau = eps_scatter, softmin_tau
+        self.stage3 = False
+
+    @staticmethod
+    def _shifted_stack(x):
+        """All 27 shifts within ±1 voxel (includes identity). x: (B,X,Y,Z)."""
+        xp = F.pad(x.unsqueeze(1), (1,1,1,1,1,1), mode='replicate').squeeze(1)
+        return torch.stack([xp[:, 1+dx:xp.shape[1]-1+dx,
+                                  1+dy:xp.shape[2]-1+dy,
+                                  1+dz:xp.shape[3]-1+dz]
+                            for dx in (-1,0,1) for dy in (-1,0,1) for dz in (-1,0,1)],
+                           dim=0)                                   # (27,B,X,Y,Z)
+
+    def _soft_gamma(self, pred, target, mask, crit, ref):
+        """Soft 1-voxel-DTA gamma: per ref voxel, soft-min over shifted
+        predictions of |pred_shift - target| / (crit*ref); hinge at 1."""
+        if not mask.any():
+            return pred.new_zeros(())
+        shifts = self._shifted_stack(pred)                          # (27,B,...)
+        g = (shifts - target.unsqueeze(0)).abs() / (crit * ref + 1e-12)
+        g = -self.tau * torch.logsumexp(-g / self.tau, dim=0)       # soft-min
+        return F.relu(g[mask] - 1.0).mean()                         # only failures
+
+    def forward(self, target: Tensor, prediction: Tensor, input: TrainingInputData) -> Tensor:
+        from radfield3dnn.roi import compute_roi_masks
+        finite = torch.isfinite(target)   # -inf = not-sampled / masked -> excluded from every ROI
+        # ROIs FROM THE TARGET (joined flux). Pass it as both 'direct' and 'joined': the joined-max
+        # beam ≈ the metric's direct-channel beam (direct dominates the joined beam). Zero-fill the
+        # -inf voxels so the per-field max stays finite; they are re-excluded via `finite` below.
+        safe = torch.where(finite, target, torch.zeros_like(target))
+        m_beam, m_scatter, m_floor = compute_roi_masks(safe, safe, self.beam_rel, self.scatter_lo)
+        m_beam, m_scatter, m_floor = m_beam & finite, m_scatter & finite, m_floor & finite
+
+        loss = prediction.new_zeros(())
+        # Per-term breakdown for the training debug probe (callbacks/debug_probe.py); floats only.
+        self.last_terms: dict[str, float] = {}
+        if self.w['beam'] > 0 and m_beam.any():
+            # absolute L1 — matches the beam air-kerma SMAPE
+            term = (prediction[m_beam] - target[m_beam]).abs().mean()
+            self.last_terms['beam'] = float(term.detach())
+            self.last_terms['n_beam'] = int(m_beam.sum())
+            loss = loss + self.w['beam'] * term
+        for name, m in (('scatter', m_scatter), ('floor', m_floor)):
+            if self.w[name] > 0 and m.any():
+                # bounded symmetric SMAPE core (≤1 per voxel) — the metric's own functional;
+                # differentiable through BOTH p and t paths, no unbounded under-prediction value.
+                p, t = prediction[m], target[m]
+                rel = (p - t).abs() / (p.abs() + t.abs() + self.eps)
+                # .mean() normalises by THIS ROI's target voxel count -> equal per-ROI influence
+                term = rel.mean()
+                self.last_terms[name] = float(term.detach())
+                self.last_terms[f'n_{name}'] = int(m.sum())
+                loss = loss + self.w[name] * term
+        if self.stage3 and self.w['gamma'] > 0:
+            tmax = safe.detach().amax()
+            loss = loss + self.w['gamma'] * (
+                self._soft_gamma(prediction, target, m_beam,    self.cb, tmax)
+              + self._soft_gamma(prediction, target, m_scatter, self.cs,
+                                 target.detach().clamp_min(self.scatter_lo)))
+        return loss
