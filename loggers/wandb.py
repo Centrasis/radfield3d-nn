@@ -81,7 +81,12 @@ class WandBLogger(LoggerBase):
         plot.write_html(f"tmp/{filename}")
         
         log_data = {name: wandb.Html(f"tmp/{filename}")}
-        if step is not None:
-            wandb.log(log_data, step=step)
-        else:
-            wandb.log(log_data)
+        # Log the media at an EXPLICIT step so it merges into the current step instead of
+        # auto-incrementing wandb's internal counter. A bare wandb.log() advances that counter,
+        # which desyncs it from the step Lightning's self.log sets explicitly — wandb then drops the
+        # out-of-order per-epoch metric history (only the summary survives). Logging at the current
+        # step (default commit=True) keeps the history intact AND flushes immediately (instant on the
+        # server) — unlike commit=False, which would buffer and delay visibility.
+        if step is None and wandb.run is not None:
+            step = wandb.run.step
+        wandb.log(log_data, step=step)

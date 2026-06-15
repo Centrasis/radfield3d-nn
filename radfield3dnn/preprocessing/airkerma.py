@@ -1,5 +1,5 @@
 from RadFiled3D.pytorch.datasets.processing import DataProcessing
-from radfield3dnn import TrainingInputData, AirKermaField, RadiationField, RadiationFieldChannel
+from radfield3dnn.rftypes import TrainingInputData, AirKermaField, RadiationField, RadiationFieldChannel
 from torch.nn import Module
 from torch import Tensor
 from radfield3dnn.utils.mean_sampling import resample_histogram_means
@@ -40,23 +40,23 @@ class Airkerma(Module):
             raise ValueError("Unknown energy unit: " + energy_unit)
         return torch.tensor(mu_tr, dtype=torch.float32, requires_grad=False)
 
-    def calc_airkerma(self, spectra: Tensor | None, fluences: Tensor) -> Tensor:
+    def calc_airkerma(self, spectra: Tensor | None, fluxes: Tensor) -> Tensor:
         """
-        Calculates the air kerma from the spectra and fluences.
+        Calculates the air kerma from the spectra and fluxes.
         :param spectra: The spectra to calculate the air kerma from. Shape: (batch_size, num_bins, x, y, z) or None. If None, a uniform spectrum is assumed.
-        :param fluences: The fluences to calculate the air kerma from. Shape: (batch_size, x, y, z) or (batch_size, 1, x, y, z)
+        :param fluxes: The fluxes to calculate the air kerma from. Shape: (batch_size, x, y, z) or (batch_size, 1, x, y, z)
         :return: The air kerma. Shape: (batch_size, 1, x, y, z)
         """
-        if self._mu_tr.device != fluences.device:
-            self._mu_tr = self._mu_tr.to(fluences.device)
-            self._spectra_bin_edges = self._spectra_bin_edges.to(fluences.device)
+        if self._mu_tr.device != fluxes.device:
+            self._mu_tr = self._mu_tr.to(fluxes.device)
+            self._spectra_bin_edges = self._spectra_bin_edges.to(fluxes.device)
 
         if spectra is None:
-            spectra = torch.ones((fluences.shape[0], self._spectra_bin_edges.shape[0]-1, *fluences.shape[2:]), device=fluences.device, dtype=torch.float32)
+            spectra = torch.ones((fluxes.shape[0], self._spectra_bin_edges.shape[0]-1, *fluxes.shape[2:]), device=fluxes.device, dtype=torch.float32)
             spectra /= spectra.shape[1]  # Uniform distribution if no spectra given
         assert (spectra.dim() == 5 and spectra.size(1) > 2) or (spectra.dim() == 4 and spectra.size(0) > 2), "spectra must be shaped (B, num_bins, X, Y, Z) with num_bins > 2 or (num_bins, X, Y, Z) with num_bins > 2"
-        assert fluences.dim() in [4, 5], "fluences must be shaped (B, X, Y, Z) or (B, 1, X, Y, Z)"
-        assert fluences.dim() == spectra.dim(), "spectra and fluences must have the same number of dimensions"
+        assert fluxes.dim() in [4, 5], "fluxes must be shaped (B, X, Y, Z) or (B, 1, X, Y, Z)"
+        assert fluxes.dim() == spectra.dim(), "spectra and fluxes must have the same number of dimensions"
         # Normalize spectra along the energy bins
         spectra_integral = torch.sum(spectra, dim=1, keepdim=True)
         spectra_integral = torch.nan_to_num(spectra_integral, nan=0.0, posinf=0.0, neginf=0.0)
@@ -71,11 +71,11 @@ class Airkerma(Module):
         # μ_tr per bin (already resampled to our histogram bins)
         mu_tr_vals = self._mu_tr[:-1, 1].view(1, -1, 1, 1, 1)
 
-        # Ensure fluences shape is (B,1,X,Y,Z)
-        if fluences.dim() == 4:
-            fluences = fluences.unsqueeze(1)
-        elif not (fluences.dim() == 5 and fluences.shape[1] == 1):
-            raise ValueError("fluences must be shaped (B,X,Y,Z) or (B,1,X,Y,Z)")
+        # Ensure fluxes shape is (B,1,X,Y,Z)
+        if fluxes.dim() == 4:
+            fluxes = fluxes.unsqueeze(1)
+        elif not (fluxes.dim() == 5 and fluxes.shape[1] == 1):
+            raise ValueError("fluxes must be shaped (B,X,Y,Z) or (B,1,X,Y,Z)")
 
         # Bin centers and widths from edges (edges length = bins+1)
         bin_edges = self._spectra_bin_edges
@@ -85,20 +85,20 @@ class Airkerma(Module):
         bin_centers = bin_centers.view(1, -1, 1, 1, 1)
         bin_widths = bin_widths.view(1, -1, 1, 1, 1)
 
-        # Discrete integral: sum over bins of Φ_norm(E_i) * μ_tr(E_i) * E_i * ΔE, then scale by fluence
+        # Discrete integral: sum over bins of Φ_norm(E_i) * μ_tr(E_i) * E_i * ΔE, then scale by flux
         y = spectra * mu_tr_vals * bin_centers
-        kerma = (y * bin_widths).sum(dim=1, keepdim=True) * fluences
+        kerma = (y * bin_widths).sum(dim=1, keepdim=True) * fluxes
 
         return kerma
 
-    def forward(self, spectra: Tensor, fluences: Tensor) -> Tensor:
+    def forward(self, spectra: Tensor, fluxes: Tensor) -> Tensor:
         """
-        Calculates the air kerma from the spectra and fluences.
+        Calculates the air kerma from the spectra and fluxes.
         :param spectra: The spectra to calculate the air kerma from. Shape: (batch_size, num_bins, x, y, z)
-        :param fluences: The fluences to calculate the air kerma from. Shape: (batch_size, 1, x, y, z) or (batch_size, x, y, z)
+        :param fluxes: The fluxes to calculate the air kerma from. Shape: (batch_size, 1, x, y, z) or (batch_size, x, y, z)
         :return: The air kerma. Shape: (batch_size, 1, x, y, z)
         """
-        return self.calc_airkerma(spectra, fluences)
+        return self.calc_airkerma(spectra, fluxes)
 
 
 class AirkermaProcessing(DataProcessing):
@@ -113,7 +113,7 @@ class AirkermaProcessing(DataProcessing):
         assert isinstance(x.ground_truth, RadiationFieldChannel), "AirkermaProcessing only supports RadiationFieldChannel as ground truth."
         air_kerma = self.airkerma_module.forward(
             spectra=x.ground_truth.spectrum if x.ground_truth.spectrum is not None else None,
-            fluences=x.ground_truth.flux    # use flux for relative airkerma
+            fluxes=x.ground_truth.flux
         )
 
         return TrainingInputData(

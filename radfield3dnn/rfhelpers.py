@@ -1,10 +1,8 @@
-
-
-from radfield3dnn import RadiationField, TrainingInputData, AirKermaField, RadiationFieldChannel
+from radfield3dnn.rftypes import RadiationField, TrainingInputData, AirKermaField, RadiationFieldChannel, rf3RadiationField
 import torch
 from radfield3dnn.models.base import BaseNeuralRadFieldModel
-from radfield3dnn.normalizations.base import Normalizer
-from radfield3dnn.normalizations.linear import LinearNormalizer
+from radfield3dnn.preprocessing.normalizations.base import Normalizer
+from radfield3dnn.preprocessing.normalizations.linear import LinearNormalizer
 from radfield3dnn.datasets.channel_join import ChannelsJoin
 
 class InferenceHelper:
@@ -16,6 +14,12 @@ class InferenceHelper:
         gt = batch.original_ground_truth if batch.original_ground_truth is not None else batch.ground_truth
 
         with torch.no_grad():
+            # Deployment-faithful models (scatter net + analytic direct + ρ scale)
+            # supply their own joined PHYSICAL field, so the reported accuracy is on
+            # the same field the model produces at inference (no simulated direct).
+            if hasattr(pl_module, "deployment_joined_physical"):
+                return pl_module.deployment_joined_physical(batch)
+
             batch = TrainingInputData(
                 input=batch.input,
                 ground_truth=pl_module._normalizer.forward(gt),
@@ -25,8 +29,13 @@ class InferenceHelper:
             pred_field: RadiationField | AirKermaField | RadiationFieldChannel = pl_module.forward2volume_from_training_input(batch, voxel_resolution, spectra_bins=spectra_bins)
             if isinstance(pred_field, RadiationField):
                 if pred_field.direct_beam is not None:
-                    pred_field: RadiationFieldChannel = InferenceHelper.channels_join.forward(pred_field)
-                    pred_field = pl_module._normalizer.forward(pred_field)  # Ensure prediction is normalized
+                    # Two-head prediction: join scatter + direct in PHYSICAL
+                    # space. The two heads can only be summed as physical flux;
+                    # joining in normalised space and re-applying the normaliser
+                    # is invalid for non-linear normalisers (a log-space value is
+                    # negative -> LogScaleNormalizer.validate_range rejects it).
+                    pred_phys = pl_module._normalizer.inverse(pred_field)
+                    return InferenceHelper.channels_join.forward(pred_phys)
                 else:
                     pred_field = pred_field.scatter_field
             pred_field: RadiationFieldChannel | AirKermaField = pl_module._normalizer.inverse(pred_field)
@@ -62,7 +71,14 @@ class InferenceHelper:
 
         with torch.no_grad():
             pred_field = InferenceHelper.inference_step(batch, pl_module, voxel_resolution, spectra_bins=spectra_bins)
-            gt = InferenceHelper.channels_join.forward(batch.ground_truth) if isinstance(batch.ground_truth, RadiationField) else batch.ground_truth
+            # Compare against the ORIGINAL physical GT, not `batch.ground_truth`:
+            # for two-head models the latter is the ChannelsSplitRelative encoding
+            # (direct relative to scatter), which is non-finite where scatter is 0
+            # and cannot be channel-joined. The preserved original is the raw
+            # physical RadiationField (both channels), joinable in physical space —
+            # matching how inference_step joins the two-head prediction.
+            gt_src = batch.original_ground_truth if batch.original_ground_truth is not None else batch.ground_truth
+            gt = InferenceHelper.channels_join.forward(gt_src) if isinstance(gt_src, (RadiationField, rf3RadiationField)) else gt_src
             pred_field = InferenceHelper.linear_normalizer.forward(pred_field)
             gt = InferenceHelper.linear_normalizer.forward(gt)
 

@@ -1,0 +1,6 @@
+[build-system]
+requires = ["setuptools>=81.0.0", "cmake", "ninja>=1.13.0", "torch>=2.10.0", "pybind11>=3.0.4"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

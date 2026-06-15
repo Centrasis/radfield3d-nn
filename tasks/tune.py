@@ -66,11 +66,18 @@ class HyperparameterTuningTask(Task):
     def run_task(self, trainer: pl.Trainer, model: BaseNeuralRadFieldModel, datamodule: RadiationFieldDataModule):
         self.max_inner_batch_size = model.max_inner_batch_size
 
+        # Propagate the general-purpose run settings to the per-trial trainers so
+        # tuning matches single-run training: weight EMA (stability) and the
+        # LR-finder toggle. The per-trial trainers are rebuilt from primitives
+        # below, so capture these as primitives here before `trainer` is dropped.
+        _ema_cb = next((c for c in getattr(trainer, "callbacks", []) if c.__class__.__name__ == "WeightEMA"), None)
         self._trainer_cfg = {
             # ensure primitives only
             "accelerator": "cuda" if torch.cuda.is_available() else "gpu",
             "precision": str(trainer.precision) if getattr(trainer, "precision", None) is not None else "32-true",
             "max_epochs": int(trainer.max_epochs),
+            "weight_ema_decay": float(_ema_cb.decay) if _ema_cb is not None else None,
+            "use_lr_finder": bool(getattr(model, "use_lr_finder", True)),
         }
         self._datamodule_cfg = {
             "batch_size": datamodule.batch_size,
@@ -418,28 +425,33 @@ def _run_single_trial_subprocess(
                     )
                 except Exception:
                     local_logger = None
-            # LR finder
-            lr_trainer = pl.Trainer(
-                accelerator="cuda" if torch.cuda.is_available() else "gpu",
-                devices=1,
-                max_steps=250,
-                precision=trainer_cfg["precision"],
-                logger=False,
-                enable_progress_bar=False,
-                enable_checkpointing=True,
-                num_sanity_val_steps=0 if platform == "win32" else 2
-            )
-            lr_tuner = Tuner(lr_trainer)
-            lr_result = lr_tuner.lr_find(
-                model,
-                datamodule=datamodule,
-                min_lr=1e-4,
-                max_lr=1e-2,
-                num_training=250
-            )
-            model._lr = float(lr_result.suggestion())
+            # LR finder — respect the same toggle as single-run training. The
+            # finder picks a different LR per seed/trial (a variance source); when
+            # disabled, the trial uses the model's configured LR for reproducibility.
+            if trainer_cfg.get("use_lr_finder", True) and getattr(model, "use_lr_finder", True):
+                lr_trainer = pl.Trainer(
+                    accelerator="cuda" if torch.cuda.is_available() else "gpu",
+                    devices=1,
+                    max_steps=250,
+                    precision=trainer_cfg["precision"],
+                    logger=False,
+                    enable_progress_bar=False,
+                    enable_checkpointing=True,
+                    num_sanity_val_steps=0 if platform == "win32" else 2
+                )
+                lr_tuner = Tuner(lr_trainer)
+                lr_result = lr_tuner.lr_find(
+                    model,
+                    datamodule=datamodule,
+                    min_lr=1e-4,
+                    max_lr=1e-2,
+                    num_training=250
+                )
+                _sug = lr_result.suggestion()
+                if _sug is not None:
+                    model._lr = float(_sug)
             # Main trainer
-            pruning_cb = PyTorchLightningPruningCallback(trial, monitor="val_loss")
+            pruning_cb = PyTorchLightningPruningCallback(trial, monitor="val_raw_loss")
             metrics_cb = HyperparameterTuningTask.create_metrics_plotter_cb(
                 model=model,
                 mu_tr_file=mu_tr_file,
@@ -449,6 +461,11 @@ def _run_single_trial_subprocess(
 
             print(f"[blue] Start training of trial {external_trial_id} with parameters: {parameter_suggestions} and learning rate: {model._lr}[/blue]")
 
+            _tune_callbacks = [pruning_cb, metrics_cb]
+            if trainer_cfg.get("weight_ema_decay"):
+                # Same stability EMA as single-run training (evaluate smoothed weights).
+                from callbacks.ema import WeightEMA
+                _tune_callbacks.append(WeightEMA(decay=float(trainer_cfg["weight_ema_decay"])))
             tune_trainer = pl.Trainer(
                 accelerator="cuda" if torch.cuda.is_available() else "gpu",
                 devices=1,
@@ -457,19 +474,18 @@ def _run_single_trial_subprocess(
                 logger=(local_logger.get_lightning_callback() if local_logger else False),
                 enable_progress_bar=False,
                 enable_checkpointing=False,
-                callbacks=[
-                    pruning_cb,
-                    metrics_cb
-                ],
+                callbacks=_tune_callbacks,
                 num_sanity_val_steps=0 if platform == "win32" else 2
             )
             tune_trainer.fit(model, datamodule=datamodule)
             callback_metrics = getattr(tune_trainer, "callback_metrics", {})
-            val_loss = float(callback_metrics.get("val_loss", torch.tensor(float("inf"))))
+            # Optimise the raw (positive, quality-meaningful) loss, not the
+            # DB-MTL log-space `val_loss` which can be negative (findings/O6).
+            val_raw_loss = float(callback_metrics.get("val_raw_loss", torch.tensor(float("inf"))))
             test_metrics = tune_trainer.test(model, datamodule=datamodule)
             results = {}
-            if "val_loss" in callback_metrics:
-                results["val_loss"] = val_loss
+            if "val_raw_loss" in callback_metrics:
+                results["val_raw_loss"] = val_raw_loss
             if test_metrics:
                 results.update(test_metrics[0])
             # Persist using external_trial_id
@@ -490,7 +506,7 @@ def _run_single_trial_subprocess(
             print(f"[blue] Wrote result of external trial {external_trial_id} to {optuna_path}.")
             if local_logger:
                 local_logger.finalize_logging()
-            return val_loss
+            return val_raw_loss
 
         study.optimize(objective, n_trials=1)
 

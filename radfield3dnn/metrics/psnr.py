@@ -3,7 +3,7 @@ from torch import Tensor, nn
 from typing import Union, Literal
 import torch
 from radfield3dnn.preprocessing.airkerma import Airkerma
-from radfield3dnn import RadiationFieldChannel, TrainingInputData
+from radfield3dnn.rftypes import RadiationFieldChannel, TrainingInputData
 
 
 class PSNR(MetricBase):

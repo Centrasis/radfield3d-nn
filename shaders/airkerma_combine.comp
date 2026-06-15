@@ -1,0 +1,31 @@
+#version 450
+// Per-voxel air-kerma combine: fold a per-voxel spectrum histogram against a per-bin
+// kerma coefficient and scale by the per-voxel flux. Mirrors the Python air-kerma metric
+//   airkerma[v] = flux[v] * Σ_bin spectrum[v, bin] * kerma_coeff[bin]
+// where kerma_coeff[bin] already bundles the bin energy and the mass energy-absorption
+// coefficient, i.e. kerma_coeff[bin] = E_bin * (mu_en/rho)_bin. The caller uploads that
+// LUT (see write_airkerma_to_vulkan), so the shader stays a pure reduction.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly  buffer Flux        { float flux[]; };
+layout(std430, binding = 1) readonly  buffer Spectrum    { float spectrum[]; };   // n_voxels * n_bins
+layout(std430, binding = 2) readonly  buffer KermaCoeff  { float kerma_coeff[]; }; // n_bins
+layout(std430, binding = 3) writeonly buffer AirKerma    { float airkerma[]; };    // n_voxels
+
+layout(push_constant) uniform Params {
+    uint n_voxels;
+    uint n_bins;
+} params;
+
+void main() {
+    uint v = gl_GlobalInvocationID.x;
+    if (v >= params.n_voxels) return;
+
+    float acc = 0.0;
+    uint base = v * params.n_bins;
+    for (uint b = 0u; b < params.n_bins; ++b) {
+        acc += spectrum[base + b] * kerma_coeff[b];
+    }
+    airkerma[v] = flux[v] * acc;
+}

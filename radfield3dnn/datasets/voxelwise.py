@@ -1,5 +1,5 @@
 from typing import List
-from radfield3dnn import TrainingInputData
+from radfield3dnn.rftypes import TrainingInputData
 from RadFiled3D.pytorch.datasets.processing import DataProcessing
 from RadFiled3D.pytorch.datasets.radfield3d import RadField3DVoxelwiseDataset
 

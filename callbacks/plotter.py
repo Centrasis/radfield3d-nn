@@ -3,7 +3,7 @@ from lightning.pytorch.trainer import Trainer
 from loggers.logger import LoggerBase
 import torch
 import random
-from radfield3dnn import AirKermaField, TrainingInputData, RadiationField, PositionalInput
+from radfield3dnn.rftypes import AirKermaField, TrainingInputData, RadiationField, PositionalInput
 from torch import Tensor
 import plotly.graph_objects as go
 from rich import print
@@ -96,7 +96,7 @@ class ValidationPlotter(Callback):
                         fig=fig_volume,
                         field=pred_field,
                         batch_idx=vidx,
-                        name=f"Predicted flux {vidx}"
+                        name=f"Predicted Flux {vidx}"
                     )
 
                 # Optional target for blending (normalize independently to ensure visibility)
@@ -163,7 +163,7 @@ class ValidationPlotter(Callback):
                         col=idx + 1
                     )
 
-            rendered_measurand = "Air Kerma" if isinstance(pred_field, AirKermaField) else "flux"
+            rendered_measurand = "Air Kerma" if isinstance(pred_field, AirKermaField) else "Flux"
             fig.update_layout(
                 title_text=f"Predicted vs Target {rendered_measurand} (Red=Pred, Blue=Target, Purple=Overlap) - Batch",
                 showlegend=False,
@@ -322,6 +322,6 @@ class ValidationDepthIntesityPlotter(Callback):
             ]
 
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=[d[0] for d in data], y=[d[1] for d in data], mode='lines', name='flux'))
+            fig.add_trace(go.Scatter(x=[d[0] for d in data], y=[d[1] for d in data], mode='lines', name='Flux'))
             fig.update_layout(title='Flux vs Depth', xaxis_title='Depth', yaxis_title='Flux', plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)')
             self.logger.log_plot("Flux vs Depth", fig)

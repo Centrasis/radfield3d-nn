@@ -1,131 +1,22 @@
-from .base import BaseNeuralRadFieldModel, ModuleBuilder, AngularSinusoidalFrequencyEncoding
+from .base import BaseNeuralRadFieldModel
 import torch
 from torch import Tensor
 from torch import nn
-from typing import Type
-import os
-from radfield3dnn.encodings.sinusoidal_encoding import SinusoidalFrequencyEncoding
 from radfield3dnn.rftypes import AirKermaField, RadiationField, PositionalInput, RadiationFieldChannel, DirectionalInput, PositionalInput
 from typing import Union
-
-
-class Reduce(nn.Module):
-    """
-    Reduce the input tensor along the specified dimension.
-    For residual connections, the input and output dimensions have different sizes.
-    Uses summation to reduce the tensor. If the tensor input and output dimensions are not a multiple of each other, the remaining dimensions are just added
-    """
-    def __init__(self, axis: int, output_dim: int):
-        super(Reduce, self).__init__()
-        self.axis = axis
-        self.output_dim = output_dim
-
-    def forward(self, x: Tensor) -> Tensor:
-        input_dim = x.shape[self.axis]
-        group_size = input_dim // self.output_dim
-        remainder = input_dim % self.output_dim
-
-        # Calculate the number of elements to sum in each group
-        if group_size == 0:
-            group_size = 1
-            self.output_dim = input_dim
-
-        # Reshape the tensor to group elements
-        dims = list(x.shape)
-        dims.pop(self.axis)
-        summed_elements = torch.tensor(dims, dtype=torch.int32).prod() * self.output_dim * group_size
-        output = torch.zeros(*dims, self.output_dim, device=x.device)
-        output_sum = torch.sum(x.flatten()[:summed_elements].reshape(*dims, self.output_dim, group_size), dim=-1)
-        output_sum = output_sum / group_size
-
-        if remainder > 0:
-            sum_elements_embedded = torch.zeros_like(output)
-            output_slice = [slice(None, None) for _ in range(len(output.shape))]
-
-            output_slice[self.axis] = slice(0, x.shape[self.axis] - remainder)
-            sum_elements_embedded[*tuple(output_slice)] = output_sum
-            output = output + sum_elements_embedded
-
-            left_elements = x.flatten()[summed_elements:]
-            left_elements_shape = list(output.shape)
-            left_elements_shape[self.axis] = remainder
-            left_elements = left_elements.reshape(*left_elements_shape)
-
-            output_slice[self.axis] = slice(int(output.shape[self.axis] - remainder), None)
-            left_elements_embedded = torch.zeros_like(output)
-            left_elements_embedded[*tuple(output_slice)] = left_elements
-
-            output = output + left_elements_embedded
-        else:
-            output = output + output_sum
-        return output
-
-
-class LinearBlock(nn.Module):
-    def __init__(self, d_model: int, activation: Type[nn.Module] | None, normalization: Type[nn.Module] | None = nn.BatchNorm1d, num_layers: int = 1, d_model_out: int | None = None):
-        super(LinearBlock, self).__init__()
-        assert num_layers > 0, "Number of layers must be greater than 0."
-        if d_model_out is None:
-            d_model_out = d_model
-        layers = []
-
-        for i in range(num_layers):
-            layer_out = d_model_out if i == num_layers - 1 else d_model
-            layers += [
-                nn.Linear(d_model, layer_out),
-            ]
-            if normalization is not None:
-                layers += [
-                    normalization(layer_out)
-                ]
-            if activation is not None and i < num_layers - 1:
-                layers += [
-                    activation()
-                ]
-
-        self.model = nn.Sequential(
-            *layers
-        )
-        self.activation = activation() if activation is not None else nn.Identity()
-        self.reduction = nn.Identity() if d_model_out == d_model else Reduce(-1, d_model_out)
-
-    def forward(self, x: Tensor) -> Tensor:
-        return self.activation(self.model(x))
-
-
-class ResidualBlock(nn.Module):
-    def __init__(self, d_model: int):
-        super(ResidualBlock, self).__init__()
-        self.linear1 = nn.Linear(d_model, d_model)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.linear2 = nn.Linear(d_model, d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.activation = nn.SiLU(inplace=False)
-    
-    def forward(self, x: Tensor) -> Tensor:
-        residual = x
-        x = self.linear1(x)
-        x = self.norm1(x)
-        x = self.activation(x)
-        x = self.linear2(x)
-        x = self.norm2(x)
-        x = x + residual
-        x = self.activation(x)
-        return x
+from radfield3dnn.models.activations.HistogramNormalize import HistogramNormalize
+from radfield3dnn.utils.mean_sampling import resample_histogram_bilinear
 
 
 class FeedforwardPointwiseModel(BaseNeuralRadFieldModel):
-    def __init__(self, location_encoding_dims=10, direction_encoding_dims=10, d_model=256, learning_rate: float = 1e-3, randomize_voxel_location_in_training: bool = True, voxels_centered_around_origin: bool = True, normalizer=None):
+    def __init__(self, learning_rate: float = 1e-3, randomize_voxel_location_in_training: bool = True, voxels_centered_around_origin: bool = True, normalizer=None):
         """
         Feedforward model that processes each voxel independently.
-        :param location_encoding_dims: Number of frequency bands for positional encoding of the location.
-        :param direction_encoding_dims: Number of frequency bands for positional encoding of the direction.
-        :param d_model: Dimension of the model.
         :param learning_rate: Learning rate for the optimizer.
         :param randomize_voxel_location_in_training: Whether to randomize voxel centers during training within the voxel extent.
         :param voxels_centered_around_origin: Whether the voxel grid is centered around the origin ([-1, 1]) or starts from the origin ([0, 1]).
         """
-        super().__init__(location_encoding_dims, direction_encoding_dims, d_model, learning_rate=learning_rate, normalizer=normalizer)
+        super().__init__(learning_rate=learning_rate, normalizer=normalizer)
         self.randomize_voxel_location_in_training = randomize_voxel_location_in_training
         self.voxels_centered_around_origin = voxels_centered_around_origin
         self.relevance_discriminator: "FeedforwardPointwiseModel" | None = None
@@ -138,39 +29,6 @@ class FeedforwardPointwiseModel(BaseNeuralRadFieldModel):
         if self.relevance_discriminator is not None:
             self.relevance_discriminator = self.relevance_discriminator.eval()
         super().on_fit_start()
-
-    def jacobian_norm(self, x: PositionalInput) -> Tensor:
-        x = PositionalInput(
-            position=x.position.clone().detach().requires_grad_(True),
-            direction=x.direction.clone().detach().requires_grad_(True),
-            spectrum=x.spectrum.clone().detach().requires_grad_(True),
-            geometry=x.geometry.clone().detach().requires_grad_(True) if x.geometry is not None else None,
-            origin=x.origin.clone().detach().requires_grad_(True) if x.origin is not None else None,
-            beam_shape_parameters=x.beam_shape_parameters.clone().detach().requires_grad_(True) if x.beam_shape_parameters is not None else None,
-            beam_shape_type=x.beam_shape_type.clone().detach().requires_grad_(True) if x.beam_shape_type is not None else None
-        )
-        field = self.forward(x)
-        y = torch.stack([field.scatter_field.flux, field.scatter_field.spectrum.sum(dim=-1)], dim=-1)
-        batch_size = y.size(0)
-        norms = torch.empty(batch_size, device=x.position.device)
-        for i in range(batch_size):
-            grads = torch.autograd.grad(
-                y[i].sum(), 
-                [
-                    x.position,
-                    x.direction,
-                    x.spectrum,
-                    x.geometry,
-                    x.origin,
-                    x.beam_shape_parameters,
-                    x.beam_shape_type
-                ],
-                create_graph=False, 
-                retain_graph=False,
-                allow_unused=True
-            )[0][i]
-            norms[i] = grads.norm()  # L2 norm of gradient row i
-        return norms.mean()
 
     @staticmethod
     def write_linear_output_to_volume(output: RadiationFieldChannel, target_volume: RadiationFieldChannel, indices: Tensor):
@@ -189,16 +47,18 @@ class FeedforwardPointwiseModel(BaseNeuralRadFieldModel):
     
     @property
     def base_voxel_map(self):
-        if self._base_voxel_map is not None:
-            if self._base_voxel_map.requires_grad != self.training:
-                self._base_voxel_map = None
-        
-        if self._base_voxel_map is None:
-            if self.training:
-                self._base_voxel_map = self.generate_voxelmap3d(self.voxel_counts, None, self.device)
-            else:
-                with torch.no_grad():
-                    self._base_voxel_map = self.generate_voxelmap3d(self.voxel_counts, None, self.device)
+        # The normalised voxel-coordinate grid depends only on the grid shape and
+        # device — never on grad (positions carry no gradient, and
+        # generate_voxelmap3d already builds it under torch.no_grad). Cache it
+        # and rebuild only when the shape or device changes. Per-step location
+        # randomisation happens on a clone in prepare_linear_input_batches, so
+        # caching the un-noised base map across steps is correct.
+        vc = self.voxel_counts
+        target_shape = (int(vc[0]), int(vc[1]), int(vc[2]))
+        if (self._base_voxel_map is None
+                or self._base_voxel_map.device != self.device
+                or tuple(self._base_voxel_map.shape[:3]) != target_shape):
+            self._base_voxel_map = self.generate_voxelmap3d(vc, None, self.device)
         return self._base_voxel_map
 
     def prepare_linear_input_batches(self, x: DirectionalInput, voxel_counts: Tensor, mask: Tensor | None = None):
@@ -285,7 +145,26 @@ class FeedforwardPointwiseModel(BaseNeuralRadFieldModel):
         full_field: RadiationField = None
         voxel_splits, direction_splits, batch_idx_splits, index_splits = self.prepare_linear_input_batches(x, voxel_counts, mask)
 
+        # Every chunk is padded to a CONSTANT row count (max_inner_batch_size)
+        # before it reaches the tcnn modules. tiny-cuda-nn's GPUMemoryArena is
+        # a high-water-mark allocator backed by CUDA virtual memory that is
+        # never returned to the driver; a variable input size (short last
+        # split, data-dependent mask filtering, per-call 256-padding) makes it
+        # allocate a fresh, larger arena for every new shape and keep all the
+        # old ones, so VRAM ratchets up every epoch until cuMemCreate OOMs.
+        # Fixed shape => one arena, reused forever. Padded rows are sliced off
+        # (`[:n]`) before anything is scattered into full_field, so they never
+        # affect the result or the gradient.
+        fixed_chunk = self.max_inner_batch_size
         for voxels, directions, batch_idx, indices in zip(voxel_splits, direction_splits, batch_idx_splits, index_splits):
+            n = voxels.shape[0]
+            pad = fixed_chunk - n
+            if pad > 0:
+                voxels = nn.functional.pad(voxels, (0, 0, 0, pad))
+                directions = nn.functional.pad(directions, (0, 0, 0, pad))
+                # index 0 is always valid; these rows are discarded via [:n].
+                batch_idx = nn.functional.pad(batch_idx, (0, pad))
+
             pred_field = self.forward(
                 PositionalInput(
                     direction=directions,
@@ -299,24 +178,61 @@ class FeedforwardPointwiseModel(BaseNeuralRadFieldModel):
                 global_parameters=global_parameters.index_select(0, batch_idx) if global_parameters is not None else None
             )
 
+            # Drop the padded rows before they reach full_field. RadiationField
+            # / RadiationFieldChannel / AirKermaField are NamedTuples, so
+            # rebuild via _replace rather than mutating. Slicing keeps the
+            # autograd path for the real rows intact.
+            if pad > 0:
+                def _trim_channel(ch):
+                    if ch is None:
+                        return None
+                    return ch._replace(
+                        flux=ch.flux[:n],
+                        spectrum=ch.spectrum[:n] if ch.spectrum is not None else None
+                    )
+                if isinstance(pred_field, RadiationField):
+                    pred_field = pred_field._replace(
+                        scatter_field=_trim_channel(pred_field.scatter_field),
+                        direct_beam=_trim_channel(pred_field.direct_beam),
+                        geometry=pred_field.geometry[:n] if pred_field.geometry is not None else None
+                    )
+                elif isinstance(pred_field, AirKermaField):
+                    pred_field = pred_field._replace(
+                        air_kerma=pred_field.air_kerma[:n],
+                        geometry=pred_field.geometry[:n] if pred_field.geometry is not None else None
+                    )
+
             if full_field is None:
+                # Pre-fill prediction-side flux/spectrum slots with `-inf`
+                # so any positions NOT scatter-written below (because
+                # `ErrorbasedImportanceSampler` filtered them out of the
+                # forward via `prepare_linear_input_batches`'s mask) carry
+                # a known sentinel matching the target convention rather
+                # than `torch.empty`'s uninitialised garbage. Downstream
+                # `StdLossWeighted` / `HistogramLoss` mask both sides on
+                # `isfinite`, so consistent `-inf` here is what lets the
+                # loss-side mask exclude dropped voxels correctly. Geometry
+                # is carried-through metadata (no `-inf` convention) and
+                # stays as zero-init.
                 total_samples = batch_size * total_voxels_per_batch
+                _dev, _dt = x.direction.device, torch.float32
+                neg_inf = float("-inf")
                 if isinstance(pred_field, RadiationField):
                     full_field = RadiationField(
                         scatter_field=RadiationFieldChannel(
-                            spectrum=torch.empty(total_samples, spectra_bins, device=x.direction.device, dtype=torch.float32) if pred_field.scatter_field.spectrum is not None else None,
-                            flux=torch.empty(total_samples, device=x.direction.device, dtype=torch.float32)
+                            spectrum=torch.full((total_samples, spectra_bins), neg_inf, device=_dev, dtype=_dt) if pred_field.scatter_field.spectrum is not None else None,
+                            flux=torch.full((total_samples,), neg_inf, device=_dev, dtype=_dt)
                         ) if pred_field.scatter_field is not None else None,
                         direct_beam=RadiationFieldChannel(
-                            spectrum=torch.empty(total_samples, spectra_bins, device=x.direction.device, dtype=torch.float32) if pred_field.direct_beam.spectrum is not None else None,
-                            flux=torch.empty(total_samples, device=x.direction.device, dtype=torch.float32)
+                            spectrum=torch.full((total_samples, spectra_bins), neg_inf, device=_dev, dtype=_dt) if pred_field.direct_beam.spectrum is not None else None,
+                            flux=torch.full((total_samples,), neg_inf, device=_dev, dtype=_dt)
                         ) if pred_field.direct_beam is not None else None,
-                        geometry=torch.empty(total_samples, device=x.direction.device, dtype=torch.float32) if pred_field.geometry is not None else None
+                        geometry=torch.zeros(total_samples, device=_dev, dtype=_dt) if pred_field.geometry is not None else None
                     )
                 elif isinstance(pred_field, AirKermaField):
                     full_field = AirKermaField(
-                        air_kerma=torch.empty(total_samples, device=x.direction.device, dtype=torch.float32),
-                        geometry=torch.empty(total_samples, device=x.direction.device, dtype=torch.float32) if pred_field.geometry is not None else None
+                        air_kerma=torch.full((total_samples,), neg_inf, device=_dev, dtype=_dt),
+                        geometry=torch.zeros(total_samples, device=_dev, dtype=_dt) if pred_field.geometry is not None else None
                     )
             if isinstance(pred_field, RadiationField):
                 if pred_field.scatter_field is not None:
@@ -384,82 +300,3 @@ class FeedforwardPointwiseModel(BaseNeuralRadFieldModel):
         optimizer = torch.optim.Adam(self.parameters(), lr=self._lr, weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
         return [optimizer], [scheduler]
-
-
-class ParametricFeedforwardModel(FeedforwardPointwiseModel):
-    __model_name__ = "ParametricFeedforwardModel"
-
-    def __init__(self, location_encoding_dims=10, direction_encoding_dims=4, d_model=256, num_layers=5, out_spectra_dims: int = 32, activation_fn: str = "ReLU", spectra_loss_fn = "L1Loss", flux_loss_fn = "L1Loss", position_encoding_type: str = "SinusoidalFrequency", layer_normalization: str | None = "LayerNorm", use_residuals: bool = True):
-        super().__init__(location_encoding_dims, direction_encoding_dims, d_model)
-        self.num_layers = num_layers
-        self.activation_fn_name = activation_fn
-        self.spectra_loss_fn_name = spectra_loss_fn
-        self.flux_loss_fn_name = flux_loss_fn
-        self.position_encoding_type = position_encoding_type
-        self.num_layers = num_layers
-        self.out_spectra_dims = out_spectra_dims
-        self.use_residuals = use_residuals
-        self.layer_normalization_name = layer_normalization
-        self.activation_fn = ModuleBuilder.ConstructActivation_fn(activation_fn)
-        self.spectra_loss_fn = ModuleBuilder.ConstructLoss_fn(spectra_loss_fn)
-        self.flux_loss_fn = ModuleBuilder.ConstructLoss_fn(flux_loss_fn)
-        self.layer_normalization = ModuleBuilder.ConstructNormalization_fn(layer_normalization) if layer_normalization is not None else None
-        self.positional_location_encoding = None
-        if position_encoding_type == "SinusoidalFrequency":
-            self.preprocess_location = nn.Identity()
-            self.preprocess_direction = nn.Identity()
-            self.positional_location_encoding = SinusoidalFrequencyEncoding(location_encoding_dims, 3, append_input=True)
-            self.positional_direction_encoding = AngularSinusoidalFrequencyEncoding(direction_encoding_dims, append_input=True)
-        else:
-            raise ValueError(f"Unknown position encoding type: {position_encoding_type}")
-
-        self.hidden_layers_and_output = [
-            ResidualBlock(d_model, self.activation_fn, self.layer_normalization) if use_residuals else LinearBlock(d_model, self.activation_fn, self.layer_normalization)
-            for _ in range(num_layers - 1)
-        ] + [
-            ResidualBlock(d_model, self.activation_fn, self.layer_normalization, d_model_out=d_model//2) if use_residuals else LinearBlock(d_model, self.activation_fn, self.layer_normalization, d_model_out=d_model//2)
-        ]
-
-        self.model = nn.Sequential(
-            nn.Linear(self.positional_location_encoding.encoded_dims + self.positional_direction_encoding.encoded_dims, d_model),
-            *self.hidden_layers_and_output
-        )
-
-        self.flux_activation = nn.Sigmoid()
-        self.spectra_activation = nn.Softmax(dim=1)
-
-    def forward(self, x: PositionalInput) -> RadiationField:
-        loc = self.preprocess_location(x.position)
-        loc_enc = self.positional_location_encoding(loc)
-        dir = self.preprocess_direction(x.direction)
-        dir_enc = self.positional_direction_encoding(dir)
-        x = torch.cat((loc_enc, dir_enc), dim=-1)
-        x = self.model(x)
-        flux = self.flux_activation(x[:, -1])
-        spectra = self.spectra_activation(x[:, :self.out_spectra_dims])
-        return RadiationField(
-            scatter_field=RadiationFieldChannel(
-                flux=flux,
-                spectrum=spectra
-            ),
-            direct_beam=None
-        )
-
-    def get_custom_parameters(self):
-        params = {
-            "location_encoding_dims": self.positional_location_encoding.encoded_dims,
-            "direction_encoding_dims": self.positional_direction_encoding.encoded_dims,
-            "d_model": self.d_model,
-            "num_layers": self.num_layers,
-            "out_spectra_dims": self.out_spectra_dims,
-            "activation_fn": self.activation_fn_name,
-            "spectra_loss_fn": self.spectra_loss_fn_name,
-            "flux_loss_fn": self.flux_loss_fn_name,
-            "position_encoding_type": self.position_encoding_type,
-            "layer_normalization": self.layer_normalization_name,
-            "use_residuals": self.use_residuals,
-        }
-        seed = os.environ.get("PL_GLOBAL_SEED", None)
-        if seed is not None:
-            params["training_seed"] = int(seed)
-        return params

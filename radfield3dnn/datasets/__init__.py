@@ -7,9 +7,9 @@ from RadFiled3D.RadFiled3D import CartesianRadiationField
 from enum import Enum
 from RadFiled3D.pytorch.datasets.processing import DataProcessing
 from .crop_dataset import CropDataset
-from radfield3dnn import TrainingInputData, rf3TrainingInputData, RadiationField, rf3RadiationField, RadiationFieldChannel, AirKermaField
+from radfield3dnn.rftypes import TrainingInputData, rf3TrainingInputData, RadiationField, rf3RadiationField, RadiationFieldChannel, AirKermaField
 import os
-from radfield3dnn.normalizations.beam_parameters import BeamParametersNormalization
+from radfield3dnn.preprocessing.normalizations.beam_parameters import BeamParametersNormalization
 from rich import print
 from .dataloader import RadiationFieldDataModule
 
@@ -99,7 +99,7 @@ def get_dataset_dimensions_and_voxel_size(dataset: str | RadiationFieldDataModul
     return (field_dim.x, field_dim.y, field_dim.z), vx_size_x
 
 
-def construct_datamodule(dataset_path: str, batch_size: int, num_workers: int, use_geometry: bool, use_beam_parameters: bool, dataprocessings: list[DataProcessing] = None, voxel_resolution: tuple[int, int, int] = None) -> RadiationFieldDataModule:
+def construct_datamodule(dataset_path: str, batch_size: int, num_workers: int, use_geometry: bool, use_beam_parameters: bool, dataprocessings: list[DataProcessing] = None, voxel_resolution: tuple[int, int, int] = None, prefetch_to_device: bool = True, max_fields: int = None, cache_to_ram: bool = False, cache_ram_gb: float = None) -> RadiationFieldDataModule:
     if dataprocessings is None:
         dataprocessings = []
     dataset_cls = RadField3DDataset
@@ -127,9 +127,8 @@ def construct_datamodule(dataset_path: str, batch_size: int, num_workers: int, u
         print(f"[blue]Testing dataset with voxel resolution {voxel_resolution}[/blue]")
         assert vx_counts[0] >= voxel_resolution[0] and vx_counts[1] >= voxel_resolution[1] and vx_counts[2] >= voxel_resolution[2], f"Voxel resolution of dataset {vx_counts} does not match enforced resolution {voxel_resolution}"
         
-        dataprocessings.append(
-            CropDataset(voxel_resolution)
-        )
+        dataprocessings = [CropDataset(voxel_resolution)] + dataprocessings
+
         print(f"[green]Voxel resolution of dataset matches enforced resolution {voxel_resolution}!")
 
     if use_beam_parameters:
@@ -154,7 +153,11 @@ def construct_datamodule(dataset_path: str, batch_size: int, num_workers: int, u
         batch_size=batch_size,
         num_workers=num_workers,
         dataset_cls=dataset_cls,
-        data_processings=dataprocessings
+        data_processings=dataprocessings,
+        prefetch_to_device=prefetch_to_device,
+        max_fields=max_fields,
+        cache_to_ram=cache_to_ram,
+        cache_ram_gb=cache_ram_gb
     )
     datamodule.prepare_data()
 

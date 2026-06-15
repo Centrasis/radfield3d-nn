@@ -1,7 +1,7 @@
 from torch import nn
 from torch import Tensor
 import torch
-from radfield3dnn import TrainingInputData, RadiationField, RadiationFieldChannel
+from radfield3dnn.rftypes import TrainingInputData, RadiationField, RadiationFieldChannel
 from typing import Union, Literal
 
 

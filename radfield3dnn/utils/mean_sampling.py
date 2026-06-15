@@ -58,9 +58,9 @@ def resample_histogram_bilinear(histogram: torch.Tensor, target_bins: int) -> to
     """
     batch_size, source_bins = histogram.shape
     
-    x_coords = torch.linspace(-1, 1, target_bins, device=histogram.device)
-    
-    grid = torch.zeros((batch_size, 1, target_bins, 2), device=histogram.device)
+    x_coords = torch.linspace(-1, 1, target_bins, device=histogram.device, dtype=histogram.dtype)
+
+    grid = torch.zeros((batch_size, 1, target_bins, 2), device=histogram.device, dtype=histogram.dtype)
     grid[:, :, :, 0] = x_coords.view(1, 1, -1)
     histogram_input = histogram.view(batch_size, 1, 1, source_bins)
 

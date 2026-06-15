@@ -1,0 +1,51 @@
+#version 450
+// Perspective voxel-visibility cull. One invocation per voxel of a D×H×W grid: project the
+// voxel's normalised [0,1]^3 centre by `proj` (column-major 4×4) and, if it lands inside the
+// clip volume (x,y ∈ [-1,1], z ∈ [0,1], w > 0), append it to the compact output via an atomic
+// counter. Outputs go into HOST-VISIBLE buffers so a consumer (ONNX Runtime) can bind them
+// directly with no host round-trip:
+//   * positions — tightly packed [count, 3] (x,y,z), ready as the model's per-voxel input,
+//   * indices   — the flat voxel index ((i*H+j)*W+k) per survivor, for scattering results back.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) buffer Counter   { uint  count; };
+layout(std430, binding = 1) buffer Positions { float xyz[]; };   // 3 floats per survivor
+layout(std430, binding = 2) buffer Indices   { uint  idx[]; };   // 1 uint per survivor
+
+layout(push_constant) uniform PC {
+    uint D;
+    uint H;
+    uint W;
+    uint pad;
+    mat4 proj;   // column-major (matches the host std::array<float,16>)
+} pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint N = pc.D * pc.H * pc.W;
+    if (gid >= N) return;
+
+    uint plane = pc.H * pc.W;
+    uint i = gid / plane;
+    uint rem = gid - i * plane;
+    uint j = rem / pc.W;
+    uint k = rem - j * pc.W;
+
+    float x = (pc.D > 1u) ? float(i) / float(pc.D - 1u) : 0.0;
+    float y = (pc.H > 1u) ? float(j) / float(pc.H - 1u) : 0.0;
+    float z = (pc.W > 1u) ? float(k) / float(pc.W - 1u) : 0.0;
+
+    vec4 clip = pc.proj * vec4(x, y, z, 1.0);
+    if (clip.w <= 0.0) return;
+    vec3 ndc = clip.xyz / clip.w;
+    if (ndc.x >= -1.0 && ndc.x <= 1.0 &&
+        ndc.y >= -1.0 && ndc.y <= 1.0 &&
+        ndc.z >=  0.0 && ndc.z <= 1.0) {
+        uint slot = atomicAdd(count, 1u);
+        xyz[slot * 3u + 0u] = x;
+        xyz[slot * 3u + 1u] = y;
+        xyz[slot * 3u + 2u] = z;
+        idx[slot] = gid;
+    }
+}

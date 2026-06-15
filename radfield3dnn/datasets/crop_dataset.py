@@ -1,4 +1,4 @@
-from radfield3dnn import RadiationFieldChannel, RadiationField, TrainingInputData, DirectionalInput, rf3TrainingInputData, rf3RadiationField
+from radfield3dnn.rftypes import RadiationFieldChannel, RadiationField, TrainingInputData, DirectionalInput, rf3TrainingInputData, rf3RadiationField
 from typing import Union
 from RadFiled3D.pytorch.datasets.processing import DataProcessing
 from torch import Tensor
@@ -85,10 +85,13 @@ class CropDataset(DataProcessing):
     
     def forward(self, x: Union[TrainingInputData, RadiationField]) -> Union[TrainingInputData, RadiationFieldChannel]:
         if isinstance(x, TrainingInputData) or isinstance(x, rf3TrainingInputData):
+            ogt = None
+            if hasattr(x, "original_ground_truth"):
+                ogt = self.forward(x.original_ground_truth) if x.original_ground_truth is not None else None
             return TrainingInputData(
                 input=self.crop_input_data(x.input),
                 ground_truth=self.forward(x.ground_truth),
-                original_ground_truth=self.forward(x.original_ground_truth) if x.original_ground_truth is not None else None
+                original_ground_truth=ogt
             )
         elif isinstance(x, RadiationField) or isinstance(x, rf3RadiationField):
             return self.crop_radiation_field(x)

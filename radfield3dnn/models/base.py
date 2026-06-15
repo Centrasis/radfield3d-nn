@@ -3,9 +3,10 @@ import torch.nn as nn
 import lightning.pytorch as pl
 from torch import Tensor
 from typing import Type
-from radfield3dnn.normalizations import Normalizer, LinearNormalizer, NormalizerConstructor
-from radfield3dnn.encodings.sinusoidal_encoding import SinusoidalFrequencyEncoding
-from radfield3dnn.encodings.hash_encoding import HashGridEncoding
+from radfield3dnn.preprocessing.normalizations import Normalizer, LinearNormalizer, NormalizerConstructor
+from radfield3dnn.models.encoders.sinusoidal_encoding import SinusoidalFrequencyEncoding, AngularSinusoidalFrequencyEncoding
+from radfield3dnn.models.encoders.hash_encoding import HashGridEncoding
+from radfield3dnn.models.encoders.spherical_hamonics import SphericalHarmonics
 from radfield3dnn.rftypes import AirKermaField, RadiationField, PositionalInput, TrainingInputData, RadiationFieldChannel, DirectionalInput, PositionalInput
 import gc
 from rich import print
@@ -14,9 +15,9 @@ from radfield3dnn.losses.base import Loss
 from radfield3dnn.metrics.types import TrainingMetrics, ChannelMetrics
 import radfield3dnn.losses.std as std
 import radfield3dnn.losses.combinations as comb_loss
-import torch.nn.functional as F
-from radfield3dnn.activations.HistogramNormalize import HistogramNormalize
+from radfield3dnn.models.activations.HistogramNormalize import HistogramNormalize
 from radfield3dnn.datasets.channel_join import ChannelsJoin
+from radfield3dnn.losses.mtl.mtl import MultiTaskLossBalancer
 
 
 class ModuleBuilder:
@@ -24,44 +25,35 @@ class ModuleBuilder:
     def ConstructLoss_fn(loss_fn_name: str) -> nn.Module:
         if loss_fn_name == "L1Loss":
             return std.L1LossWeighted(False)
-        elif loss_fn_name == "MSELoss":
-            return std.MSELossWeighted(False)
-        elif loss_fn_name == "CrossEntropyLoss":
-            return std.CrossEntropyLossWeighted(False)
-        elif loss_fn_name == "KLDivLoss":
-            return std.KLDivLossWeighted(False)
-        elif loss_fn_name == "BCELoss":
-            raise NotImplementedError("BCELoss is not supported.")
-        elif loss_fn_name == "BCEWithLogitsLoss":
-            raise NotImplementedError("BCEWithLogitsLoss is not supported.")
-        elif loss_fn_name == "SmoothL1Loss":
-            raise NotImplementedError("SmoothL1Loss is not supported.")
-        elif loss_fn_name == "L1LogLoss":
-            return std.L1LossLogSpace(False)
-        elif loss_fn_name == "WassersteinLoss":
-            return std.WassersteinLossWeighted(dim=1, weight_with_error=False)
+        elif loss_fn_name == "L1Plain":
+            # Plain physical-space L1 for LinearNormalizer(0,1) targets.
+            return std.PlainL1Loss(weight_with_error=False)
+        elif loss_fn_name == "SMAPEBalanced":
+            # Metric-targeted region-balanced SMAPE: trains the metric's own functional with equal
+            # gradient mass on beam / bright-ring / reliable-bulk regions and MC-noise voxels masked
+            # out. Pair with normalizer="linear0_1" (SMAPE is scale-invariant).
+            return comb_loss.SMAPERegionBalancedLoss()
+        elif loss_fn_name == "TwoROIGammaLoss":
+            # ROI thresholds MATCH the air-kerma scatter metric + the ROI sampler (radfield3dnn.roi):
+            # beam = >=0.05*max, scatter floor = 5e-5*max. Per-ROI means equalise influence.
+            from radfield3dnn.roi import BEAM_REL_DEFAULT, SCATTER_LO_DEFAULT
+            return comb_loss.TwoROIGammaLoss(beam_rel=BEAM_REL_DEFAULT, scatter_lo=SCATTER_LO_DEFAULT)
         elif loss_fn_name == "HistogramLoss":
             return comb_loss.HistogramLoss(bin_dim=1, weight_with_error=False, penalize_out_of_range=False, calc_moments=False)
-        elif loss_fn_name == "MSELogLoss":
-            return std.MSELossLogSpace(weight_with_error=False)
-        elif loss_fn_name == "PoissonNLLLoss":
-            return std.PoissonNLLLoss(weight_with_error=False)
-        elif loss_fn_name == "FocalMSELoss":
-            return std.FocalMSELoss(weight_with_error=False)
-        elif loss_fn_name == "FocalSmoothL1Loss":
-            return std.FocalSmoothL1Loss(weight_with_error=False)
         elif loss_fn_name == "StructuralSimilarity3DLoss":
             return std.StructuralSimilarity3DLoss(weight_with_error=False)
-        elif loss_fn_name == "MultiScaleStructuralSimilarity3DLoss":
-            return std.MultiScaleStructuralSimilarity3DLoss(weight_with_error=False)
-        elif loss_fn_name == "FluxLoss":
-            return comb_loss.FluxLoss(weight_with_error=False, log_scale=False)
-        elif loss_fn_name == "FluxLogLoss":
-            return comb_loss.FluxLoss(weight_with_error=False, log_scale=True)
-        elif loss_fn_name == "FluxMultiScaleLoss":
-            return comb_loss.FluxMultiScaleLoss(weight_with_error=False)
+        elif loss_fn_name == "RawNeRF":
+            # RawNeRF HDR loss (Mildenhall CVPR 2022): linear-space relative-weighted L2. Pair with
+            # normalizer="linear0_1".
+            return std.RawNeRFLoss()
         else:
-            raise ValueError(f"Invalid loss function name: {loss_fn_name}")
+            # The loss is a TRAINING object; inference / loading never uses it. Tolerate an unknown
+            # name (e.g. a checkpoint trained with a loss no longer in the curated set) by returning
+            # None so the model still constructs for inference; a real training run would fail loudly
+            # the first time it tried to use the missing loss.
+            print(f"[yellow]Unknown loss function name '{loss_fn_name}' — not constructed "
+                  f"(fine for inference; required for training).")
+            return None
         
     @staticmethod
     def ConstructActivation_fn(activation_fn_name: str) -> Type[nn.Module]:
@@ -117,45 +109,10 @@ class ModuleBuilder:
             return SinusoidalFrequencyEncoding
         elif encoding_fn_name == "HashGridEncoding":
             return HashGridEncoding
+        elif encoding_fn_name == "SphericalHarmonics":
+            return SphericalHarmonics
         else:
             raise ValueError(f"Invalid encoding function name: {encoding_fn_name}")
-
-
-class AngularSinusoidalFrequencyEncoding(SinusoidalFrequencyEncoding):
-    def __init__(self, pos_enc_dim, append_input = False, dim = -1):
-        super().__init__(pos_enc_dim, 2, append_input, dim)
-
-    def forward(self, x):
-        assert x.shape[-1] == 3, f"Input tensor last dim should be 3, got {x.shape[-1]}"
-        x = AngularSinusoidalFrequencyEncoding.map_direction_vector2spherical_coords(x)
-        return super().forward(x)
-    
-    @staticmethod
-    def map_direction_vector2spherical_coords(direction: Tensor) -> Tensor:
-        """Convert direction vectors (x,y,z) to spherical coordinates (theta, phi).
-        This version uses torch.atan2 for better numerical stability.
-        Args:
-            direction: Tensor of shape (..., 3) containing cartesian direction vectors
-        Returns:
-            Tensor of shape (..., 2) containing spherical coordinates (theta, phi)
-        """
-        # Normalize the vectors
-        direction = F.normalize(direction, dim=-1, p=2)
-        
-        # Extract x, y, z components
-        x, y, z = direction[..., 0], direction[..., 1], direction[..., 2]
-        
-        # Convert to spherical coordinates
-        # theta: angle from z-axis (0 to π)
-        # phi: angle in xy-plane from x-axis (0 to 2π)
-        theta = torch.acos(torch.clamp(z, -1.0 + 1e-8, 1.0 - 1e-8))
-        phi = torch.atan2(y, x)
-        
-        # Normalize to [0, 1] range for more stable training
-        theta = theta / torch.pi
-        phi = (phi + torch.pi) / (2 * torch.pi)
-        
-        return torch.stack([theta, phi], dim=-1)
 
 
 class BaseNeuralRadFieldModel(pl.LightningModule):
@@ -164,16 +121,25 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
     lr = property(lambda x: x.get_lr(), lambda x, v: x.set_lr(v))
     learning_rate = property(lambda x: x.get_lr(), lambda x, v: x.set_lr(v))
 
-    def __init__(self, location_encoding_dims=10, direction_encoding_dims=4, d_model=256, normalizer: Union[Normalizer, str] = LinearNormalizer(), learning_rate: float=1e-3):
+    def __init__(self, normalizer: Union[Normalizer, str] = LinearNormalizer(), learning_rate: float=1e-3):
         super().__init__()
         self.logging_prefix = ""
-        
-        self.positional_location_encoding = SinusoidalFrequencyEncoding(location_encoding_dims, 3, append_input=True)
-        self.positional_direction_encoding = AngularSinusoidalFrequencyEncoding(direction_encoding_dims, append_input=True)
-        self.d_model = d_model
+
         self._lr = learning_rate
-        self._flux_loss_fn: Loss = comb_loss.FluxLoss(weight_with_error=False)
-        self._spectrum_loss_fn: Loss = comb_loss.HistogramLoss(bin_dim=1, weight_with_error=False, penalize_out_of_range=False)
+        self._flux_loss_fn: Loss = comb_loss.SMAPERegionBalancedLoss()
+        self._spectrum_loss_fn: Loss = comb_loss.HistogramLoss(bin_dim=1)
+        # Multi-task balancing is handled by DB-MTL (Lin et al. 2023,
+        # "Dual-Balancing for Multi-Task Learning", arXiv:2308.12029),
+        # encapsulated in `MultiTaskLossBalancer`. It is non-parametric (no
+        # learnable loss weights), so the only model state needed is a counter
+        # of non-finite-loss events for observability.
+        self._mtl = MultiTaskLossBalancer()
+        self.register_buffer("_nonfinite_loss_count", torch.zeros(1))
+        # Generic seam for subclass-specific auxiliary task losses. Subclasses
+        # populate this dict (name -> per-sample loss tensor) from their own
+        # forward/evaluate overrides; process_metrics folds it into the DB-MTL
+        # combine and clears it. base.py stays agnostic to what's in it.
+        self._extra_task_losses: dict[str, Tensor] = {}
         self._normalizer = normalizer if not isinstance(normalizer, str) else NormalizerConstructor.construct_by_name(normalizer)
         self.max_inner_batch_size = None
         self.indices: Tensor = None
@@ -183,9 +149,12 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
         assert isinstance(self._normalizer, Normalizer), f"normalizer must be an instance of Normalizer, got {type(self._normalizer)}"
         self.save_hyperparameters(ignore=["indices", "grid_dims", "_flux_loss_fn", "_spectrum_loss_fn", "normalizer", "_channels_join"])
 
+    def get_core_model(self) -> nn.Module:
+        raise NotImplementedError("Please implement get_core_model()")
+
     def _generate_random_ground_truth(self, device) -> RadiationField:
         input = self._generate_random_input(device=device)
-        return self.forward(input)
+        return self._normalizer.inverse(self.forward(input))
     
     def get_submodels(self) -> list["BaseNeuralRadFieldModel"]:
         return []
@@ -195,19 +164,16 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
             direction=torch.rand(batch_size, 3, device=device),
             spectrum=HistogramNormalize(dim=-1)(torch.rand(batch_size, 150, device=device)),
             position=torch.rand(batch_size, 3, device=device),
-            origin=torch.rand(batch_size, 3, device=device),
+            # origin is the per-sample source distance (a scalar) — [B, 1].
+            # PBRFNet(CPP)'s beam encoder asserts origin.shape[-1] == 1; the
+            # other models are shape-agnostic about it.
+            origin=torch.rand(batch_size, 1, device=device),
             geometry=None,
             beam_shape_parameters=torch.rand(batch_size, 1, device=device),
             beam_shape_type=torch.randint(0, 2, (batch_size, 1), device=device, dtype=torch.float32)
         )
 
     def _search_optimal_batch_size(self):
-        """
-        This method will simulate mutliple iterations of this network using a forward and a backward pass with incresing the batch size each.
-        Thus, this method will execute the model for n² batch sizes until a CUDA out of memory error occurs or the memory is filled to 90% capacity.
-        The biggest possible batch size will be stored to self.max_inner_batch_size.
-        NOTE: In order to skip the execution of this method set max_inner_batch_size to a value != None and > 0.
-        """
         print(f"[yellow]Try finding max inner batch_size...")
         self.max_inner_batch_size = 2
         device = next(self.parameters()).device
@@ -240,13 +206,15 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
             random_spectra1 = random_spectra1 / random_spectra1.sum(dim=1, keepdim=True)
         else:
             random_spectra1 = None
-        random_flux1 = torch.rand((num_losses, 1), device=device)
+        random_flux1 = torch.abs(torch.rand((num_losses, 1), device=device))
+        random_flux1 /= random_flux1.max()
         if y_base.scatter_field.spectrum is not None:
             random_spectra2 = torch.rand((num_losses, y_base.scatter_field.spectrum.shape[0]), device=device)
             random_spectra2 = random_spectra2 / random_spectra2.sum(dim=1, keepdim=True)
         else:
             random_spectra2 = None
-        random_flux2 = torch.rand((num_losses, 1), device=device)
+        random_flux2 = torch.abs(torch.rand((num_losses, 1), device=device))
+        random_flux2 /= random_flux1.max()
 
         loss_test_in = TrainingInputData(
             input=train_in.input,
@@ -280,31 +248,31 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
                     flux=y_base.scatter_field.flux,
                     error=y_base.scatter_field.error
                 )
-                xray_channel = RadiationFieldChannel(
+                direct_channel = RadiationFieldChannel(
                     spectrum=y_base.direct_beam.spectrum,
                     flux=y_base.direct_beam.flux,
                     error=y_base.direct_beam.error
                 ) if y_base.direct_beam is not None else scatter_channel
                 y = RadiationField(
                     scatter_field=scatter_channel,
-                    direct_beam=xray_channel,
+                    direct_beam=direct_channel,
                     geometry=torch.zeros_like(y_base.scatter_field.flux) if y_base.geometry is not None else None
                 )
                 batch_size = self.max_inner_batch_size * 2
                 y_scatter_flu = y.scatter_field.flux
                 y_scatter_spec = y.scatter_field.spectrum
-                y_xray_flu = y.direct_beam.flux
-                y_xray_spec = y.direct_beam.spectrum
+                y_direct_flu = y.direct_beam.flux
+                y_direct_spec = y.direct_beam.spectrum
                 if y.scatter_field.spectrum is not None:
                     y_scatter_spec = y.scatter_field.spectrum.unsqueeze(0)
-                    y_xray_spec = y.direct_beam.spectrum.unsqueeze(0)
+                    y_direct_spec = y.direct_beam.spectrum.unsqueeze(0)
 
                 y_scatter_flu = y.scatter_field.flux.unsqueeze(0)
-                y_xray_flu = y.direct_beam.flux.unsqueeze(0)
+                y_direct_flu = y.direct_beam.flux.unsqueeze(0)
 
-                xray_err = torch.rand_like(y_xray_flu).expand(batch_size, *([-1] * (len(y_xray_flu.shape) - 1)))
-                if len(xray_err.shape) == 1:
-                    xray_err = xray_err.unsqueeze(1)
+                direct_err = torch.rand_like(y_direct_flu).expand(batch_size, *([-1] * (len(y_direct_flu.shape) - 1)))
+                if len(direct_err.shape) == 1:
+                    direct_err = direct_err.unsqueeze(1)
                 scatter_err = torch.rand_like(y_scatter_flu).expand(batch_size, *([-1] * (len(y_scatter_flu.shape) - 1)))
                 if len(scatter_err.shape) == 1:
                     scatter_err = scatter_err.unsqueeze(1)
@@ -315,9 +283,9 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
                         error=scatter_err
                     ),
                     direct_beam=RadiationFieldChannel(
-                        spectrum=y_xray_spec.expand(batch_size, *([-1] * (len(y_xray_spec.shape) - 1))) if y_xray_spec is not None else None,
-                        flux=y_xray_flu.expand(batch_size, *([-1] * (len(y_xray_flu.shape) - 1))),
-                        error=xray_err
+                        spectrum=y_direct_spec.expand(batch_size, *([-1] * (len(y_direct_spec.shape) - 1))) if y_direct_spec is not None else None,
+                        flux=y_direct_flu.expand(batch_size, *([-1] * (len(y_direct_flu.shape) - 1))),
+                        error=direct_err
                     ),
                     geometry=torch.zeros_like(y_scatter_flu).expand(batch_size, *([-1] * (len(y_scatter_flu.shape) - 1))) if y.geometry is not None else None
                 )
@@ -454,17 +422,23 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
         if voxel_counts is None:
             raise ValueError("voxel_counts must be provided when using forward2volume_from_training_input.")
 
+        # The drop mask (voxels the importance sampler removed, marked with the
+        # -inf sentinel) is a TRAINING-only optimisation: it skips computing the
+        # dropped voxels so the loss ignores them. During eval / inference we must
+        # predict the FULL volume — otherwise validation gets a sparse (and, when
+        # a field is fully dropped, EMPTY) prediction that breaks the metrics.
         drop_mask = None
-        if isinstance(batch.ground_truth, RadiationField):
-            drop_mask = torch.isneginf(batch.ground_truth.scatter_field.flux)
-            if batch.ground_truth.direct_beam is not None and batch.ground_truth.direct_beam.flux is not None:
-                drop_mask = drop_mask | torch.isneginf(batch.ground_truth.direct_beam.flux)
-        elif isinstance(batch.ground_truth, RadiationFieldChannel):
-            drop_mask = torch.isneginf(batch.ground_truth.flux)
-        elif isinstance(batch.ground_truth, AirKermaField):
-            drop_mask = torch.isneginf(batch.ground_truth.air_kerma)
-        else:
-            raise ValueError("Ground truth must be of type RadiationField, RadiationFieldChannel, or AirKermaField.")
+        if self.training:
+            if isinstance(batch.ground_truth, RadiationField):
+                drop_mask = torch.isneginf(batch.ground_truth.scatter_field.flux)
+                if batch.ground_truth.direct_beam is not None and batch.ground_truth.direct_beam.flux is not None:
+                    drop_mask = drop_mask | torch.isneginf(batch.ground_truth.direct_beam.flux)
+            elif isinstance(batch.ground_truth, RadiationFieldChannel):
+                drop_mask = torch.isneginf(batch.ground_truth.flux)
+            elif isinstance(batch.ground_truth, AirKermaField):
+                drop_mask = torch.isneginf(batch.ground_truth.air_kerma)
+            else:
+                raise ValueError("Ground truth must be of type RadiationField, RadiationFieldChannel, or AirKermaField.")
         pred_field = self.forward2volume(batch.input, voxel_counts, spectra_bins=spectra_bins, mask=drop_mask)
         return pred_field
 
@@ -494,152 +468,392 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
     def forward(self, x: Union[DirectionalInput, PositionalInput]) -> RadiationField:
         raise NotImplementedError("This method must be implemented by the subclass.")
 
+    # ── channel-eval dispatch ────────────────────────────────────────────────────────────────
+    # How many channels the model PREDICTS (1 = single/joined, 2 = scatter+direct, AirKermaField)
+    # is a fixed property of the architecture, so it is determined ONCE by a tiny test run of
+    # forward and the matching plain eval method is bound for the lifetime of the instance.
+    _calc_metrics_impl = None   # bound on first use (test-run probe or first real prediction)
+
+    def _probe_prediction_channels(self, batch: TrainingInputData, is_complete_volume: bool):
+        """TEST RUN of the model's forward — a tiny no_grad pass on the REAL batch inputs
+        (a 2x2x2 volume for volume-trained models, the first 2 rows for pointwise ones) whose
+        only purpose is to observe what the model emits (one channel, two channels, or an
+        AirKermaField). Returns that probe prediction."""
+        with torch.no_grad():
+            if is_complete_volume:
+                bins = self.out_spectra_dim if hasattr(self, "out_spectra_dim") else 32
+                dims = torch.tensor([2, 2, 2], dtype=torch.int32, device=batch.input.direction.device)
+                return self.forward2volume(batch.input, dims, spectra_bins=bins)
+            x = batch.input
+            x2 = type(x)(*[(v[:2] if isinstance(v, Tensor) else v) for v in x])
+            return self(x2)
+
+    def _select_metrics_impl(self, pred_field, y):
+        """Pick the plain eval method matching (predicted channels, GT channels)."""
+        if isinstance(pred_field, AirKermaField):
+            return self._calculate_metrics_airkerma
+        if not isinstance(pred_field, RadiationField):
+            raise ValueError("pred_field must be of type RadiationField or AirKermaField.")
+        pred_two = pred_field.scatter_field is not None and pred_field.direct_beam is not None
+        gt_two = isinstance(y, RadiationField) and y.direct_beam is not None
+        if pred_two and gt_two:
+            return self._calculate_metrics_two_channel
+        if pred_two:                       # two-head model, single/joined GT -> join the prediction
+            return self._calculate_metrics_join_pred
+        if gt_two:                         # single-head model, split GT -> join the GT
+            return self._calculate_metrics_join_gt
+        return self._calculate_metrics_single_channel
+
+    def _join_field(self, field):
+        """Physically join a split RadiationField (inverse -> sum channels -> re-normalise)."""
+        field = self._normalizer.inverse(field)
+        field = self._channels_join(field)
+        return self._normalizer.forward(field)
+
+    def _calculate_metrics_single_channel(self, pred_field: RadiationField, y, batch: TrainingInputData) -> TrainingMetrics:
+        """Plain single-channel eval: one predicted channel vs a single-channel GT."""
+        scatter_field_gt = y.scatter_field if isinstance(y, RadiationField) else y
+
+        loss_spec = None
+        if pred_field.scatter_field.spectrum is not None:
+            loss_spec = self._spectrum_loss_fn.forward(prediction=pred_field.scatter_field.spectrum, target=scatter_field_gt.spectrum, input=batch)
+            if not torch.isfinite(loss_spec).all():
+                print(f"[red] Spectrum loss is not finite — letting downstream fallback set total to 1.")
+
+        loss_flux = self._flux_loss_fn.forward(prediction=pred_field.scatter_field.flux, target=scatter_field_gt.flux, input=batch)
+        if not torch.isfinite(loss_flux).all():
+            print(f"[red] Flux loss is not finite — letting downstream fallback set total to 1.")
+
+        # Debug-probe capture seam (callbacks/debug_probe.py): stash detached references to
+        # exactly what went through the loss this step. Enabled by the TrainingDebugProbe
+        # callback (YAML `training: debug_probe: true`); zero cost when disabled.
+        if getattr(self, "_debug_probe_enabled", False):
+            self._debug_capture = {
+                "pred_flux": pred_field.scatter_field.flux.detach(),
+                "target_flux": scatter_field_gt.flux.detach(),
+                "pred_spectrum": pred_field.scatter_field.spectrum.detach() if pred_field.scatter_field.spectrum is not None else None,
+                "flux_loss": float(loss_flux.detach().mean()),
+                "spectrum_loss": float(loss_spec.detach().mean()) if loss_spec is not None else None,
+                "flux_loss_terms": dict(getattr(self._flux_loss_fn, "last_terms", {})),
+                "batch_input": batch.input,
+            }
+
+        return TrainingMetrics(
+            scatter_field=ChannelMetrics(flux_loss=loss_flux, spectrum_loss=loss_spec),
+            direct_beam=None,
+        )
+
+    def _calculate_metrics_join_gt(self, pred_field: RadiationField, y: RadiationField, batch: TrainingInputData) -> TrainingMetrics:
+        """Single-channel prediction vs a SPLIT GT: physically join the GT (and the batch the
+        loss receives as `input`), then evaluate as plain single-channel."""
+        batch = self._normalizer.forward(self._channels_join(self._normalizer.inverse(batch)))
+        y = self._join_field(y)
+        return self._calculate_metrics_single_channel(pred_field, y, batch)
+
+    def _calculate_metrics_join_pred(self, pred_field: RadiationField, y, batch: TrainingInputData) -> TrainingMetrics:
+        """Two-head prediction vs a single-channel GT: physically join the PREDICTION
+        (inverse -> scatter+direct -> re-normalise), then evaluate as plain single-channel."""
+        inv = self._normalizer.inverse(pred_field)
+        joined = RadiationField(
+            scatter_field=RadiationFieldChannel(
+                flux=inv.scatter_field.flux + inv.direct_beam.flux,
+                spectrum=inv.scatter_field.spectrum,
+                error=inv.scatter_field.error,
+            ),
+            direct_beam=None,
+        )
+        return self._calculate_metrics_single_channel(self._normalizer.forward(joined), y, batch)
+
+    def _calculate_metrics_two_channel(self, pred_field: RadiationField, y: RadiationField, batch: TrainingInputData) -> TrainingMetrics:
+        """Plain two-channel eval: scatter (flux+spectrum) and direct (flux) scored separately.
+
+        Cross-task flux balancing is handled by `MultiTaskLossBalancer` (scale-invariantly, in
+        log space), so no per-channel rescaling happens here.
+        """
+        single = self._calculate_metrics_single_channel(pred_field, y, batch)
+        loss_direct = self._flux_loss_fn.forward(prediction=pred_field.direct_beam.flux, target=y.direct_beam.flux, input=batch)
+        return TrainingMetrics(
+            scatter_field=single.scatter_field,
+            direct_beam=ChannelMetrics(flux_loss=loss_direct, spectrum_loss=None),
+        )
+
+    def _calculate_metrics_airkerma(self, pred_field: AirKermaField, y, batch: TrainingInputData) -> TrainingMetrics:
+        assert isinstance(y, AirKermaField), "Ground truth must be of type AirKermaField when predicting AirKermaField."
+        loss_airkerma = self._flux_loss_fn.forward(prediction=pred_field.air_kerma, target=y.air_kerma, input=batch)
+        return TrainingMetrics(airkerma_field=loss_airkerma)
+
     def evaluate_forward(self, batch: TrainingInputData) -> TrainingMetrics:
         batch = self._normalizer.forward(batch)
         y = batch.ground_truth
         x = batch.input
         self.batch_size = int(x.direction.shape[0])
-        if isinstance(y, RadiationField) or isinstance(y, RadiationFieldChannel):
-            has_multi_channel = y.direct_beam is not None if isinstance(y, RadiationField) else False
+        if isinstance(y, (RadiationField, RadiationFieldChannel)):
             scatter_field_gt = y.scatter_field if isinstance(y, RadiationField) else y
             is_complete_volume = (len(scatter_field_gt.flux.shape) == 4 or (len(scatter_field_gt.flux.shape) == 5 and scatter_field_gt.flux.shape[1] == 1)) and len(scatter_field_gt.spectrum.shape) == 5
         elif isinstance(y, AirKermaField):
-            has_multi_channel = False
-            is_complete_volume = (len(y.air_kerma.shape) == 4 or (len(y.air_kerma.shape) == 5 and y.air_kerma.shape[1] == 1))
             scatter_field_gt = batch.original_ground_truth.scatter_field if batch.original_ground_truth is not None and isinstance(batch.original_ground_truth, RadiationField) else None
+            is_complete_volume = (len(y.air_kerma.shape) == 4 or (len(y.air_kerma.shape) == 5 and y.air_kerma.shape[1] == 1))
         else:
             raise ValueError("Ground truth must be of type RadiationField, RadiationFieldChannel, or AirKermaField.")
+
+        # One-time test run of forward: count the predicted channels and bind the matching plain
+        # eval method for the rest of the instance's lifetime.
+        if self._calc_metrics_impl is None:
+            probe = self._probe_prediction_channels(batch, is_complete_volume)
+            self._calc_metrics_impl = self._select_metrics_impl(probe, y)
 
         if is_complete_volume:
             pred_field: RadiationField | AirKermaField = self.forward2volume_from_training_input(batch, spectra_bins=scatter_field_gt.spectrum.shape[1] if scatter_field_gt.spectrum is not None else 32)
         else:
             pred_field: RadiationField | AirKermaField = self(x)
 
-        if isinstance(y, RadiationField) or isinstance(y, RadiationFieldChannel):
-            if has_multi_channel and (pred_field.scatter_field is None and pred_field.direct_beam is None):
-                raise ValueError("The model should not return both scatter_field and direct_beam in the same forward pass when has_multi_channel is True.")
-            elif not has_multi_channel and ((pred_field.scatter_field is not None) and (pred_field.direct_beam is not None)):
-                raise ValueError("The model should return either scatter_field or direct_beam, but not both when has_multi_channel is False.")
+        return self._calc_metrics_impl(pred_field, y, batch)
 
-        return self.calculate_metrics(pred_field, y, batch)
-
-    def calculate_metrics(self, pred_field: RadiationField | AirKermaField, y: RadiationField | AirKermaField, batch: TrainingInputData, ignore_scatter: bool = False, ignore_direct_beam: bool = False) -> TrainingMetrics:
-        scatter_metrics: ChannelMetrics = None
-        direct_beam_metrics: ChannelMetrics = None
-
-        if isinstance(pred_field, RadiationField):
-            has_multi_channel = y.direct_beam is not None if isinstance(y, RadiationField) else False
-            scatter_field_gt = y.scatter_field if isinstance(y, RadiationField) else y
-
-            if not has_multi_channel and (pred_field.scatter_field is not None and pred_field.direct_beam is not None):
-                raise ValueError("The model should return either scatter_field or direct_beam, but not both when has_multi_channel is False.")
-            
-            if has_multi_channel and (pred_field.scatter_field is None or pred_field.direct_beam is None):
-                # if network is only predicting one channel, join channels for loss calculation
-                batch = self._normalizer.inverse(batch)
-                y = self._normalizer.inverse(y)
-                batch = self._channels_join(batch)
-                batch = self._normalizer.forward(batch)
-                y = self._channels_join(y)
-                y = self._normalizer.forward(y)
-                scatter_field_gt = y
-                has_multi_channel = False
-
-            if pred_field.direct_beam is not None and has_multi_channel and not ignore_direct_beam:
-                loss_spec = None
-                if pred_field.direct_beam.spectrum is not None:
-                    loss_spec = self._spectrum_loss_fn.forward(prediction=pred_field.direct_beam.spectrum, target=y.direct_beam.spectrum, input=batch)
-
-                loss_flux = self._flux_loss_fn.forward(prediction=pred_field.direct_beam.flux, target=y.direct_beam.flux, input=batch)
-
-                direct_beam_metrics = ChannelMetrics(
-                    flux_loss=loss_flux,
-                    spectrum_loss=loss_spec if loss_spec is not None else None,
-                )
-
-            if pred_field.scatter_field is not None and not ignore_scatter:
-                loss_spec = None
-                if pred_field.scatter_field.spectrum is not None:
-                    loss_spec = self._spectrum_loss_fn.forward(prediction=pred_field.scatter_field.spectrum, target=scatter_field_gt.spectrum, input=batch)
-                    if not torch.isfinite(loss_spec).all():
-                        print(f"[red] Spectrum loss is not finite. Setting to 1.")
-                        raise ValueError("Spectrum loss is not finite.")
-
-                loss_flux = self._flux_loss_fn.forward(prediction=pred_field.scatter_field.flux, target=scatter_field_gt.flux, input=batch)
-
-                if not torch.isfinite(loss_flux).all():
-                    print(f"[red] Flux loss is not finite. Setting to 1.")
-                    raise ValueError("Flux loss is not finite.")
-
-                if direct_beam_metrics is not None and y.direct_beam is not None:
-                    sum_flux_ratio = y.direct_beam.flux.sum() / scatter_field_gt.flux.sum()
-                    loss_flux = loss_flux * sum_flux_ratio
-
-                scatter_metrics = ChannelMetrics(
-                    flux_loss=loss_flux,
-                    spectrum_loss=loss_spec
-                )
-
-            return TrainingMetrics(
-                scatter_field=scatter_metrics,
-                direct_beam=direct_beam_metrics
-            )
-        elif isinstance(pred_field, AirKermaField):
-            assert isinstance(y, AirKermaField), "Ground truth must be of type AirKermaField when predicting AirKermaField."
-            loss_airkerma = self._flux_loss_fn.forward(prediction=pred_field.air_kerma, target=y.air_kerma, input=batch)
-            return TrainingMetrics(
-                airkerma_field=loss_airkerma
-            )
-        else:
-            raise ValueError("pred_field must be of type RadiationField or AirKermaField.")
+    def calculate_metrics(self, pred_field: RadiationField | AirKermaField, y: RadiationField | AirKermaField, batch: TrainingInputData) -> TrainingMetrics:
+        """Public seam (subclasses with their own evaluate_forward call this with their
+        prediction). Binds the matching plain eval method on first use — here the first real
+        prediction IS the test run — then dispatches straight to it."""
+        if self._calc_metrics_impl is None:
+            self._calc_metrics_impl = self._select_metrics_impl(pred_field, y)
+        return self._calc_metrics_impl(pred_field, y, batch)
     
+    @property
+    def output_head_markers(self) -> tuple[str, ...]:
+        """Substrings of parameter names belonging to task-specific output heads.
+
+        `_shared_parameters` excludes these from DB-MTL's gradient-magnitude
+        balancing. The base model declares no heads — subclasses that add output
+        heads override this property, so base.py stays decoupled from any
+        specific head layout.
+        """
+        return ()
+
+    @property
+    def use_lr_finder(self) -> bool:
+        """Whether Lightning's LR finder should run before training.
+
+        Default True. Fused fp16 models (PBRFNetCPP) override to False — the
+        finder's high-LR sweep overflows their fp16 fused weights to NaN, and
+        their optimizer clamps the LR to ``max_lr`` regardless, so the sweep is
+        both harmful and pointless.
+
+        Can also be disabled per-run via the instance attribute
+        ``_use_lr_finder`` (set from the YAML ``training: lr_finder: false``) —
+        the finder picks a different LR per seed, a major source of run-to-run
+        variance, so a fixed configured LR is preferred for reproducible runs.
+        """
+        return getattr(self, "_use_lr_finder", True)
+
+    @property
+    def mtl_gradient_balancing(self) -> bool:
+        """Whether DB-MTL's gradient-magnitude balancing (step 2) is applied.
+
+        It requires per-task gradients w.r.t. the shared trunk, obtained with
+        one ``autograd.grad`` backward per task. Disable for **fused / black-box
+        models** (e.g. the tcnn-fused PBRFNetCPP) where: (a) there is no
+        Python-visible shared representation between trunk and heads to take a
+        cheap head-only Jacobian, and (b) repeated full-network backward through
+        the fused C++ autograd Function is costly and may not be re-entrant.
+        Those models fall back to **loss-scale balancing only** (step 1), which
+        is still scale-invariant and needs a single backward.
+
+        The per-task `autograd.grad(loss, shared_trunk)` is a FULL-network backward
+        EACH (N_tasks extra backwards/step). That cost is now **amortised by caching**:
+        the balancer recomputes the weights only every `update_every` steps and reuses
+        the cache in between (see `MultiTaskLossBalancer`), so DB-MTL stays ON by default
+        cheaply. Set `model._mtl_gradient_balancing = False` for a single-backward
+        fallback (fused/black-box models override this to False).
+        """
+        return getattr(self, "_mtl_gradient_balancing", True)
+
+    def _shared_parameters(self) -> list[nn.Parameter]:
+        """Trunk/encoder parameters shared across the task heads.
+
+        Used by DB-MTL's gradient-magnitude balancing: excludes the per-task
+        output heads (see `output_head_markers`) so the balancing reflects how
+        each task pulls on the *shared* representation.
+        """
+        # Cache the list: the parameter set is fixed after construction, so rebuild it
+        # once instead of iterating named_parameters() (+ string-matching) every step.
+        cached = getattr(self, "_shared_params_cache", None)
+        if cached is not None:
+            return cached
+        markers = self.output_head_markers
+        cached = [p for n, p in self.named_parameters()
+                  if p.requires_grad and not any(m in n for m in markers)]
+        self._shared_params_cache = cached
+        return cached
+
+    def _shared_parameter_limits(self, shared_params: list[nn.Parameter]) -> list[int | None]:
+        """Per-parameter element limit aligned with ``shared_params`` for DB-MTL.
+
+        Default ``None`` for every parameter (the whole gradient enters the norm).
+        Fused models (PBRFNetCPP) override this to return the TRUNK element count
+        for their single fused-weights tensor, so the per-task norm excludes the
+        output heads living in the same blob (heads can't be name-excluded via
+        ``output_head_markers`` the way pure-Python models do).
+        """
+        return [None] * len(shared_params)
+
+    def _dbmtl_combine(self, task_losses: dict[str, Tensor], stage: str, on_step: bool, on_epoch: bool) -> Tensor:
+        """Combine task losses with the DB-MTL balancer and log its weights.
+
+        Delegates the balancing to `self._mtl` (`MultiTaskLossBalancer`).
+        Gradient-magnitude balancing (step 2) needs per-task gradients w.r.t. the
+        shared trunk — supplied only when the model can expose one
+        (`mtl_gradient_balancing`); fused/black-box models (PBRFNetCPP) pass
+        ``None`` and fall back to loss-scale balancing (step 1). The per-task
+        weights ``α_i`` and gradient norms are logged (``{stage}_dbmtl_*``) so the
+        balancing can be validated in wandb.
+        """
+        use_grad_balancing = self.mtl_gradient_balancing and self.training
+        balance_params = self._shared_parameters() if use_grad_balancing else None
+        balance_limits = self._shared_parameter_limits(balance_params) if use_grad_balancing else None
+        total = self._mtl.combine(task_losses, balance_params, balance_limits)
+
+        for n, w in self._mtl.last_weights.items():
+            self.log(f'{stage}_dbmtl_weight_{n}', w, on_step=on_step, on_epoch=on_epoch, logger=True, batch_size=self.batch_size)
+        for n, gn in self._mtl.last_gradnorms.items():
+            self.log(f'{stage}_dbmtl_gradnorm_{n}', gn, on_step=on_step, on_epoch=on_epoch, logger=True, batch_size=self.batch_size)
+        # Surface the B-hardening guard: 1.0 whenever a task's trunk-gradient norm
+        # overflowed to inf/NaN this step (the guard fired). A non-zero value here
+        # means a real fp16 overflow was masked — investigate, don't ignore.
+        for n, of in getattr(self._mtl, "last_overflowed", {}).items():
+            self.log(f'{stage}_dbmtl_overflow_{n}', float(of), on_step=on_step, on_epoch=on_epoch, logger=True, batch_size=self.batch_size)
+        return total
+
     def process_metrics(self, metrics: TrainingMetrics, stage: str) -> Tensor:
-        total_loss = torch.tensor(0.0, device=self.device)
         on_epoch = stage in ["val", "test"]
 
         if len(self.logging_prefix) > 0:
             stage = stage + "." + self.logging_prefix
 
         on_step = not on_epoch
+
+        # Gather every active task loss into one dict; DB-MTL balances them
+        # jointly in a single combine call.
+        task_losses: dict[str, Tensor] = {}
         if metrics.scatter_field is not None:
-            total_loss = metrics.scatter_field.flux_loss
-            if metrics.scatter_field.spectrum_loss is not None:
-                loss_weight = 0.5
-                total_loss = total_loss * loss_weight + metrics.scatter_field.spectrum_loss * (1 - loss_weight)
-                self.log(f'{stage}_scatter_spectrum_loss', metrics.scatter_field.spectrum_loss.mean(), on_epoch=on_epoch, on_step=on_step, logger=True, batch_size=self.batch_size)
+            task_losses["scatter_flux"] = metrics.scatter_field.flux_loss
             self.log(f'{stage}_scatter_flux_loss', metrics.scatter_field.flux_loss.mean(), on_epoch=on_epoch, on_step=on_step, logger=True, batch_size=self.batch_size)
+            if metrics.scatter_field.spectrum_loss is not None:
+                # Fixed spectrum-task weight (YAML `training: spectrum_loss_weight`). The DB-MTL
+                # experiment showed ADAPTIVE balancing is incompatible with self-weighted flux
+                # losses (their magnitude IS their imbalance correction); a FIXED multiplier is the
+                # safe way to lift the undertrained spectrum head (flux/spectrum scale gap ~40-1000x),
+                # which leaks into every air-kerma metric via the mu_tr-weighted integral.
+                spec_w = float(getattr(self, "_spectrum_loss_weight", 1.0))
+                task_losses["scatter_spectrum"] = metrics.scatter_field.spectrum_loss * spec_w
+                self.log(f'{stage}_scatter_spectrum_loss', metrics.scatter_field.spectrum_loss.mean(), on_epoch=on_epoch, on_step=on_step, logger=True, batch_size=self.batch_size)
 
         if metrics.direct_beam is not None:
-            if metrics.direct_beam.spectrum_loss is not None:
-                loss_weight = 0.5
-                total_loss = total_loss + metrics.direct_beam.flux_loss * loss_weight + metrics.direct_beam.spectrum_loss * (1 - loss_weight)
-                self.log(f'{stage}_direct_beam_spectrum_loss', metrics.direct_beam.spectrum_loss.mean(), on_epoch=on_epoch, on_step=on_step, logger=True, batch_size=self.batch_size)
-            else:
-                total_loss = total_loss + metrics.direct_beam.flux_loss
+            task_losses["direct_flux"] = metrics.direct_beam.flux_loss
             self.log(f'{stage}_direct_beam_flux_loss', metrics.direct_beam.flux_loss.mean(), on_epoch=on_epoch, on_step=on_step, logger=True, batch_size=self.batch_size)
 
         if metrics.airkerma_field is not None:
-            total_loss = total_loss + metrics.airkerma_field
+            task_losses["airkerma"] = metrics.airkerma_field
             self.log(f'{stage}_airkerma_loss', metrics.airkerma_field.mean(), on_epoch=on_epoch, on_step=on_step, logger=True, batch_size=self.batch_size)
 
-        if not torch.isfinite(total_loss).all():
-            print(f"[red] Loss is not finite. Setting to 1.")
-            total_loss = torch.tensor(1.0, device=self.device, requires_grad=True)
+        # Subclass-supplied auxiliary task losses (generic seam; base.py does not
+        # know what they are — e.g. PBRFNet's two-head max-ratio). Folded into
+        # the DB-MTL combine and then cleared.
+        for name, loss in self._extra_task_losses.items():
+            task_losses[name] = loss
+            self.log(f'{stage}_{name}_loss', loss.mean(), on_epoch=on_epoch, on_step=on_step, logger=True, batch_size=self.batch_size)
+        self._extra_task_losses = {}
+
+        if not task_losses:
+            return torch.zeros((), device=self.device, requires_grad=True)
+
+        # 3.7: monitor on the raw (positive, scale-meaningful) sum of task
+        # losses — NOT the DB-MTL surrogate. Used for checkpoint/early-stop.
+        raw_total = torch.stack([l.mean() for l in task_losses.values()]).sum()
+        self.log(f'{stage}_raw_loss', raw_total.detach(), on_epoch=on_epoch, on_step=on_step, logger=True, batch_size=self.batch_size)
+
+        # MTL ABLATION: with `_use_mtl=False` (YAML `training: mtl_balancing: false`) the task
+        # losses are combined by a plain EQUAL-WEIGHT sum — no DB-MTL loss-scale or
+        # gradient-magnitude balancing — so the effectiveness of the balancing can be scored
+        # against the default. The equal-weight gradient carrier IS the raw sum.
+        if not getattr(self, "_use_mtl", True):
+            self.log(f'{stage}_loss', raw_total.mean(), on_epoch=on_epoch, on_step=on_step, logger=True, batch_size=self.batch_size)
+            return raw_total.mean()
+
+        # DB-MTL surrogate: lives in log space, so its *value* can be negative.
+        # It is only meaningful as a gradient carrier.
+        surrogate = self._dbmtl_combine(task_losses, stage, on_step=on_step, on_epoch=on_epoch)
+
+        # Straight-through estimator: the returned scalar carries the DB-MTL
+        # surrogate's *gradient* but takes the *value* of the positive raw loss.
+        # This is essential — a negative log-space loss breaks Lightning's LR
+        # finder (its divergence test `loss > k * best_loss` misfires on negative
+        # losses), gradient/loss monitoring and checkpoint selection.
+        if torch.isfinite(surrogate).all():
+            total_loss = surrogate - surrogate.detach() + raw_total.detach()
+        else:
+            # Keep training alive on a non-finite surrogate, but make it observable
+            # (a silent swap would mask real divergence).
+            self._nonfinite_loss_count += 1
+            print(f"[red] Non-finite loss (event #{int(self._nonfinite_loss_count.item())}) — falling back to the raw loss to continue.")
+            self.log(f'{stage}_nonfinite_loss_count', self._nonfinite_loss_count, on_epoch=on_epoch, on_step=on_step, logger=True, batch_size=self.batch_size)
+            total_loss = raw_total if torch.isfinite(raw_total).all() else torch.tensor(1.0, device=self.device, requires_grad=True)
 
         self.log(f'{stage}_loss', total_loss.mean(), on_epoch=on_epoch, on_step=on_step, logger=True, batch_size=self.batch_size)
         return total_loss.mean()
 
     def training_step(self, batch: TrainingInputData, batch_idx):
         metrics = self.evaluate_forward(batch)
-        return self.process_metrics(metrics, "train")
-    
+        loss = self.process_metrics(metrics, "train")
+        # fp16 loss scaling: scale so the small HDR-flux-background gradients survive fp16's ~6e-8
+        # underflow floor through the deep backbone backward (no Trainer GradScaler on the self.half()
+        # path). The scale is undone when grads are transferred to the fp32 masters in
+        # `on_after_backward`, so the optimiser sees true-magnitude gradients. No-op in fp32.
+        if getattr(self, "_fp32_masters", None) is not None:
+            loss = loss * self._loss_scale
+        return loss
+
+    # ── fp16 fp32-master-weight runtime hooks ─────────────────────────────────
+    # The masters + loss scale are *created* by the optimizer behaviour
+    # (radfield3dnn/optim) at configure_optimizers time; these hooks drive them each step. All
+    # are no-ops when `_fp32_masters` is absent (fp32 training).
+    @torch.no_grad()
+    def _sync_masters_to_fp16(self):
+        masters = getattr(self, "_fp32_masters", None)
+        if not masters:
+            return
+        pdict = dict(self.named_parameters())
+        for name, master in masters.items():
+            pdict[name].copy_(master.to(pdict[name].dtype))
+
+    def on_train_batch_start(self, batch, batch_idx):
+        # Make the fp16 forward read the freshly Adam-updated fp32 masters.
+        self._sync_masters_to_fp16()
+
+    def on_after_backward(self):
+        # Transfer fp16 weight grads → fp32 master grads (cast to fp32, accumulate across micro-
+        # batches), undoing the loss scaling, then clear the fp16 grads so the optimiser (bound to the
+        # masters) doesn't orphan them. Fires before gradient clipping / the optimiser step.
+        masters = getattr(self, "_fp32_masters", None)
+        if not masters:
+            return
+        inv_scale = 1.0 / float(getattr(self, "_loss_scale", 1.0))
+        pdict = dict(self.named_parameters())
+        for name, master in masters.items():
+            g = pdict[name].grad
+            if g is None:
+                continue
+            gf = g.detach().to(torch.float32) * inv_scale
+            master.grad = gf.clone() if master.grad is None else master.grad.add_(gf)
+            pdict[name].grad = None
+
     def validation_step(self, batch: TrainingInputData, batch_idx):
-        metrics = self.evaluate_forward(batch)
-        return self.process_metrics(metrics, "val")
+        with torch.no_grad():
+            metrics = self.evaluate_forward(batch)
+            return self.process_metrics(metrics, "val")
     
     def test_step(self, batch: TrainingInputData, batch_idx):
-        metrics = self.evaluate_forward(batch)
-        return self.process_metrics(metrics, "test")
+        with torch.no_grad():
+            metrics = self.evaluate_forward(batch)
+            return self.process_metrics(metrics, "test")
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self._lr, fused=False, weight_decay=1e-4)

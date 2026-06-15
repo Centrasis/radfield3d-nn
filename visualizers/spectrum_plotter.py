@@ -1,6 +1,6 @@
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from radfield3dnn import RadiationFieldChannel, RadiationField
+from radfield3dnn.rftypes import RadiationFieldChannel, RadiationField
 from radfield3dnn.rfhelpers import InferenceHelper
 import torch
 from typing import Literal
