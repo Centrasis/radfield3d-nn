@@ -4,7 +4,7 @@
 // the metric range/unit of each beam parameter it generalises over, the output spectrum layout,
 // and lightweight training provenance. No I/O, no ONNX, no CUDA.
 //
-// Shared by the package format (rfnn::io::V1::ModelFactory, model_io.h) which writes/reads them,
+// Shared by the package format (rfnn::io::V1::ModelStore, model_io.h) which writes/reads them,
 // and by the runtime predictor (radfield3dnn::VolumeFieldPredictor, field_predictors.h) which
 // carries them once loaded — so this header sits below both and neither has to include the other.
 //

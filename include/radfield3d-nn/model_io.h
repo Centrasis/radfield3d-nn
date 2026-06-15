@@ -4,7 +4,7 @@
 //
 // Two factories, kept apart by namespace:
 //
-//   * rfnn::io::V1::ModelFactory — the main factory (the V1 RF3M format). Binds exported ONNX graphs
+//   * rfnn::io::V1::ModelStore — the main store (the V1 RF3M format). Binds exported ONNX graphs
 //                                to the RadFiled3D field geometry it predicts plus the model's
 //                                *validity domain* (parameter ranges + the physical meaning of
 //                                the normalised inputs/outputs, in metric units) and the test
@@ -15,7 +15,7 @@
 //                                tiny-cuda-nn / libtorch / CUDA dependency — lives in the deploy
 //                                lib (libRadField3DNNDeploy).
 //
-//   * rfnn::tcnn::ModelFactory — the legacy serialiser for the fused tcnn models
+//   * rfnn::tcnn::ModelFactory — the serialiser for the fused tcnn models
 //                                (encoder+predictor raw network_precision_t weights). Only built
 //                                with RFNN_WITH_TCNN; pulls in tiny-cuda-nn.
 //
@@ -69,7 +69,7 @@ inline constexpr const char* kTrunkGraph           = "trunk";             // con
 inline constexpr const char* kBeamEncoderGraph     = "beam_encoder";      // beam vector → latent
 inline constexpr const char* kGeometryEncoderGraph = "geometry_encoder";  // (future) geometry → latent
 
-class ModelFactory {
+class ModelStore {
 public:
     static constexpr char     kMagic[4] = {'R', 'F', '3', 'M'};
     static constexpr uint32_t kVersion  = 2;

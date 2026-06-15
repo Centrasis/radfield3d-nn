@@ -34,37 +34,17 @@ class SmoothingSpectra(DataProcessing):
         self.p = p
         self._dataset_multiplier = dataset_multiplier
 
-    def smooth_spectrum(self, spectrum: torch.Tensor, error: torch.Tensor = None) -> torch.Tensor:
+    def smooth_spectrum(self, spectrum: torch.Tensor) -> torch.Tensor:
         """1D Gaussian smoothing over the energy-bin axis of a per-voxel
         histogram.
 
-        Reduces bin-to-bin Monte Carlo discretisation noise within each
-        voxel's spectrum *without* mixing across voxels, so the
-        position-dependent spectrum shape the network is trying to learn
-        is preserved.
-
-        Accepts ``(C, D, H, W)`` or ``(B, C, D, H, W)``; C is the
-        histogram bin axis. Returns the same shape, unit-summed per
+        Accepts ``(C, D, H, W)`` or ``(B, C, D, H, W)``
+        Returns the same shape, unit-summed per
         voxel (boundary bins lose Gaussian-tail mass to the zero-pad,
         which the renormalise step fixes).
 
-        The previous implementation applied a 3D box filter across the
-        *spatial* axes per bin AND multiplied by ``1/error²`` weights
-        before the conv. On DS03 (where MC error anti-correlates with
-        flux at ρ ≈ −0.6) that effectively copied beam-core spectra
-        into scatter-halo voxels and destroyed the position→spectrum
-        mapping the spectrum head is trying to learn — observable as a
-        flat ``val_scatter_spectrum_loss`` plateau at ~0.218 in run
-        ``dg1k61rm``. The new implementation does the operation the
-        name and docstring originally promised: a 1D Gaussian over
-        the bin axis.
-
-        ``error`` is accepted for signature compatibility with the old
-        callers but ignored. A correct error-weighted variant would
-        use ``conv(spec * w) / conv(w)`` (proper inverse-variance
-        average), not the destructive ``spec * w`` pre-multiply the old
-        code used — that's a separate change to consider if you want
-        denoising sensitive to MC variance.
+        A 1D Gaussian over the bin axis only: it does not mix spectra across
+        spatial voxels, so the position→spectrum mapping is preserved.
         """
         assert spectrum.ndim in (4, 5), \
             f"Expected spectrum shape to be 4D or 5D, got {tuple(spectrum.shape)}"
@@ -130,7 +110,7 @@ class SmoothingSpectra(DataProcessing):
         if ch is None or ch.spectrum is None:
             return ch
         return RadiationFieldChannel(
-            spectrum=self.smooth_spectrum(ch.spectrum, ch.error),
+            spectrum=self.smooth_spectrum(ch.spectrum),
             flux=ch.flux,
             error=ch.error,
         )

@@ -136,12 +136,9 @@ namespace rfnn::tcnn {
         uint32_t d_model;
         size_t total_parameter_count = 0;
         // Static, configurable additive offset applied to the raw flux logit
-        // before the [0,1] hard clamp in the fused kernel. Replaces both the
-        // previous Sigmoid activation (which saturates) and the previously
-        // attempted learned `rfnn::tcnn::Bias` (which is now removed entirely —
-        // bias-less tcnn matmul + fixed offset is the new contract). Default
-        // 0.5 = codomain midpoint; setting to ~0.58 centers on the DS03
-        // joined-flux normalized data mean.
+        // before the [0,1] hard clamp in the fused kernel (bias-less tcnn matmul
+        // + fixed offset). Default 0.5 = codomain midpoint; raise it to centre on
+        // the joined-flux normalized data mean.
         float flux_offset;
         // 0 = hard clamp, 1 = SoftClip. See ctor doc.
         int flux_activation;

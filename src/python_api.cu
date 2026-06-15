@@ -87,8 +87,8 @@ class PBRFBeamEncoderPyImpl : public torch::nn::Module {
 
 
 // Python facade for SPERFBeamEncoder: distance-less variant for fixed-distance
-// datasets (DS02). Concatenates (direction, spectrum) into the single input
-// tensor the bridge expects.
+// datasets. Concatenates (direction, spectrum) into the single input tensor the
+// bridge expects.
 class SPERFBeamEncoderPyImpl : public torch::nn::Module {
     std::shared_ptr<SPERFBeamEncoderBridgeImpl> bridge;
 

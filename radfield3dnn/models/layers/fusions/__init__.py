@@ -1,8 +1,7 @@
 """Two-vector feature fusions (merge a main/location vector with a conditioning/beam vector).
 
 All concrete fusions share the FusionBase contract: forward(x, cond) -> y with dim(y) == dim(x),
-and are budgeted as one logical trunk layer each. See claude-notes/fusion-methods.html for the
-survey, citations, correctness review and recommendation.
+and are budgeted as one logical trunk layer each.
 """
 from .base import FusionBase
 from .film import FiLM, ResidualFiLM

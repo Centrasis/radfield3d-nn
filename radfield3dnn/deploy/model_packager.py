@@ -5,7 +5,7 @@ ranges of the beam parameters and the physical meaning, in metric units, of the 
 inputs/outputs), lightweight provenance and the test metrics — everything a deployment (e.g. UE5)
 needs to run the model and interpret its I/O without the training stack.
 
-The byte layout is owned by the C++ side `rfnn::io::V1::ModelFactory::save_to_memory`
+The byte layout is owned by the C++ side `rfnn::io::V1::ModelStore::save_to_memory`
 (include/radfield3d-nn/model_io.h / src/RadField3DNN/model_io.cpp) — the single source of truth.
 This module gathers the metadata (domain / provenance / metrics) and exports the ONNX graphs, then
 hands them to that serialiser through the `rfnn_deploy` python bindings, so the format is never
@@ -148,7 +148,6 @@ class ModelPackager:
                 print(f"[yellow]ModelPackager: two-graph export failed ({e}); using single trunk[/yellow]")
         return {"trunk": self._export_bytes(ModelExporter.onnx_export)}
 
-    # ── serialisation: delegate the byte layout to the C++ rfnn::io::V1::ModelFactory ─────────────
     def _rf3m_metadata(self):
         """Assemble the C++ ModelDomain/ModelProvenance from the gathered metadata + ONNX graphs.
         Imported lazily via the deploy loader (which preloads the matching ONNX Runtime), so merely

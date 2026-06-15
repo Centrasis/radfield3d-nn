@@ -11,8 +11,12 @@ except ImportError:
 
 # Real spherical-harmonics basis up to degree 4 (l = 0..3 → 16 coeffs)
 def _sh_components(d: Tensor, degree: int) -> Tensor:
-    x = d[..., 0]; y = d[..., 1]; z = d[..., 2]
-    x2 = x * x; y2 = y * y; z2 = z * z
+    x = d[..., 0]
+    y = d[..., 1]
+    z = d[..., 2]
+    x2 = x * x
+    y2 = y * y
+    z2 = z * z
     out = [torch.full_like(x, 0.28209479177387814)]
     if degree >= 2:
         out += [-0.48860251190291987 * y,

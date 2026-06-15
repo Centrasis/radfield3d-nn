@@ -11,7 +11,6 @@ from radfield3dnn.optim import OptimizerBehaviour, CosineWithWarmup
 from typing import Union, Literal
 from radfield3dnn.models.activations.flux_activations import GradientConservingClamping, SoftClip, LogitSigmoid
 from radfield3dnn.preprocessing.normalizations.linear import LinearNormalizer
-from radfield3dnn.preprocessing.normalizations.logscale import LogScaleNormalizer
 from radfield3dnn.preprocessing.normalizations.asinh import AsinhTonemapNormalizer
 from radfield3dnn.models.layers import FiLM, Concat, GatedFusion, ResidualFiLM, ConcatLinear, CrossAttentionFusion, TokenCrossAttentionFusion
 from radfield3dnn.preprocessing.normalizations.base import Normalizer
@@ -38,9 +37,8 @@ class RFNetBase(FeedforwardPointwiseModel):
                 nn.init.zeros_(module.bias)
 
     def _maybe_cast_to_precision(self):
-        # Init runs in fp32 then we round to fp16 — same contract bridge.inl
-        # uses for the tcnn fused side. Self.half() also casts encoding
-        # buffers (frequencies / SH coefficients) which is acceptable.
+        # Init runs in fp32, then round to fp16. self.half() also casts the encoding
+        # buffers (frequencies / SH coefficients), which is acceptable.
         if getattr(self, "_precision", "fp32") == "fp16":
             self.half()
 
@@ -76,7 +74,7 @@ class RFBackboneModel(nn.Module):
 
         # Location/direction encoders are built from self-contained ``{"type", **kwargs}`` dicts via the
         # encoder factory (each diverging encoder is its own class); a None dict falls back to the
-        # historic sinusoidal/spherical-harmonic defaults.
+        # default sinusoidal/spherical-harmonic encoders.
         if location_encoding_params is None:
             location_encoding_params = {"type": "sinusoidal", "pos_enc_dim": 10, "append_input": True}
         if direction_encoding_params is None:
@@ -99,8 +97,6 @@ class RFBackboneModel(nn.Module):
         self.activation_fn = nn.SiLU(inplace=True)
         self.configure_beam_encoding(conditioning, self.positional_direction_encoding.encoded_dims, self.d_model)
 
-        # xyz_decoder_skip was always False on every conditioning branch, so the
-        # decoder input is always d_model (dead branch removed).
         self.decoder_in_dim = d_model
 
         self.block1 = nn.Sequential(
@@ -137,13 +133,11 @@ class RFBackboneModel(nn.Module):
             nn.SiLU(True),
             nn.Linear(d_model // 2, self.out_spectra_dim)
         )
-        # Flux head bumped from 1 Linear → Linear+SiLU+Linear (one hidden).
         # Flux head depth = ``flux_head_hidden`` SiLU-separated hidden Linears before the scalar
         # projection. Default 1 (Linear+SiLU+Linear): the HDR flux distribution (~87% empty +
         # sharp peaks) is too non-linear for a single matrix-vector projection; one SiLU lets the
-        # head model the bimodal "beam present / not present" decision (mirrors the CPP
-        # flux_projector n_hidden_layers 0→1). ``flux_head_hidden=0`` reproduces the PUBLISHED
-        # single-Linear head (ablation C2).
+        # head model the bimodal "beam present / not present" decision. ``flux_head_hidden=0``
+        # gives a plain single-Linear head.
         _flux_layers: list[nn.Module] = []
         for _ in range(self._flux_head_hidden):
             _flux_layers += [nn.Linear(d_model, d_model), nn.SiLU(True)]
@@ -154,20 +148,16 @@ class RFBackboneModel(nn.Module):
         # Flux activations. The output-layer bias is decided by the chosen activation
         # (its `init_bias` = the pre-activation putting the initial output at the codomain
         # midpoint / max-gradient point); see apply_weights_init.
-        # Selectable flux activations (B-4):
-        #   "clamp"   — historic gradient-conserving hard clamp; matches the
-        #               normalizer's exact codomain endpoints. Suffers from
-        #               "predict 0 forever" lock-in once z is pushed below
-        #               the lower clamp (see handoff.md §3 B-4).
-        #   "softclip" — 0.5 * (tanh(z) + 1), smooth in (0,1) for the [0,1]
-        #               case. Avoids the lock-in because the gradient is
-        #               nonzero everywhere on R. Not valid for the [-1,1]
-        #               codomain (would map to (0,1)); the clamp variant is
-        #               selected automatically in that case with a warning.
-        #   "sigmoid"  — y = sigmoid(z), logit clamped (grad-conserving) to ±30. For HDR
-        #               linear0_1 targets: spans ~13 decades inside (0,1) so the crushed
-        #               scatter AND the peak are representable, with a recovery gradient
-        #               everywhere (no lock-in). Requires the (0,1) codomain.
+        # Selectable flux activations:
+        #   "clamp"   — gradient-conserving hard clamp matching the normalizer's codomain
+        #               endpoints. Can lock into "predict 0 forever" once z is pushed below
+        #               the lower clamp.
+        #   "softclip" — 0.5 * (tanh(z) + 1), smooth in (0,1). Avoids the lock-in (gradient
+        #               nonzero everywhere on R). Not valid for the [-1,1] codomain; falls
+        #               back to clamp there with a warning.
+        #   "sigmoid"  — y = sigmoid(z), logit clamped (grad-conserving) to ±30. Spans the
+        #               full (0,1) codomain so crushed scatter AND the peak stay representable
+        #               with a recovery gradient everywhere. Requires the (0,1) codomain.
         if flux_activation == "sigmoid":
             if issubclass(self._normalizer.__class__, LinearNormalizer) \
                     and self._normalizer.range == (0.0, 1.0):
@@ -189,10 +179,6 @@ class RFBackboneModel(nn.Module):
                 self.flux_activation = GradientConservingClamping(0.0, 1.0)
             else:
                 raise ValueError(f"Unsupported normalization range for LinearNormalizer: {self._normalizer.range}")
-        elif isinstance(self._normalizer, LogScaleNormalizer):
-            # Clamp down to the zero sentinel (not log_min) so the head can emit
-            # true-zero (occluded) voxels, matching the normalizer's zero_floor.
-            self.flux_activation = GradientConservingClamping(self._normalizer.zero_floor, self._normalizer.log_max)
         elif isinstance(self._normalizer, AsinhTonemapNormalizer):
             # asinh tonemap codomain is [0,1] (y = asinh(x/σ)/asinh(1/σ), bounded), so the head clamps
             # to [0,1] — same range as linear0_1, but the targets are tonemapped (HDR-spread). The
@@ -215,7 +201,6 @@ class RFBackboneModel(nn.Module):
     # Beam→trunk fusion registry: name -> factory(d_model, activation_fn) building one fusion that
     # merges a trunk feature (x) with the beam latent (cond), returning dim(x) (FusionBase contract).
     # Two of these become beam_conditioner1/2 in forward(); each counts as one logical trunk layer.
-    # See claude-notes/fusion-methods.html for the survey + measured authority/latency ranking.
     _FUSION_FACTORIES = {
         "FiLM":      lambda d, act: FiLM(d, d, non_linearity=act),
         "ResFiLM":   lambda d, act: ResidualFiLM(d, d, non_linearity=act),
@@ -357,7 +342,7 @@ class SRBFNet(RFNetBase):
         global_parameters = self.backbone_model.encode_additional_parameters(x)
         return super().forward2volume(x, voxel_counts, self.out_spectra_dim, mask=mask, global_parameters=global_parameters)
 
-    def __init__(self, d_model=256, out_spectra_dim=32, flux_loss="L1LogLoss", spectrum_loss="HistogramLoss", normalizer=None, precision: Literal["fp32", "fp16"] = "fp32", flux_activation: Literal["clamp", "softclip", "sigmoid"] = "clamp",
+    def __init__(self, d_model=256, out_spectra_dim=32, flux_loss="SMAPEBalanced", spectrum_loss="HistogramLoss", normalizer=None, precision: Literal["fp32", "fp16"] = "fp32", flux_activation: Literal["clamp", "softclip", "sigmoid"] = "clamp",
                  location_encoding_params: dict = None, direction_encoding_params: dict = None, conditioning_params: dict = None, training_params: dict = None, trunk_depth: int = 4, flux_head_hidden: int = 1):
         # Optimization/sampling knobs (learning_rate, max_lr, voxel-sampling flags) are folded into one
         # ``training_params`` dict; the individual values are unpacked here and threaded into the shared
@@ -431,13 +416,11 @@ class SRBFNet(RFNetBase):
                 nn.init.xavier_uniform_(out_linears[-1].weight, gain=1.0)
 
         # Flux OUTPUT bias is decided by the actual flux activation: each activation reports the
-        # pre-activation value (init_bias) that places the initial output at its codomain midpoint /
-        # maximum-gradient point — clamp(lo,hi) -> (lo+hi)/2, softclip -> 0 (output 0.5),
-        # sigmoid -> 0 (output 0.5). A zero bias on a clamp(0,1) head would start at the clamp
-        # FLOOR, where the peak-crushed scatter band gets no gradient -> predict-0 lock-in
-        # (verified in claude-notes/hdr-analysis/_init_test.py).
-        # Bias depends on the NORMALIZER: linear → just above the floor (anti-collapse), log-like →
-        # codomain midpoint (max gradient). See flux_activations.flux_head_init_bias.
+        # pre-activation value (init_bias) that places the initial output at its high-gradient
+        # point. A zero bias on a clamp(0,1) head would start at the clamp FLOOR, where the
+        # peak-crushed scatter band gets no gradient -> predict-0 lock-in. The exact value also
+        # depends on the NORMALIZER (linear → just above the floor; log-like → codomain midpoint);
+        # see flux_activations.flux_head_init_bias.
         flux_linears = [m for m in self.backbone_model.flux_decoder.modules() if isinstance(m, nn.Linear)]
         if flux_linears and flux_linears[-1].bias is not None:
             from radfield3dnn.models.activations.flux_activations import flux_head_init_bias
@@ -484,7 +467,7 @@ class SPERFNet(SRBFNet):
             super().__init__(d_model=d_model, out_spectra_dim=out_spectra_dim, normalizer=normalizer, conditioning_params=conditioning_params, precision=precision, flux_activation=flux_activation, location_encoding_params=location_encoding_params, direction_encoding_params=direction_encoding_params, trunk_depth=trunk_depth, flux_head_hidden=flux_head_hidden)
             # Spectrum encoder built from a self-contained ``{"type", **kwargs}`` dict via the spectra
             # factory; the chosen encoder exposes its output width as ``encoded_dims`` (``projector``
-            # keeps the raw-spectrum dim — the old use_spectra_encoding=False path; ``simple`` bottlenecks).
+            # keeps the raw-spectrum dim; ``simple`` bottlenecks).
             if spectra_encoding_params is None:
                 spectra_encoding_params = {"type": "projector", "in_spectra_dim": 150, "out_spectra_dim": 150}
             self._spectra_encoding_params = dict(spectra_encoding_params)
@@ -503,7 +486,7 @@ class SPERFNet(SRBFNet):
             beam_params = self.beam_encoder([dir_enc, spectrum])
             return beam_params
 
-    def __init__(self, d_model=256, out_spectra_dim=32, flux_loss="L1LogLoss", spectrum_loss="HistogramLoss", normalizer=None, precision: Literal["fp32", "fp16"] = "fp32", flux_activation: Literal["clamp", "softclip", "sigmoid"] = "clamp",
+    def __init__(self, d_model=256, out_spectra_dim=32, flux_loss="SMAPEBalanced", spectrum_loss="HistogramLoss", normalizer=None, precision: Literal["fp32", "fp16"] = "fp32", flux_activation: Literal["clamp", "softclip", "sigmoid"] = "clamp",
                  location_encoding_params: dict = None, direction_encoding_params: dict = None, spectra_encoding_params: dict = None, conditioning_params: dict = None, training_params: dict = None, trunk_depth: int = 4, flux_head_hidden: int = 1):
         super().__init__(
             d_model=d_model,
@@ -605,12 +588,12 @@ class PBRFNet(SPERFNet):
             beam = self.beam_encoder(enc)
             return beam
 
-    def __init__(self, d_model=256, out_spectra_dim=32, scalar_encoding_dims=16, flux_loss="L1LogLoss", spectrum_loss="HistogramLoss", normalizer=None, precision: Literal["fp32", "fp16"] = "fp32", flux_activation: Literal["clamp", "softclip", "sigmoid"] = "clamp",
+    def __init__(self, d_model=256, out_spectra_dim=32, scalar_encoding_dims=16, flux_loss="SMAPEBalanced", spectrum_loss="HistogramLoss", normalizer=None, precision: Literal["fp32", "fp16"] = "fp32", flux_activation: Literal["clamp", "softclip", "sigmoid"] = "clamp",
                  location_encoding_params: dict = None, direction_encoding_params: dict = None, spectra_encoding_params: dict = None, conditioning_params: dict = None, training_params: dict = None, trunk_depth: int = 4, flux_head_hidden: int = 1):
         if conditioning_params is None:
             conditioning_params = {"type": "None"}
         conditioning_params = dict(conditioning_params)
-        conditioning_params.setdefault("use_beam_shape", True)   # PBRFNet historically defaults beam-shape ON
+        conditioning_params.setdefault("use_beam_shape", False)
         super().__init__(d_model=d_model, out_spectra_dim=out_spectra_dim, flux_loss=flux_loss, spectrum_loss=spectrum_loss, training_params=training_params, conditioning_params=conditioning_params, normalizer=normalizer, precision=precision, flux_activation=flux_activation, location_encoding_params=location_encoding_params, direction_encoding_params=direction_encoding_params, spectra_encoding_params=spectra_encoding_params, trunk_depth=trunk_depth, flux_head_hidden=flux_head_hidden)
         self.scalar_encoding_dims = scalar_encoding_dims
         self.use_beam_shape = bool(conditioning_params.get("use_beam_shape", True))

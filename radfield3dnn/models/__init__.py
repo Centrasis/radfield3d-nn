@@ -6,17 +6,10 @@ import torch
 
 from radfield3dnn.preprocessing.normalizations import NormalizerConstructor
 from .base import BaseNeuralRadFieldModel
-from .cnn import *
 from .nerf import *
-from .hdr_net import *
-from .twohead_hdr import *
 from .nerf_cpp import *
 from .feedforward import *
-from .xattn_siren import *
 from .field_unet import *
-from .mlp import *
-from .pbrf_analytic import *
-from .pbrf_spectrum_residual import *
 from radfield3dnn.rftypes import PositionalInput
 from enum import Enum
 
@@ -57,10 +50,8 @@ class ModelConstructor:
         """Replace a string normalizer key in params with a Normalizer instance."""
         norm = params.get("normalizer")
         if isinstance(norm, str):
-            auto_tune = norm == "asinh_auto"
             params = dict(params)
             params["normalizer"] = NormalizerConstructor.construct_by_name(norm)
-            params["_asinh_auto"] = auto_tune
         return params
 
     @staticmethod
@@ -72,7 +63,6 @@ class ModelConstructor:
     @staticmethod
     def create_model_from_dict(config: dict) -> Type[BaseNeuralRadFieldModel]:
         params = ModelConstructor._resolve_normalizer(dict(config.get("parameters", {})))
-        params.pop("_asinh_auto", None)
         return ModelConstructor.create_model_with_defaults(config["model_name"], **params)
 
     @staticmethod
@@ -158,13 +148,20 @@ class ModelExporter:
         inp = model._generate_random_input(model.device)
         inp = getattr(inp, "input", inp)   # _generate_random_input may return a PositionalInput directly
         wrapped = _OnnxWrapper(model.get_core_model())
+        args = (inp.direction, inp.position, inp.spectrum,
+                inp.origin, inp.beam_shape_parameters,
+                inp.beam_shape_type, inp.geometry)
+        # Dynamic batch axis on every (non-None) input: a stored model must accept any batch size
+        # at inference. Without this dynamo freezes the traced example batch into the graph and the
+        # deployed ONNX rejects every other batch size.
+        batch = torch.export.Dim("batch")
+        dynamic_shapes = tuple({0: batch} if a is not None else None for a in args)
         torch.onnx.export(
             model=wrapped,
-            args=(inp.direction, inp.position, inp.spectrum,
-                  inp.origin, inp.beam_shape_parameters,
-                  inp.beam_shape_type, inp.geometry),
+            args=args,
             input_names=["direction", "position", "spectrum", "origin",
                          "beam_shape_parameters", "beam_shape_type", "geometry"],
+            dynamic_shapes=dynamic_shapes,
             dynamo=True,
         ).save(path)
 
@@ -187,7 +184,9 @@ class ModelExporter:
         inp = getattr(inp, "input", inp)
 
         class _BeamEnc(BaseNeuralRadFieldModel):
-            def __init__(self, d): super().__init__(); self._d = d
+            def __init__(self, d):
+                super().__init__()
+                self._d = d
             def forward(self, direction, distance, spectrum, beam_shape_parameters=None):
                 return self._d.encode_additional_parameters(PositionalInput(
                     direction=direction, origin=distance, spectrum=spectrum,
@@ -216,7 +215,9 @@ class ModelExporter:
             latent = core.encode_additional_parameters(inp)  # example [B, d_model]
 
         class _Trunk(BaseNeuralRadFieldModel):
-            def __init__(self, d): super().__init__(); self._d = d
+            def __init__(self, d):
+                super().__init__()
+                self._d = d
             def forward(self, position, latent):
                 return self._d.forward(PositionalInput(
                     direction=torch.zeros_like(position), origin=position[..., :1] * 0,

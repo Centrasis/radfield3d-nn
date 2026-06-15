@@ -7,10 +7,10 @@ C++ → Python mapping:
     radfield3dnn::BeamParameters            → BeamParameters
     radfield3dnn::EncodedBeam               → EncodedBeam
     radfield3dnn::ExecutionOptions          → ExecutionOptions
-    rfnn::io::V1::ModelFactory              → ModelFactory  (loads an RF3M STRAIGHT to a predictor)
+    rfnn::io::V1::ModelStore              → ModelStore  (loads an RF3M STRAIGHT to a predictor)
     rfnn::io::ModelDomain / ModelProvenance / BeamParameter / ParameterRange → metadata classes
 
-There is deliberately NO LoadedModel: ``ModelFactory.load(path)`` parses the RF3M container AND
+There is deliberately NO LoadedModel: ``ModelStore.load(path)`` parses the RF3M container AND
 builds the runnable predictor in one step, returning the :class:`VoxelFieldPredictor` (per-voxel
 models) or :class:`VolumeFieldPredictor` (field-wise models) directly, with the package metadata
 exposed as read-only properties (``.domain``, ``.provenance``, ``.metrics``, ``.graph_names``).
@@ -18,7 +18,7 @@ exposed as read-only properties (``.domain``, ``.provenance``, ``.metrics``, ``.
 Quick start::
 
     import rfnn_deploy as rd
-    pred = rd.ModelFactory.load("PBRFNet.rf3m")     # VoxelFieldPredictor | VolumeFieldPredictor
+    pred = rd.ModelStore.load("PBRFNet.rf3m")     # VoxelFieldPredictor | VolumeFieldPredictor
     pred.domain.beam_parameters                      # explore the model's input layout + ranges
     pred.metrics                                     # the stored test metrics
     beam = rd.BeamParameters(direction=[0,0,-1], origin=[0.5,0.5,0.5], spectrum=raw_tube_histogram)
@@ -119,10 +119,10 @@ class VolumeFieldPredictor:
     """Runs one exported ONNX trunk graph through ONNX Runtime. Field-wise models emit the whole
     D×H×W volume in a single Run(). Base of the predictor hierarchy.
 
-    When constructed by :meth:`ModelFactory.load`, the RF3M package metadata is attached:
+    When constructed by :meth:`ModelStore.load`, the RF3M package metadata is attached:
     ``domain`` / ``provenance`` / ``metrics`` / ``graph_names``.
     """
-    # package metadata (present when loaded via ModelFactory)
+    # package metadata (present when loaded via ModelStore)
     domain: ModelDomain
     provenance: ModelProvenance
     metrics: Mapping[str, float]
@@ -159,8 +159,8 @@ class VoxelFieldPredictor(VolumeFieldPredictor):
         """Query arbitrary points. ``positions``: (N,3) float32 in [0,1]³ (zero-copy bind)."""
         ...
 
-# ── factory (rfnn::io::V1::ModelFactory) ────────────────────────────────────────────
-class ModelFactory:
+# ── factory (rfnn::io::V1::ModelStore) ────────────────────────────────────────────
+class ModelStore:
     """Loads an RF3M model package STRAIGHT to the runnable predictor; the byte layout's single
     source of truth on the save side (used by the Python ModelPackager)."""
     @staticmethod

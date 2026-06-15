@@ -72,10 +72,8 @@ class CosineWithWarmup(OptimizerBehaviour):
                 pass
             return 1
 
-        # Warmup shortened 1000 -> 200 steps: the 1000-step ramp ate ~16 epochs at 100ep / ~8 at
-        # 1024-field epochs before cosine even started, wasting early budget (see experiments.md:
-        # the late "asymptote" was partly the LR freezing, not convergence). 200 steps still
-        # stabilises the FiLM/frequency-encoding start without stalling learning.
+        # A short warmup (~200 steps) stabilises the FiLM/frequency-encoding start without eating
+        # into the budget before cosine decay begins.
         default_warmup_steps = 200
         warmup_lr = 1e-5
         total_opt_steps = int(model.trainer.estimated_stepping_batches)

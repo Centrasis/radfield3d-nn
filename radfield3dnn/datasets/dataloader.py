@@ -47,7 +47,7 @@ class RadiationFieldDataModule(pl.LightningDataModule):
             on_dataset_created=set_augmentations
         )
 
-        # Optional field-count cap for fast iteration / coverage ablations. Subsample the file list
+        # Optional field-count cap for fast iteration. Subsample the file list
         # (seeded deterministically by the run's global seed) and re-split into train/val/test, so a
         # reduced run still has held-out fields drawn from the same beam-parameter coverage.
         if max_fields is not None and max_fields < len(self._dataloader_builder.file_paths):

@@ -25,7 +25,7 @@ from torch import optim, nn
 from torch.utils.data import Dataset, DataLoader
 
 from radfield3dnn.models.nerf_cpp import PBRFNetCPP
-from radfield3dnn.preprocessing.normalizations import LinearNormalizer, LogScaleNormalizer
+from radfield3dnn.preprocessing.normalizations import LinearNormalizer
 from radfield3dnn.rftypes import PositionalInput, TrainingInputData
 from RadFiled3D.pytorch.types import RadiationFieldChannel
 import lightning.pytorch as pl
@@ -162,12 +162,6 @@ def test_pbrfnetcpp_gradients_reach_all_params():
     named = list(m.named_parameters())
     assert len(named) >= 2, f"expected at least encoder + model weights, got {len(named)}"
 
-    # Skip the Kendall & Gal 2018 multitask uncertainty scalars and the
-    # per-field ratio head: they are part of the multitask / ratio loss
-    # paths in BaseNeuralRadFieldModel.process_metrics, not of the raw
-    # `flux.mean() + spectrum.mean()` test loss path, so they legitimately
-    # receive no gradient here. The intent of this test is to verify
-    # gradient flow into the C++ encoder and model bridges.
     grad_norms = {}
     for name, p in named:
         if not p.requires_grad:

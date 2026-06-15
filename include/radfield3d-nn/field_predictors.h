@@ -15,8 +15,6 @@
 //
 // Output layout matches the trained models: flux is the joined per-voxel relative flux; spectrum
 // is the per-voxel histogram (n_bins, default 32).
-//
-// (Class formerly named TrainedModel; the file keeps its name.)
 
 #include <array>
 #include <map>
@@ -105,13 +103,13 @@ public:
     // itself (e.g. "distance" in metres, "opening_angle" in degrees) — are clipped to this range and
     // linearly mapped to [0,1] before encoding, matching the training-time BeamParametersNormalization.
     // Self-normalised inputs (the "direction" unit vector, the "spectrum" histogram) are left untouched.
-    // rfnn::io::V1::ModelFactory::load() calls this for every domain parameter; without it, metric
+    // rfnn::io::V1::ModelStore::load() calls this for every domain parameter; without it, metric
     // inputs reach the graph un-normalised and the prediction is wrong (the deployed beam latent does
     // not match training).
     void set_parameter_range(const std::string& name, float min, float max);
 
     // ── RF3M package metadata ───────────────────────────────────────────────────────────────────
-    // Populated by rfnn::io::V1::ModelFactory::load[/_from_memory] from the package the predictor
+    // Populated by rfnn::io::V1::ModelStore::load[/_from_memory] from the package the predictor
     // was loaded from (so the factory returns the runnable predictor directly, carrying its own
     // domain/provenance/metrics + the names of the graphs it was composed from). A predictor built
     // straight from a bare ONNX path/buffer leaves these empty. The factory is the only writer.

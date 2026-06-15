@@ -9,7 +9,7 @@
 #include <stdexcept>
 #include <vector>
 
-// rfnn::ModelFactory — the deployment-side ONNX package factory. See model_io.h for the
+// rfnn::ModelStore — the deployment-side ONNX package factory. See model_io.h for the
 // authoritative RF3M container layout (this file is the format's reference implementation).
 // load() both parses the container AND assembles the runnable predictor; it does so only through
 // the predictor's PUBLIC declared API (ctors / set_parameter_range / is_voxelwise), so this TU
@@ -73,7 +73,7 @@ ModelDomain get_domain(std::istream& is) {
 
 }  // namespace
 
-std::vector<uint8_t> ModelFactory::save_to_memory(const NamedGraphs& graphs,
+std::vector<uint8_t> ModelStore::save_to_memory(const NamedGraphs& graphs,
                                                   const ModelDomain& domain,
                                                   const ModelProvenance& provenance,
                                                   const std::map<std::string, float>& metrics) {
@@ -96,7 +96,7 @@ std::vector<uint8_t> ModelFactory::save_to_memory(const NamedGraphs& graphs,
     return std::vector<uint8_t>(s.begin(), s.end());
 }
 
-void ModelFactory::save(const std::string& path,
+void ModelStore::save(const std::string& path,
                         const NamedGraphs& graphs,
                         const ModelDomain& domain,
                         const ModelProvenance& provenance,
@@ -109,7 +109,7 @@ void ModelFactory::save(const std::string& path,
 }
 
 std::unique_ptr<radfield3dnn::VolumeFieldPredictor>
-ModelFactory::load_from_memory(const void* bytes, size_t n, bool use_cuda) {
+ModelStore::load_from_memory(const void* bytes, size_t n, bool use_cuda) {
     const std::string buf(static_cast<const char*>(bytes), n);
     std::istringstream is(buf, std::ios::binary);
 
@@ -194,7 +194,7 @@ ModelFactory::load_from_memory(const void* bytes, size_t n, bool use_cuda) {
 }
 
 std::unique_ptr<radfield3dnn::VolumeFieldPredictor>
-ModelFactory::load(const std::string& path, bool use_cuda) {
+ModelStore::load(const std::string& path, bool use_cuda) {
     std::ifstream is(path, std::ios::binary | std::ios::ate);
     if (!is) throw std::runtime_error("model_io: cannot open '" + path + "'");
     const std::streamsize n = is.tellg();

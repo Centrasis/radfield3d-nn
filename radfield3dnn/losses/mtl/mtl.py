@@ -57,13 +57,11 @@ class MultiTaskLossBalancer(nn.Module):
                 slowly, so this keeps full DB-MTL balancing at ~1/N the cost (the per-
                 task `autograd.grad` was N_tasks extra full-network backwards/step).
             loss_floor: GRADIENT guard for the log transform. ``∇ log L = (1/L)·∇L``
-                amplifies a task's gradient by 1/L, unbounded as the task is solved
-                (at the old eps=1e-8 numerical floor that is up to 1e8×). Step 2's
-                EMA+clamp guards bound the *relative* weights, but the **step-1-only
-                path had no guard at all**. Clamping the loss at ``loss_floor`` before
-                the log bounds the amplification at 1/loss_floor and — because clamp
-                kills the gradient below the floor — stops pushing a task once it is
-                solved past the floor (correct behaviour: a solved task should release
+                amplifies a task's gradient by 1/L, unbounded as the task is solved.
+                Clamping the loss at ``loss_floor`` before the log bounds the
+                amplification at 1/loss_floor and — because clamp kills the gradient
+                below the floor — stops pushing a task once it is solved past the floor
+                (correct behaviour: a solved task should release
                 the shared trunk, not dominate it).
         """
         super().__init__()

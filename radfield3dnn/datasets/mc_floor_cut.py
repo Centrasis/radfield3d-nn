@@ -1,11 +1,11 @@
 """MCFloorCut — remove the Monte-Carlo low-dose noise floor from the GT.
 
 A simulated field has a near-zero MC noise floor in ~99% of voxels (the direct beam
-is nonzero in 98.6% of DS03 voxels purely from MC scatter/leakage). Training on that
+is nonzero in nearly all voxels purely from MC scatter/leakage). Training on that
 floor wastes capacity on noise and lets the diffuse background dominate the loss, which
 suppresses the high-dose structure the air-kerma metric rewards. Zeroing every voxel
-below a small fraction of the per-field peak removes the floor while keeping >99% of the
-physical flux (DS03: rel=1e-3 keeps 99.0% of the flux in 8.5% of voxels).
+below a small fraction of the per-field peak removes the floor while keeping the bulk of
+the physical flux (e.g. rel=1e-3 keeps ~99% of the flux in a small fraction of voxels).
 
 The two channels have very different dynamic range, so the threshold is PER-CHANNEL:
 the **scatter** field is diffuse and low-DR (peak ~2e-3, ~100% of voxels within 1e-4 of
@@ -47,11 +47,11 @@ class MCFloorCut(DataProcessing):
         self.beam_rel = float(beam_rel)
         self.scatter_lo = float(scatter_lo)
         # Error-based mode: zero each channel where its per-voxel MC error flags the voxel
-        # as noise-dominated (error >= error_threshold; the DS03 error field is ~binary {0,1}).
+        # as noise-dominated (error >= error_threshold; the error field is ~binary {0,1}).
         # This is data-adaptive — the dropped fraction is whatever is genuinely noise-dominated
-        # per field (scatter ~8.8%, direct ~94.6% leakage floor). After ChannelsJoin a voxel
-        # only vanishes if it is noise in BOTH channels (~8% on DS03), so the joined target keeps
-        # >=~80% of voxels automatically while stripping the MC floor where it truly dominates.
+        # per field. After ChannelsJoin a voxel only vanishes if it is noise in BOTH channels,
+        # so the joined target keeps most voxels automatically while stripping the MC floor where
+        # it truly dominates.
         self.use_error = bool(use_error)
         self.error_threshold = float(error_threshold)
 

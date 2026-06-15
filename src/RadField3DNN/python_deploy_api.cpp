@@ -1,10 +1,10 @@
-// Python bindings for the DEPLOYMENT runtime (rfnn::io::V1::ModelFactory + the ONNX field
+// Python bindings for the DEPLOYMENT runtime (rfnn::io::V1::ModelStore + the ONNX field
 // predictors). No CUDA / torch / tcnn dependency — this is the pure ONNX-Runtime half, so a
 // trained RF3M package can be loaded and executed from Python exactly as the C++ deployment
 // would run it (the Python-side test of the deploy path).
 //
 //   import rfnn_deploy
-//   pred = rfnn_deploy.ModelFactory.load("PBRFNet.rf3m") # RF3M -> runnable predictor (Voxel|Volume)
+//   pred = rfnn_deploy.ModelStore.load("PBRFNet.rf3m") # RF3M -> runnable predictor (Voxel|Volume)
 //   pred.domain, pred.metrics, pred.graph_names          # package metadata, carried on the predictor
 //   out  = pred.predict_volume(beam, (48,48,48))         # -> dict(flux=np[D,H,W], spectrum=np[D,H,W,B])
 //   enc  = pred.encode_beam(beam)                        # voxel models: beam latent (cached)
@@ -91,7 +91,7 @@ PYBIND11_MODULE(rfnn_deploy, m) {
         .value("VolumeField", PredictorType::VolumeField)
         .value("VoxelField", PredictorType::VoxelField);
 
-    // The package metadata is carried ON the predictor (set by ModelFactory::load), exposed as
+    // The package metadata is carried ON the predictor (set by ModelStore::load), exposed as
     // read-only properties .domain / .provenance / .metrics / .graph_names (inherited by
     // VoxelFieldPredictor). dynamic_attr stays so callers may still attach their own attributes.
     py::class_<VolumeFieldPredictor, std::shared_ptr<VolumeFieldPredictor>>(m, "VolumeFieldPredictor", py::dynamic_attr())
@@ -132,7 +132,7 @@ PYBIND11_MODULE(rfnn_deploy, m) {
              py::arg("positions"), py::arg("encoded_beam"));
 
     // ── RF3M container (rfnn::io::V1) ────────────────────────────────────────
-    using rfnn::io::V1::ModelFactory;
+    using rfnn::io::V1::ModelStore;
 
     // Read/WRITE + constructible: these double as the SAVE-side metadata builders, so the Python
     // packager assembles a domain/provenance here and the bytes are produced by the SAME C++
@@ -168,19 +168,19 @@ PYBIND11_MODULE(rfnn_deploy, m) {
         .def_readwrite("software_version", &rfnn::io::ModelProvenance::software_version)
         .def_readwrite("physics", &rfnn::io::ModelProvenance::physics);
 
-    // ── ModelFactory: parses an RF3M package AND builds the runnable predictor in one call (no
+    // ── ModelStore: parses an RF3M package AND builds the runnable predictor in one call (no
     //    LoadedModel handle). pybind transfers the returned unique_ptr into the shared_ptr holder
     //    and downcasts a per-voxel model to VoxelFieldPredictor automatically; the package metadata
     //    rides along as the predictor's `.domain` / `.provenance` / `.metrics` / `.graph_names`. ──
-    py::class_<ModelFactory>(m, "ModelFactory")
-        .def_static("load", &ModelFactory::load,
+    py::class_<ModelStore>(m, "ModelStore")
+        .def_static("load", &ModelStore::load,
                     py::arg("path"), py::arg("use_cuda") = false,
                     "Load an RF3M package and return the runnable predictor "
                     "(VoxelFieldPredictor for per-voxel models, VolumeFieldPredictor for field-wise).")
         .def_static("load_from_memory",
                     [](py::bytes data, bool use_cuda) {
                         std::string s = data;
-                        return ModelFactory::load_from_memory(s.data(), s.size(), use_cuda);
+                        return ModelStore::load_from_memory(s.data(), s.size(), use_cuda);
                     },
                     py::arg("data"), py::arg("use_cuda") = false);
 
@@ -199,7 +199,7 @@ PYBIND11_MODULE(rfnn_deploy, m) {
           [to_named_graphs](const py::dict& graphs, const rfnn::io::ModelDomain& domain,
                             const rfnn::io::ModelProvenance& prov,
                             const std::map<std::string, float>& metrics) {
-              auto bytes = ModelFactory::save_to_memory(to_named_graphs(graphs), domain, prov, metrics);
+              auto bytes = ModelStore::save_to_memory(to_named_graphs(graphs), domain, prov, metrics);
               return py::bytes(reinterpret_cast<const char*>(bytes.data()), bytes.size());
           },
           py::arg("graphs"), py::arg("domain"), py::arg("provenance"), py::arg("metrics"),
@@ -208,7 +208,7 @@ PYBIND11_MODULE(rfnn_deploy, m) {
           [to_named_graphs](const std::string& path, const py::dict& graphs,
                             const rfnn::io::ModelDomain& domain, const rfnn::io::ModelProvenance& prov,
                             const std::map<std::string, float>& metrics) {
-              ModelFactory::save(path, to_named_graphs(graphs), domain, prov, metrics);
+              ModelStore::save(path, to_named_graphs(graphs), domain, prov, metrics);
           },
           py::arg("path"), py::arg("graphs"), py::arg("domain"), py::arg("provenance"), py::arg("metrics"),
           "Write an RF3M package straight to disk.");

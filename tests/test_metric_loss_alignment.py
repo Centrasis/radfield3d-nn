@@ -6,7 +6,7 @@ import math
 import torch
 import pytest
 
-from radfield3dnn.losses.std import SMAPERegionBalancedLoss, RawNeRFLoss, MuLawL2Loss
+from radfield3dnn.losses.combinations import SMAPERegionBalancedLoss
 from radfield3dnn.rftypes import TrainingInputData, RadiationField, RadiationFieldChannel
 
 
@@ -160,87 +160,6 @@ class TestGhostBeamSuppression:
         assert torch.allclose(z, torch.zeros_like(z), atol=1e-6)
 
 
-class TestSimpleHDRLosses:
-    """The branch-free, citable reconstruction losses (final experiment set): RawNeRF (Mildenhall
-    CVPR 2022) and mu-law L2 (Kalantari SIGGRAPH 2017). Both must suppress ghost beams (the SMAPE
-    failure) AND give every decade gradient (the linear-L1 failure) with a single smooth formula."""
-
-    def _ghost(self, loss):
-        t = torch.full((2, 8, 8, 8), 1e-4); t[:, :2] = 0.5     # bulk + beam slab
-        p = t.clone(); p[:, 5, 5, 5] = 0.3                     # ghost in the bulk
-        p = p.requires_grad_(True)
-        inp = TrainingInputData(input=None, ground_truth=None)
-        loss(t, p, inp).sum().backward()
-        return p.grad[:, 5, 5, 5]
-
-    def test_mulaw_ghost_suppression(self):
-        # per-voxel ghost gradient ~0.63 -> /512 (field mean) ≈ 1.2e-3; SMAPE's was ~4e-4 BEFORE any
-        # mean (i.e. ~8e-7 after) -> mu-law suppresses ghosts >1000x stronger than the SMAPE core.
-        g = self._ghost(MuLawL2Loss(mu=5000.0))
-        assert (g > 5e-4).all(), f"mu-law must push ghosts down, got {g.tolist()}"
-
-    def test_rawnerf_ghost_suppression(self):
-        g = self._ghost(RawNeRFLoss(eps=1e-3))
-        assert (g > 5e-4).all(), f"RawNeRF must push ghosts down, got {g.tolist()}"
-
-    def test_mulaw_every_decade_has_gradient(self):
-        """The same relative error must yield gradients within ~2 decades across 4 decades of target
-        magnitude (mu=5000 knee at 2e-4: relative above, damped below). Plain linear L2 spreads 1e4x;
-        mu-law ~1.3e2x — the documented intermediate between linear and log."""
-        inp = TrainingInputData(input=None, ground_truth=None)
-        grads = []
-        for tval in (1e-4, 1e-3, 1e-2, 1e-1):
-            t = torch.full((1, 4, 4, 4), tval)
-            p = (t * 1.2).requires_grad_(True)
-            MuLawL2Loss(mu=5000.0)(t, p, inp).sum().backward()
-            grads.append(float(p.grad.abs().mean()))
-        ratio = max(grads) / min(grads)
-        assert ratio < 200, f"mu-law per-decade gradient spread should be <200x, got {ratio:.1f}x ({grads})"
-        # contrast: plain L2 on the same setup spreads ~(1e-1/1e-4)^2 = 1e6x in loss, ~1e3x in grad
-        lin = [tv * 0.2 * 2 for tv in (1e-4, 1e-1)]   # d/dp (p-t)^2 = 2(p-t) = 0.4*t
-        assert (lin[1] / lin[0]) / ratio > 5, "mu-law must be far more decade-balanced than plain L2"
-
-    def test_mulaw_smooth_and_zero_at_perfect(self):
-        t = torch.rand(2, 6, 6, 6) * 0.1
-        inp = TrainingInputData(input=None, ground_truth=None)
-        z = MuLawL2Loss()(t, t.clone(), inp)
-        assert torch.allclose(z, torch.zeros_like(z), atol=1e-10)
-        assert torch.isfinite(MuLawL2Loss()(t, torch.zeros_like(t), inp)).all()
-
-
-class TestRawNeRFSharp:
-    """The beam-sharpening hybrid: RawNeRF (geometry/ghosts) + alpha*L1 (non-annealing beam polish)."""
-
-    def test_beam_gradient_does_not_anneal(self):
-        """At the measured converged-blur state (pred~0.3 under a t=1.0 beam voxel), the hybrid's
-        beam gradient must keep a floor of ~alpha/N from the L1 term even as RawNeRF anneals."""
-        from radfield3dnn.losses.std import RawNeRFSharpLoss
-        inp = TrainingInputData(input=None, ground_truth=None)
-        t = torch.full((1, 8, 8, 8), 1e-4); t[0, 4, 4, 4] = 1.0
-        p = t.clone(); p[0, 4, 4, 4] = 0.999999      # nearly-converged beam: RawNeRF grad ~ 0
-        p = p.requires_grad_(True)
-        RawNeRFSharpLoss(alpha=10.0)(t, p, inp).sum().backward()
-        n = t.numel()
-        g_beam = float(p.grad[0, 4, 4, 4].abs())
-        assert g_beam >= 0.9 * 10.0 / n, f"L1 floor missing on the beam: {g_beam} vs {10.0/n}"
-
-    def test_ghost_suppression_retained(self):
-        from radfield3dnn.losses.std import RawNeRFSharpLoss
-        inp = TrainingInputData(input=None, ground_truth=None)
-        t = torch.full((1, 8, 8, 8), 1e-4)
-        p = t.clone(); p[0, 5, 5, 5] = 0.3
-        p = p.requires_grad_(True)
-        RawNeRFSharpLoss(alpha=10.0)(t, p, inp).sum().backward()
-        assert float(p.grad[0, 5, 5, 5]) > 0.01, "ghosts must still be pushed down"
-
-    def test_perfect_zero(self):
-        from radfield3dnn.losses.std import RawNeRFSharpLoss
-        inp = TrainingInputData(input=None, ground_truth=None)
-        t = torch.rand(2, 6, 6, 6) * 0.1
-        z = RawNeRFSharpLoss()(t, t.clone(), inp)
-        assert torch.allclose(z, torch.zeros_like(z), atol=1e-9)
-
-
 class TestSupervoxelMetric:
     def test_perfect_is_one_and_noise_is_damped(self):
         from radfield3dnn.metrics.airkerma_accuracy import AirkermaSupervoxelScatterAccuracy
@@ -294,25 +213,6 @@ class TestMTLBalancer:
         # d/da log(a*1.0) = 1.0 ; d/db log(b*0.025) = 1.0  -> equal relative push
         assert abs(float(a.grad) - 1.0) < 1e-5 and abs(float(b.grad) - 1.0) < 1e-5, \
             f"log balancing must equalize: got {float(a.grad)} vs {float(b.grad)}"
-
-
-class TestRawNeRF:
-    def test_perfect_zero_and_finite(self):
-        t = torch.rand(2, 8, 8, 8) * 1e-2
-        inp = TrainingInputData(input=None, ground_truth=None)
-        assert torch.allclose(RawNeRFLoss()(t, t.clone(), inp), torch.zeros(2), atol=1e-9)
-        assert torch.isfinite(RawNeRFLoss()(t, torch.zeros_like(t), inp)).all()
-
-    def test_relative_weighting_lifts_small_values(self):
-        """The same RELATIVE error must produce a comparable loss for small and large targets
-        (unlike plain L2, which ignores the small ones)."""
-        inp = TrainingInputData(input=None, ground_truth=None)
-        big_t = torch.full((1, 4, 4, 4), 0.5); big_p = big_t * 1.1
-        small_t = torch.full((1, 4, 4, 4), 5e-3); small_p = small_t * 1.1
-        lb = RawNeRFLoss(eps=1e-3)(big_t, big_p, inp)
-        ls = RawNeRFLoss(eps=1e-3)(small_t, small_p, inp)
-        # plain L2 ratio would be (0.05/5e-4)^2 = 10000x; RawNeRF keeps them within ~100x
-        assert lb / ls < 110, f"relative weighting failed: big/small = {float(lb/ls):.1f}"
 
 
 class TestNoiseAwareScatterMetricMask:

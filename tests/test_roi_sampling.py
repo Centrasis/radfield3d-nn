@@ -4,7 +4,7 @@ equalisation + -inf handling) and the ROIbasedSampler (keep beam, sample scatter
 import torch
 
 from radfield3dnn.roi import compute_roi_masks, BEAM_REL_DEFAULT, SCATTER_LO_DEFAULT
-from radfield3dnn.losses.std import TwoROIGammaLoss
+from radfield3dnn.losses.combinations import TwoROIGammaLoss
 from radfield3dnn.preprocessing.augmentations.roi_sampling import ROIbasedSampler
 from radfield3dnn.rftypes import TrainingInputData, RadiationField, RadiationFieldChannel
 

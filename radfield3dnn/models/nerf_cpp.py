@@ -76,9 +76,8 @@ class _TcnnModule(nn.Module):
         # `<T, PARAMS_T>` split (fp32 state, fp16 params): updates smaller
         # than fp16 ULP (~1e-3 near 1.0) accumulate in fp32 across many
         # steps until they cross a fp16 ULP boundary, then bump the fp16
-        # weight by one ULP. Without this, ~56% of Adam's small-magnitude
-        # updates round to 0 in fp16 state (documented in
-        # pbrfnetcpp-nan-status.md 2026-05-18). Memory cost: one extra fp32
+        # weight by one ULP. Without this, a large fraction of Adam's small-magnitude
+        # updates round to 0 in fp16 state. Memory cost: one extra fp32
         # tensor of the same numel — for PBRFNetCPP that's +1.22 MB per
         # `_TcnnModule`, negligible vs the fused fwd_ctx / batch buffers.
         master = cpp.weights.detach().clone().to(torch.float32)
@@ -155,15 +154,11 @@ class PBRFNetCPP(RFNetBase):
     def mtl_gradient_balancing(self) -> bool:
         """Enable DB-MTL gradient-magnitude balancing (step 2) for the fused model.
 
-        Previously disabled on the assumption that a per-task ``autograd.grad``
-        through the fused C++ autograd Function is "not re-entrant". That was
-        WRONG: the bridge backward supports ``retain_graph`` and multiple
-        per-task ``autograd.grad`` calls work fine (verified 2026-06-05). With
-        balancing off, the flux and spectrum tasks share the trunk at fixed 1.0
-        weights; the spectrum task (easy, beam-driven) dominates the shared
-        update and starves the hard spatial flux task — the cpp capped ~0.26
-        while a DB-MTL-balanced pure-Python twin reaches ~0.86 (see
-        claude-notes/summary.md).
+        The bridge backward supports ``retain_graph`` and multiple per-task
+        ``autograd.grad`` calls, so DB-MTL balancing is enabled. Without it the
+        flux and spectrum tasks share the trunk at fixed 1.0 weights and the
+        easy, beam-driven spectrum task dominates the shared update, starving the
+        hard spatial flux task.
 
         The balance target is the fused ``model``/``encoder`` weights
         (`_shared_parameters`); `output_head_markers` is empty so the whole fused
@@ -174,41 +169,13 @@ class PBRFNetCPP(RFNetBase):
 
     def __init__(self, location_encoding_dims=10, in_spectra_dim=32, d_model=256, flux_loss="L1Loss", spectrum_loss="HistogramLoss", learning_rate: float=1e-3, randomize_voxel_location_in_training: bool = True, voxels_centered_around_origin: bool = True, normalizer=None, seed: int = 1337, max_lr: float = 1e-3, flux_offset: float = 0.5, flux_activation: str = "clamp", location_encoding_kind: str = "frequency", flux_clamp_min: float = 0.0, flux_clamp_max: float = 1.0, trunk_hidden_layers: int = 1, beam_fusion: str = "film"):
         # Single-head model: one joined flux head + a joined spectrum head.
-        # flux_clamp_min/max: codomain of the hard-clamp flux activation.
-        # Defaults (0, 1) reproduce historic behavior. For real log-space
-        # training paired with the LogScaleNormalizer, use
-        #     normalizer="log_scale", flux_activation="clamp",
-        #     flux_clamp_min=-9.0, flux_clamp_max=0.0, flux_offset=-4.5
-        # The clamp range [-9, 0] matches LogScaleNormalizer's full output
-        # domain (zero sentinel at -9, log10 of [1e-8, 1.0] in [-8, 0]). With
-        # this setup, prefer flux_loss="L1Loss" — the log step is now in the
-        # data, so an additional log inside the loss would double-log.
-        # Lightning's save_hyperparameters(ignore=[... "normalizer"]) in
-        # BaseNeuralRadFieldModel drops `normalizer` from the checkpoint
-        # hparams, so LightningModule.load_from_checkpoint reconstructs us with
-        # normalizer=None and the base ctor's isinstance(Normalizer) assert
-        # fails -> stored models could not be loaded back. Coerce here: a name
-        # string is constructed (base already does this too) and None falls
-        # back to the project default ("log_decade") so headless / checkpoint
-        # reload works.
-        #
-        # log_decade -> LogDecadeNormalizer((0,1), x_min=1e-8, x_max=1.0): a
-        # fixed base-10 *decade* map giving every decade an equal slice of
-        # (0,1). The HDR flux field spans ~8 decades with ~99% near-zero
-        # voxels; under FP16 a linear map sends 1e-8 -> 1e-8 which underflows
-        # to 0 (Sigmoid can't emit it -> predicts ~0 everywhere, SSIM~0,
-        # NCC<0 — observed), and log_1e+5's log1p(x*1e5) is ~linear for
-        # x<<1e-5 so it crushes the 1e-8..1e-7 tail into the FP16 floor. The
-        # decade map keeps FP16's ~constant relative mantissa step ->
-        # ~constant relative error (~1%) across the whole range incl. ~1.0.
-        # Subclasses LinearNormalizer with range (0,1), so the Sigmoid flux
-        # head below already matches its output range.
+        # flux_clamp_min/max: codomain of the hard-clamp flux activation; the (0, 1) defaults match
+        # the linear0_1 normalizer below. Lightning's save_hyperparameters(ignore=[... "normalizer"])
+        # drops `normalizer` from the checkpoint hparams, so load_from_checkpoint reconstructs us with
+        # normalizer=None; coerce here (a name string is constructed, None falls back to the default)
+        # so headless / checkpoint reload works.
         if normalizer is None:
-            # LogDecadeNormalizer was removed in the clean repo; `log_scale`
-            # (LogScaleNormalizer, log10 of [1e-8, 1] with a zero sentinel at
-            # -9) is the supported HDR default and pairs with this model's
-            # log-space flux activation (see the clamp/offset note above).
-            normalizer = NormalizerConstructor.construct_by_name("log_scale")
+            normalizer = NormalizerConstructor.construct_by_name("linear0_1")
         elif isinstance(normalizer, str):
             normalizer = NormalizerConstructor.construct_by_name(normalizer)
         super().__init__(
@@ -250,8 +217,8 @@ class PBRFNetCPP(RFNetBase):
             raise ValueError(
                 f"location_encoding_kind must be 'frequency' or 'hashgrid', got {location_encoding_kind!r}")
         self._location_encoding_kind = location_encoding_kind
-        # Trunk depth (n_hidden_layers of mlp_block + mlp_post). 1 = historic
-        # default. 0 makes the trunk a single Linear each → 4 Linears on the
+        # Trunk depth (n_hidden_layers of mlp_block + mlp_post). 1 = default.
+        # 0 makes the trunk a single Linear each → 4 Linears on the
         # flux path; pairs well with hashgrid (the encoding already provides
         # high-frequency features, so a deep trunk is wasted and harder to
         # train in fp16).
@@ -392,9 +359,8 @@ class PBRFNetCPP(RFNetBase):
         #     representable (fp32 ULP near 1.0 ≈ 1.2e-7).
         #   • Sub-fp16-ULP updates (e.g. 5e-6) accumulate in fp32 master
         #     across many steps until they cross a fp16 ULP boundary, then
-        #     bump the fp16 weight by one ULP. Without the master, ~56% of
-        #     Adam's small updates round to 0 (documented in
-        #     pbrfnetcpp-nan-status.md 2026-05-18).
+        #     bump the fp16 weight by one ULP. Without the master, a large
+        #     fraction of Adam's small updates round to 0.
         #   • fp32-master → fp16-weight sync happens in `_TcnnModule`'s
         #     forward pre-hook, just before the JIT-fused kernel reads the
         #     pointer.
@@ -404,13 +370,8 @@ class PBRFNetCPP(RFNetBase):
         #
         # lr_peak (default `max_lr=1e-3`): the fp16-fused weights take a ~10×
         # smaller *effective* step per nominal lr than the pure-Python model, so
-        # the old `max_lr=1e-4` starved flux learning — flux plateaued at ~0.02
-        # (fourier) / ~0.08 (hashgrid) while spectrum (beam-driven, not spatial)
-        # learned fine and masked it. Raising to 1e-3 unsticks flux with NO NaN
-        # (the old "~1.2e-4 overflow ceiling" does not hold with the current
-        # RadFiled3D / kernel); 3e-3 oscillates. Root-cause runs 2026-06-05,
-        # wandb `radfield-flux-debug` E4/E5/E7 — see
-        # claude-notes/flux-plateau-experiments.md.
+        # a peak near 1e-3 is needed to drive flux learning (1e-4 is too small and
+        # starves it, 3e-3 oscillates).
         effective_lr = min(max(float(self._lr), 1e-5), self._max_lr)
 
         # The optimizer operates on the fp32 masters, NOT on the fp16
@@ -472,10 +433,8 @@ class PBRFNetCPP(RFNetBase):
         total_opt_steps = int(max(1, total_opt_steps / acc_batches))
 
         # Step-wise warmup (~1 epoch) followed by cosine decay — the same
-        # schedule the pure-Python RFNetBase uses, which holds lr near the peak
-        # far longer than the old NGP power-decay (0.1^(step/T), already halved
-        # by ~ep6). With the higher peak lr this gives a smooth monotonic flux
-        # climb (E7); power-decay + low lr was the prior plateau.
+        # schedule the pure-Python RFNetBase uses, holding lr near the peak so
+        # flux learning climbs smoothly.
         max_epochs = int(max(self.trainer.max_epochs, 1))
         steps_per_epoch = int(math.ceil(total_opt_steps / max_epochs))
         warmup_steps = int(min(max(steps_per_epoch, 1), max(1, total_opt_steps - 1)))
@@ -587,14 +546,13 @@ class PBRFNetCPP(RFNetBase):
 class SPERFNetCPP(PBRFNetCPP):
     """Distance-less variant of PBRFNetCPP, mirroring the pure-Python SPERFNet
     (radfield3dnn/models/nerf.py): the beam encoder takes only direction and
-    spectrum, no beam distance. Used to test PBRFNetCPP's network on the
-    simpler fixed-distance DS02 dataset (where the beam distance is constant
-    and would only add a uninformative input dimension).
+    spectrum, no beam distance. For fixed-distance datasets where the beam
+    distance is constant and would only add an uninformative input dimension.
 
     The trunk and decoder/activation pipeline (BaseRadiationPredictionModel
     with the in-kernel Sigmoid + Softplus+sum-norm bake-in) are unchanged;
     only the beam encoder is swapped (rfnn.SPERFBeamEncoder instead of
-    rfnn.PBRFBeamEncoder) and `encode_additional_parameters` no longer passes
+    rfnn.PBRFBeamEncoder) and `encode_additional_parameters` does not pass
     distance.
     """
     __model_name__ = "SPERFNetCPP"
@@ -646,7 +604,7 @@ class SPERFNetCPP(PBRFNetCPP):
     def encode_additional_parameters(self, batch: PositionalInput) -> Tensor:
         # Same batch-granularity padding as PBRFNetCPP, but the encoder takes
         # only direction + spectrum — batch.origin (distance) is intentionally
-        # ignored for the simpler fixed-distance DS02 dataset.
+        # ignored for fixed-distance datasets.
         B = batch.direction.size(0)
         granularity = 256
         g = B % granularity

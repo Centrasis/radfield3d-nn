@@ -40,7 +40,7 @@ DeviceCartesianRadiationField::DeviceCartesianRadiationField(const glm::vec3& fi
 std::shared_ptr<DeviceCartesianRadiationField> DeviceCartesianRadiationField::from_dims(
     std::array<int, 3> dims, float field_box_m, DeviceBackend backend) {
     const glm::vec3 field(field_box_m, field_box_m, field_box_m);
-    // Voxel size derives from the box / resolution (CLAUDE.md rule) — never hardcoded.
+    // Voxel size derives from the box / resolution — never hardcoded.
     const glm::vec3 voxel(field_box_m / static_cast<float>(dims[0]),
                           field_box_m / static_cast<float>(dims[1]),
                           field_box_m / static_cast<float>(dims[2]));

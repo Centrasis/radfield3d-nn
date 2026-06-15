@@ -1,8 +1,8 @@
-"""Shared region-of-interest (ROI) definition for DS03 radiation fields.
+"""Shared region-of-interest (ROI) definition for radiation fields.
 
 ONE definition of beam / scatter / floor, used by the metric (AirkermaScatterAccuracy),
 the loss (TwoROIGammaLoss) and the voxel sampler (ROIbasedSampler) so all three score and
-train on exactly the same regions. Chosen from a 50-field DS03 sweep (2026-06-12):
+train on exactly the same regions:
 
   * beam    = direct_beam >= ``beam_rel`` * direct_max         (≈0.55% of voxels at 0.05)
   * scatter = NOT beam AND joined >= ``scatter_lo`` * joined_max (≈80% at 5e-5; 3.8% MC-noise,
@@ -11,15 +11,14 @@ train on exactly the same regions. Chosen from a 50-field DS03 sweep (2026-06-12
               genuine noise floor; 1e-4 was rejected because it dumps the clean [5e-5,1e-4]
               decade into the floor)
 
-The beam is defined on the DIRECT channel (sharp, high-DR) exactly like the air-kerma metric's
+The beam is defined on the DIRECT channel (sharp, high dynamic range) exactly like the air-kerma metric's
 beam exclusion; scatter/floor are split on the JOINED flux. Per-field maxima (reduced over the
 trailing spatial dims) so a batch of fields is handled at once.
 """
-import torch
 from torch import Tensor
 
 BEAM_REL_DEFAULT = 0.05     # beam = direct >= 0.05 * direct_max  (matches the metric's max_relative_flux)
-SCATTER_LO_DEFAULT = 5e-5   # scatter floor = joined >= 5e-5 * joined_max (DS03 sweep, 2026-06-12)
+SCATTER_LO_DEFAULT = 5e-5   # scatter floor = joined >= 5e-5 * joined_max
 
 
 def _spatial_amax(x: Tensor) -> Tensor:

@@ -31,7 +31,7 @@ class HistogramNormalize(Module):
                             no dead-bin gradient at init.
         * ``"identity"``  — pass-through (assumes input already non-negative).
 
-        Default keeps the old behaviour (ReLU when ``enforce_positivity=True``).
+        Defaults to ReLU when ``enforce_positivity=True``.
         """
         super().__init__()
         self.dim = dim
@@ -46,8 +46,8 @@ class HistogramNormalize(Module):
 
     def forward(self, hists: Tensor) -> Tensor:
         hists = self.positivity(hists)
-        # Branch-free nan/inf -> 0 cleanup (the old data-dependent `if ...any()` blocked
-        # torch.export / ONNX; this is numerically identical, the guard was only an optimisation).
+        # Branch-free nan/inf -> 0 cleanup (a data-dependent `if ...any()` would block
+        # torch.export / ONNX).
         hists = torch.where(torch.isfinite(hists), hists, torch.zeros_like(hists))
         sum = torch.sum(hists, dim=self.dim, keepdim=True)
         sum = torch.clamp(sum, min=1e-8)

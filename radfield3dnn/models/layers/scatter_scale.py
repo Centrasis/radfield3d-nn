@@ -5,7 +5,7 @@ Rationale: the main network learns only the NORMALISED scatter SHAPE (max 1, cle
 low-dynamic-range signal). To recombine that shape with the analytic direct into a
 physical joined field, we need one scalar per field — the scatter/direct magnitude
 coupling. Predicting the *integrated* flux ratio ρ = Σscatter/Σdirect is robust
-(small-MLP val R²≈0.95, ~6% error on DS03), whereas the peak ratio is MC-noisy
+(small-MLP val R²≈0.95, ~6% error), whereas the peak ratio is MC-noisy
 (R²≈0.68). The join then rescales the shape so Σscatter = ρ·Σdirect, adds the direct,
 and renormalises to max flux 1.0.
 

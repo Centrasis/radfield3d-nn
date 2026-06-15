@@ -3,21 +3,21 @@ from torch import nn
 from torch import Tensor
 
 
-# Fraction of the codomain ABOVE the floor at which a LINEAR-normalizer flux head starts. DS03
-# linear0_1 targets are crushed near 0 (median ~1e-4, mean ~2e-3), so starting the head at the
-# codomain MIDPOINT (0.5) puts ~99% of voxels far above their target → the bulk L1 gradient sweeps
-# the whole field DOWN and overshoots into the all-zero basin (the documented collapse). Starting
-# just above the floor (~1% of range) instead means the bulk is already ~correct (≈0 gradient) and
-# the only live signal is the bright beam/scatter voxels pulling UP — collapse-aligned.
+# Fraction of the codomain ABOVE the floor at which a LINEAR-normalizer flux head starts.
+# linear0_1 flux targets are crushed near 0, so starting the head at the codomain MIDPOINT (0.5)
+# puts most voxels far above their target → the bulk L1 gradient sweeps the whole field DOWN and
+# overshoots into the all-zero basin. Starting just above the floor (~1% of range) instead means
+# the bulk is already ~correct (≈0 gradient) and the only live signal is the bright beam/scatter
+# voxels pulling UP.
 LINEAR_INIT_FRACTION = 0.01
 
 
 def flux_head_init_bias(activation, normalizer) -> float:
     """Pre-activation bias for the flux output head, chosen by the NORMALIZER family:
 
-      * LINEAR normalizer (linear0_1 / linear-1_1): the target bulk sits at the codomain floor, so
+      * LINEAR normalizer (linear0_1): the target bulk sits at the codomain floor, so
         start the head just above it (``LINEAR_INIT_FRACTION`` of the range) — see the constant.
-      * LOG-like normalizer (log_scale / asinh tonemap): the transform already spreads the dynamic
+      * LOG-like normalizer (asinh tonemap): the transform already spreads the dynamic
         range, so the codomain MIDPOINT (each activation's ``init_bias``, the max-gradient point) is
         the right, well-conditioned start.
     """
@@ -58,8 +58,7 @@ class SoftClip(nn.Module):
 
     y = 0.5 * (tanh(k * x) + 1)  maps R -> (0, 1).
 
-    At x=0 the output is 0.5 (codomain midpoint, same starting point as the
-    historic 0.5 offset + linear-clamp), gradient is k/2; outside the
+    At x=0 the output is 0.5 (codomain midpoint), gradient is k/2; outside the
     linear regime the gradient decays smoothly to 0 but never vanishes
     exactly — so a prediction that overshoots into the (-inf, 0) or
     (1, inf) zones still receives a recovery gradient. This avoids the
@@ -113,7 +112,7 @@ class LogitSigmoid(nn.Module):
 
     Pairs with a (0,1)-codomain normalizer (``LinearNormalizer(0,1)``). The output-layer bias
     is zero-initialized (``init_bias``), starting the head at sigmoid(0)=0.5 — the maximum-
-    gradient point — matching the published ``_init_decoders`` zero-bias.
+    gradient point.
     """
 
     def __init__(self, logit_range: float = 30.0):

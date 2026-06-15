@@ -1,26 +1,20 @@
-"""FieldScatterUNet — a from-scratch FIELD-WISE scatter predictor (Stage B).
+"""FieldScatterUNet — a FIELD-WISE scatter predictor.
 
 Predicts the ENTIRE 3D scatter field in one forward (vs the per-voxel coordinate
-query of PBRFNet / XAttnSiren), so it can exploit spatial correlation between voxels
-— the inductive bias the per-voxel models lack (they capped ~0.70 on DS03 despite
-the data being clean, ceiling ~0.98). Field-to-field translation:
+query of PBRFNet), so it can exploit spatial correlation between voxels. Field-to-field:
   input  = direct-beam flux volume (1ch) + normalised xyz coordinate grid (3ch)
   cond   = beam spectrum  (encoded → FiLM)
   output = scatter spectrum volume (out_spectra_bins ch) + scatter flux volume (1ch)
 
-NOT based on the existing Beam2ScatterUNet — fresh SOTA design:
+Architecture:
   • residual Conv3d blocks (Conv→GroupNorm→SiLU ×2 + projection skip),
-  • ATTENTION-GATED skip connections (Attention U-Net, Oktay et al. 2018) — focuses
+  • attention-gated skip connections (Attention U-Net, Oktay et al. 2018) — focuses
     the decoder on the sparse high-flux region (the field is ~87% near-zero),
   • FiLM conditioning from the beam spectrum at the bottleneck and every decoder
     stage (gamma = 1+tanh, identity-start).
-Trained in log_scale space with L1MagWeighted (flux) + HistogramLoss (spectrum) +
-DB-MTL (all inherited). Deployment: every op is standard ONNX (Conv3d→Conv,
-ConvTranspose3d, GroupNorm→GroupNormalization/InstanceNorm, Sigmoid, Tanh, Add, Mul,
-Pad, Slice) → ONNX Runtime C++ / TensorRT. `export_onnx()` + onnxruntime parity gate.
 
-Only framework plumbing is reused (BaseNeuralRadFieldModel base, losses, normalizer,
-DB-MTL, generate_voxelmap3d, calculate_metrics) — the network is entirely new.
+Deployment: every op is standard ONNX (Conv3d, ConvTranspose3d, GroupNorm, Sigmoid,
+Tanh, Add, Mul, Pad, Slice) → ONNX Runtime C++ / TensorRT, via `export_onnx()`.
 """
 from __future__ import annotations
 
@@ -67,7 +61,8 @@ class _FiLM3D(nn.Module):
     def __init__(self, channels: int, cond_dim: int):
         super().__init__()
         self.to_gb = nn.Linear(cond_dim, 2 * channels)
-        nn.init.zeros_(self.to_gb.weight); nn.init.zeros_(self.to_gb.bias)
+        nn.init.zeros_(self.to_gb.weight)
+        nn.init.zeros_(self.to_gb.bias)
         self.channels = channels
 
     def forward(self, x: Tensor, cond: Tensor) -> Tensor:
@@ -104,17 +99,17 @@ class FieldScatterUNet(BaseNeuralRadFieldModel):
         out_spectra_bins: int = 32,
         cond_dim: int = 64,
         out_dims: tuple = (48, 48, 48),
-        flux_loss: str = "L1MagWeighted",
+        flux_loss: str = "SMAPEBalanced",
         spectrum_loss: str = "HistogramLoss",
-        flux_clamp_min: float = -9.0,
-        flux_clamp_max: float = 0.0,
+        flux_clamp_min: float = 0.0,
+        flux_clamp_max: float = 1.0,
         normalizer=None,
         learning_rate: float = 1e-3,
         max_lr: float = 1e-3,
         use_analytic_direct: bool = True,
     ):
         if normalizer is None:
-            normalizer = NormalizerConstructor.construct_by_name("log_scale")
+            normalizer = NormalizerConstructor.construct_by_name("linear0_1")
         elif isinstance(normalizer, str):
             normalizer = NormalizerConstructor.construct_by_name(normalizer)
         super().__init__(normalizer=normalizer, learning_rate=learning_rate)
@@ -194,7 +189,8 @@ class FieldScatterUNet(BaseNeuralRadFieldModel):
         spatial = direct.shape[2:]
         pad = [self._next_pow2(d) for d in spatial]
         diff = [pad[i] - spatial[i] for i in range(3)]
-        pl = [d // 2 for d in diff]; pr = [diff[i] - pl[i] for i in range(3)]
+        pl = [d // 2 for d in diff]
+        pr = [diff[i] - pl[i] for i in range(3)]
         flux_in = F.pad(direct, (pl[2], pr[2], pl[1], pr[1], pl[0], pr[0]))
         vmap = self.generate_voxelmap3d(torch.tensor(pad, device=dev), None, dev)
         vmap = (vmap * 2.0 - 1.0).unsqueeze(0).expand(direct.shape[0], -1, -1, -1, -1).permute(0, 4, 1, 2, 3)
@@ -229,20 +225,12 @@ class FieldScatterUNet(BaseNeuralRadFieldModel):
         return self(x)
 
     def evaluate_forward(self, batch: TrainingInputData):
-        # Score on the FULL JOINED field (direct + scatter) so the metric is
-        # comparable to the per-voxel models (which were scored on the joined
-        # field). The net predicts SCATTER only; the JOINED total is
-        # reconstructed as (direct + predicted_scatter) in PHYSICAL space, then
-        # re-normalised — mirroring the base two-head join. The direct beam used
-        # here is the GT (simulated) direct; at DEPLOYMENT it is replaced by the
-        # validated analytic air direct beam (radfield3dnn/preprocessing/
-        # analytic_direct_beam.py, corr 0.978 vs GT) — the model never needs a
-        # simulated direct at inference.
-        # MODEL-INTERNAL analytic air direct beam: compute it from the RAW batch
-        # beam geometry + density channel (before normalisation) and use it in
-        # place of the simulated direct beam — so the LightningModule is
-        # self-contained and deployable (no simulated direct, no data
-        # preprocessing). With use_geometry=true the density gives the shadow.
+        # Score on the FULL JOINED field (direct + scatter). The net predicts SCATTER
+        # only; the joined total is reconstructed as (direct + predicted_scatter) in
+        # PHYSICAL space, then re-normalised. When use_analytic_direct is set, the direct
+        # beam is computed from the RAW batch beam geometry + density channel by the
+        # internal AnalyticDirectBeam instead of using the simulated direct — so the model
+        # is self-contained and deployable (no simulated direct needed at inference).
         if self.use_analytic_direct and isinstance(batch.ground_truth, RadiationField) \
                 and batch.ground_truth.direct_beam is not None:
             adb = self._analytic_direct(batch).to(batch.ground_truth.direct_beam.flux.dtype)
@@ -291,14 +279,16 @@ class FieldScatterUNet(BaseNeuralRadFieldModel):
             milestones=[warm])
         return [opt], [{"scheduler": sched, "interval": "step"}]
 
-    def export_onnx(self, path: str, opset: int = 17):
+    def export_onnx(self, path: str):
         self.eval()
         dev = next(self.parameters()).device
         D = self._next_pow2(self.out_dims[0])
         dummy = (torch.rand(1, 4, D, D, D, device=dev), torch.rand(1, self.cond_dim, device=dev))
-        torch.onnx.export(_CoreWrap(self), dummy, path, opset_version=opset,
+        # Dynamic batch axis so a stored model accepts any number of fields at inference.
+        batch = torch.export.Dim("batch")
+        torch.onnx.export(_CoreWrap(self).eval(), dummy,
                           input_names=["volume", "cond"], output_names=["out"],
-                          dynamic_axes={"volume": {0: "N"}, "cond": {0: "N"}, "out": {0: "N"}})
+                          dynamic_shapes=({0: batch}, {0: batch}), dynamo=True).save(path)
         return path
 
     def get_custom_parameters(self) -> dict:
@@ -315,6 +305,8 @@ class FieldScatterUNet(BaseNeuralRadFieldModel):
 
 class _CoreWrap(nn.Module):
     def __init__(self, m: FieldScatterUNet):
-        super().__init__(); self.m = m
+        super().__init__()
+        self.m = m
+
     def forward(self, volume, cond):
         return self.m._core(volume, cond)

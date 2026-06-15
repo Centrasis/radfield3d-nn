@@ -25,108 +25,35 @@ class ModuleBuilder:
     def ConstructLoss_fn(loss_fn_name: str) -> nn.Module:
         if loss_fn_name == "L1Loss":
             return std.L1LossWeighted(False)
-        elif loss_fn_name == "L2Loss":
-            # Plain L2 (MSE) on the normalised targets. In a tonemapped space (asinh/log) it spreads
-            # gradient across the dynamic range; pairs with asinh in the loss-effectiveness study.
-            return std.PlainL2Loss(weight_with_error=False)
-        elif loss_fn_name == "LogRatioBalanced":
-            # Region-balanced LOG-RATIO L1 (SMAPEBalanced's regions/masks/hinge with a non-saturating
-            # relative core): fixes SMAPE's over-prediction saturation, which left misplaced/rotated
-            # ghost beams nearly gradient-free (ep153 evidence: bright-IoU 0.29, 63% ghost mass).
-            return std.SMAPERegionBalancedLoss(core="logratio")
-        elif loss_fn_name == "SMAPEBalanced":
-            # Metric-targeted region-balanced SMAPE (pipeline-audit P0): trains the metric's own
-            # functional with equal gradient mass on beam / bright-ring / reliable-bulk regions and
-            # MC-noise voxels masked out. Pair with normalizer="linear0_1" (SMAPE is scale-invariant).
-            return std.SMAPERegionBalancedLoss()
-        elif loss_fn_name == "RawNeRF":
-            # RawNeRF HDR loss (Mildenhall CVPR 2022): linear-space L2 / (sg(pred)+eps)^2 — the
-            # relative-weighted linear recipe between the linear+abs and log+abs corners.
-            return std.RawNeRFLoss()
-        elif loss_fn_name == "RawNeRFSharp":
-            # RawNeRF + alpha*L1 beam-sharpening hybrid (reconstruction-eval finding: RawNeRF's
-            # self-weight anneals ~p^-2 -> blurred beam; the L1 term restores the non-annealing
-            # coherent beam gradient of the published sharp-beam recipe).
-            return std.RawNeRFSharpLoss(alpha=10.0)
-        elif loss_fn_name == "MuLawL2":
-            # mu-law tone-mapped L2 (Kalantari & Ramamoorthi, SIGGRAPH 2017) — the standard HDR-
-            # reconstruction loss: one smooth branch-free formula, non-saturating ghost suppression.
-            return std.MuLawL2Loss(mu=5000.0)
-        elif loss_fn_name == "L1MagWeighted":
-            # Log-space L1 weighted by physical flux magnitude (air-kerma-aligned).
-            # Fixes the HDR imbalance where the near-zero background drowns out the
-            # high-flux beam and the peak collapses. Pairs with normalizer="log_scale".
-            return std.MagnitudeWeightedL1Loss(c=0.01, gamma=1.0)
         elif loss_fn_name == "L1Plain":
-            # Plain physical-space L1 for LinearNormalizer(0,1) targets — the
-            # published config that reached ~84% scatter air-kerma accuracy.
+            # Plain physical-space L1 for LinearNormalizer(0,1) targets.
             return std.PlainL1Loss(weight_with_error=False)
-        elif loss_fn_name == "L1Physical":
-            # L1 measured in PHYSICAL flux space (10**target) for log-space targets.
-            # Air-kerma is ∝ physical flux, so additive peak error is what the
-            # accuracy metric rewards — this recovers the ~84% scatter accuracy the
-            # old LinearNormalizer reached, which log-space (multiplicative) L1 lost.
-            # Pairs with normalizer="log_scale".
-            return std.PhysicalSpaceL1Loss(beta=0.1)
-        elif loss_fn_name == "WassersteinLoss":
-            return std.WassersteinLossWeighted(dim=1, weight_with_error=False)
+        elif loss_fn_name == "SMAPEBalanced":
+            # Metric-targeted region-balanced SMAPE: trains the metric's own functional with equal
+            # gradient mass on beam / bright-ring / reliable-bulk regions and MC-noise voxels masked
+            # out. Pair with normalizer="linear0_1" (SMAPE is scale-invariant).
+            return comb_loss.SMAPERegionBalancedLoss()
+        elif loss_fn_name == "TwoROIGammaLoss":
+            # ROI thresholds MATCH the air-kerma scatter metric + the ROI sampler (radfield3dnn.roi):
+            # beam = >=0.05*max, scatter floor = 5e-5*max. Per-ROI means equalise influence.
+            from radfield3dnn.roi import BEAM_REL_DEFAULT, SCATTER_LO_DEFAULT
+            return comb_loss.TwoROIGammaLoss(beam_rel=BEAM_REL_DEFAULT, scatter_lo=SCATTER_LO_DEFAULT)
         elif loss_fn_name == "HistogramLoss":
             return comb_loss.HistogramLoss(bin_dim=1, weight_with_error=False, penalize_out_of_range=False, calc_moments=False)
-        elif loss_fn_name == "SpectrumWasserstein":
-            # PURE Earth-Mover (no L1 term) spectrum loss. Routed through HistogramLoss so it inherits
-            # the -inf/ROI-mask-safe bin-permute path (the bare WassersteinLossWeighted scrambles
-            # histograms under masking). = HistogramLoss with the W:L1 split set to (1.0, 0.0).
-            return comb_loss.HistogramLoss(bin_dim=1, weight_with_error=False, penalize_out_of_range=False,
-                                           calc_moments=False, ws_weight=1.0, l1_weight=0.0)
         elif loss_fn_name == "StructuralSimilarity3DLoss":
             return std.StructuralSimilarity3DLoss(weight_with_error=False)
-        elif loss_fn_name == "L1ChannelBalanced":
-            # Two-head: plain physical-space L1 whose gradient is per-channel-max-balanced (as if
-            # individually normalized) WITHOUT normalizing the data — so the model predicts raw and
-            # the scatter:direct relation is preserved. Pair with normalizer="linear_joint" + raw
-            # split. See ChannelMaxBalancedLoss / tests/test_split_loss_weighting.py.
-            return std.ChannelMaxBalancedLoss(std.PlainL1Loss(weight_with_error=False))
-        elif loss_fn_name == "FluxChannelBalanced":
-            return std.ChannelMaxBalancedLoss(comb_loss.FluxLoss(weight_with_error=False, log_scale=False))
-        elif loss_fn_name == "FluxLoss":
-            return comb_loss.FluxLoss(weight_with_error=False, log_scale=False)
-        elif loss_fn_name == "FluxLossNoSSIM":
-            # Ablation A1: the published FluxLoss core (Huber = 0.5*(L1+L2)) with the SSIM3D
-            # structural term removed (ssim_weight=0) — isolates the only spatial/sharpness term.
-            return comb_loss.FluxLoss(weight_with_error=False, log_scale=False, ssim_weight=0.0)
-        elif loss_fn_name == "FluxLossRelative":
-            return comb_loss.FluxLoss(weight_with_error=False, log_scale=False, relative_weighting=True)
-        elif loss_fn_name == "FluxLossFocalR":
-            # Huber core × Focal-R modulator. Use for absolute-error work
-            # where the 99% near-zero background otherwise dominates the loss.
-            return comb_loss.FluxLoss(weight_with_error=False, log_scale=False, focal_r=True)
-        elif loss_fn_name == "HotspotAwareFluxLoss":
-            return std.HotspotAwareFluxLoss()
-        elif loss_fn_name == "TwoROIGammaLoss":
-            # ROI thresholds MATCH the air-kerma scatter metric + the ROI sampler
-            # (radfield3dnn.roi): beam = >=0.05*max, scatter floor = 5e-5*max (DS03 sweep,
-            # 2026-06-12). Per-ROI means equalise beam/scatter/floor influence by target voxel count.
-            from radfield3dnn.roi import BEAM_REL_DEFAULT, SCATTER_LO_DEFAULT
-            return std.TwoROIGammaLoss(beam_rel=BEAM_REL_DEFAULT, scatter_lo=SCATTER_LO_DEFAULT)
-        elif loss_fn_name == "FluxLossRelativeFocalR":
-            # Relative-error core × Focal-R modulator. Use when relative
-            # accuracy in [0,1] codomain matters AND the dataset is imbalanced
-            # (e.g. dosimetry on a phantom with a sparse beam core).
-            return comb_loss.FluxLoss(weight_with_error=False, log_scale=False,
-                                         relative_weighting=True, focal_r=True)
-        elif loss_fn_name == "FluxLossHDR":
-            return comb_loss.FluxLoss(weight_with_error=False, log_scale=True, ssim_weight=0.0)
-        elif loss_fn_name == "FluxLogLoss":
-            return comb_loss.FluxLoss(weight_with_error=False, log_scale=True)
-        elif loss_fn_name == "L1WithSSIM3DLoss":
-            # FluxLoss recipe with the L2 component removed. fp16-safe at
-            # raw log-space outputs (LogScaleNormalizer in [-9, 0]); SSIM3D
-            # breaks the median-collapse plateau that plain L1 suffers on
-            # sparse-target fields. Recommended pairing with the
-            # log_scale stack — see handoff §6 S-17.
-            return comb_loss.L1WithSSIM3DLoss(weight_with_error=False)
+        elif loss_fn_name == "RawNeRF":
+            # RawNeRF HDR loss (Mildenhall CVPR 2022): linear-space relative-weighted L2. Pair with
+            # normalizer="linear0_1".
+            return std.RawNeRFLoss()
         else:
-            raise ValueError(f"Invalid loss function name: {loss_fn_name}")
+            # The loss is a TRAINING object; inference / loading never uses it. Tolerate an unknown
+            # name (e.g. a checkpoint trained with a loss no longer in the curated set) by returning
+            # None so the model still constructs for inference; a real training run would fail loudly
+            # the first time it tried to use the missing loss.
+            print(f"[yellow]Unknown loss function name '{loss_fn_name}' — not constructed "
+                  f"(fine for inference; required for training).")
+            return None
         
     @staticmethod
     def ConstructActivation_fn(activation_fn_name: str) -> Type[nn.Module]:
@@ -199,26 +126,13 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
         self.logging_prefix = ""
 
         self._lr = learning_rate
-        self._flux_loss_fn: Loss = comb_loss.FluxLoss(weight_with_error=False)
-        self._spectrum_loss_fn: Loss = comb_loss.HistogramLoss(bin_dim=1) # comb_loss.HistogramLoss(bin_dim=1, weight_with_error=False, penalize_out_of_range=False) # std.KLDivLossWeighted(True)
-        # Learnable log-variance weights for the multi-task (flux, spectrum)
-        # objective — Kendall & Gal 2018 ("Multi-Task Learning Using Uncertainty
-        # to Weigh Losses for Scene Geometry and Semantics", arXiv:1705.07115).
-        # Effective loss is exp(-s) * L + s per task; the +s prevents both
-        # weights from collapsing to zero. Initialised at 0 → equal weights
-        # (the historic 0.5/0.5 split) on the first step, then re-balanced
-        # automatically by the optimizer. Logged to wandb under
-        # `loss_logvar_flux` / `loss_logvar_spectrum` so the rebalancing is
-        # observable across training. Not in save_hyperparameters since
-        # nn.Parameters are serialised by state_dict anyway.
+        self._flux_loss_fn: Loss = comb_loss.SMAPERegionBalancedLoss()
+        self._spectrum_loss_fn: Loss = comb_loss.HistogramLoss(bin_dim=1)
         # Multi-task balancing is handled by DB-MTL (Lin et al. 2023,
         # "Dual-Balancing for Multi-Task Learning", arXiv:2308.12029),
         # encapsulated in `MultiTaskLossBalancer`. It is non-parametric (no
         # learnable loss weights), so the only model state needed is a counter
-        # of non-finite-loss events for observability (findings.md §3.7).
-        # DB-MTL replaces the previous Kendall uncertainty weighting, which
-        # converged to weight ∝ 1/loss and starved the high-magnitude flux head
-        # (findings.md §3.2/§4).
+        # of non-finite-loss events for observability.
         self._mtl = MultiTaskLossBalancer()
         self.register_buffer("_nonfinite_loss_count", torch.zeros(1))
         # Generic seam for subclass-specific auxiliary task losses. Subclasses
@@ -557,8 +471,7 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
     # ── channel-eval dispatch ────────────────────────────────────────────────────────────────
     # How many channels the model PREDICTS (1 = single/joined, 2 = scatter+direct, AirKermaField)
     # is a fixed property of the architecture, so it is determined ONCE by a tiny test run of
-    # forward and the matching plain eval method is bound for the lifetime of the instance —
-    # replacing the per-step isinstance/None-check maze the old calculate_metrics carried.
+    # forward and the matching plain eval method is bound for the lifetime of the instance.
     _calc_metrics_impl = None   # bound on first use (test-run probe or first real prediction)
 
     def _probe_prediction_channels(self, batch: TrainingInputData, is_complete_volume: bool):
@@ -654,11 +567,8 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
     def _calculate_metrics_two_channel(self, pred_field: RadiationField, y: RadiationField, batch: TrainingInputData) -> TrainingMetrics:
         """Plain two-channel eval: scatter (flux+spectrum) and direct (flux) scored separately.
 
-        NOTE: a manual `loss_flux *= direct_flux.sum() / scatter_flux.sum()` rescaling used to
-        live here. It assumed a log-space normaliser where the per-channel flux sums are large
-        and same-signed; under `asinh_split` the scatter sum crosses zero, so the ratio blew up
-        to inf/NaN and poisoned the DB-MTL surrogate. The cross-task flux balancing it tried to
-        do is exactly what `MultiTaskLossBalancer` now does (scale-invariantly, in log space).
+        Cross-task flux balancing is handled by `MultiTaskLossBalancer` (scale-invariantly, in
+        log space), so no per-channel rescaling happens here.
         """
         single = self._calculate_metrics_single_channel(pred_field, y, batch)
         loss_direct = self._flux_loss_fn.forward(prediction=pred_field.direct_beam.flux, target=y.direct_beam.flux, input=batch)
@@ -821,7 +731,7 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
         on_step = not on_epoch
 
         # Gather every active task loss into one dict; DB-MTL balances them
-        # jointly (a single combine call instead of the old per-channel Kendall).
+        # jointly in a single combine call.
         task_losses: dict[str, Tensor] = {}
         if metrics.scatter_field is not None:
             task_losses["scatter_flux"] = metrics.scatter_field.flux_loss
@@ -880,8 +790,8 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
         if torch.isfinite(surrogate).all():
             total_loss = surrogate - surrogate.detach() + raw_total.detach()
         else:
-            # 3.7: keep training alive on a non-finite surrogate, but make it
-            # observable (a silent swap previously masked real divergence).
+            # Keep training alive on a non-finite surrogate, but make it observable
+            # (a silent swap would mask real divergence).
             self._nonfinite_loss_count += 1
             print(f"[red] Non-finite loss (event #{int(self._nonfinite_loss_count.item())}) — falling back to the raw loss to continue.")
             self.log(f'{stage}_nonfinite_loss_count', self._nonfinite_loss_count, on_epoch=on_epoch, on_step=on_step, logger=True, batch_size=self.batch_size)

@@ -6,7 +6,7 @@ direct beam at deployment (where no simulated direct exists). Per the data owner
 the direct beam is AIR ONLY, zeroed inside/behind the phantom; the scatter field is
 the radiation leaving the phantom.
 
-Model (validated on DS03, 2026-06-07):
+Model:
   direct(p) = in_beam(p) · (1/r²) · air_transmission(spectrum, r) · ¬phantom_shadow(p)
   - r = |p − source|; magnitude corr 0.90, ~8% rel-error vs GT in the beam.
   - in_beam: diverging rectangle. Local beam axis is (0,0,−1) with the rect spread in
@@ -19,9 +19,7 @@ Model (validated on DS03, 2026-06-07):
   - phantom_shadow: ray-march source→p through the `density` channel; zero if it
     crosses density>0 (the phantom blocks the primary). Doubles beam-mask IoU.
 
-OPEN refinements (see claude-notes/new-architectures.md): calibrate `dref` and the
-penumbra; higher-res shadow march. Good enough to wire in as the field-model input +
-joined-metric reconstruction.
+OPEN refinements: calibrate `dref` and the penumbra; higher-res shadow march.
 """
 from __future__ import annotations
 import numpy as np
@@ -40,7 +38,9 @@ def _air_mu_percm(E_keV: np.ndarray) -> np.ndarray:
 def _rot_min(D: np.ndarray) -> np.ndarray:
     """Minimal rotation matrix mapping local up=(0,0,-1) to world direction D."""
     up = np.array([0.0, 0.0, -1.0])
-    v = np.cross(up, D); s = np.linalg.norm(v); c = float(np.dot(up, D))
+    v = np.cross(up, D)
+    s = np.linalg.norm(v)
+    c = float(np.dot(up, D))
     if s < 1e-9:
         return np.eye(3) if c > 0 else np.diag([1.0, -1.0, -1.0])
     vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
@@ -59,17 +59,24 @@ def analytic_direct_beam(
     is needed). `density` (phantom) enables shadow masking."""
     nx, ny, nz = voxel_counts
     O = np.asarray(source, float)
-    D = np.asarray(direction, float); D = D / np.linalg.norm(D)
+    D = np.asarray(direction, float)
+    D = D / np.linalg.norm(D)
     hw, hh = rect_full[0] / 2.0, rect_full[1] / 2.0
     off = -0.5 * np.array(voxel_counts) * voxel_size_m if centered else 0.0
     ax = (np.arange(nx) + 0.5) * voxel_size_m + (off[0] if centered else 0.0)
     ay = (np.arange(ny) + 0.5) * voxel_size_m + (off[1] if centered else 0.0)
     az = (np.arange(nz) + 0.5) * voxel_size_m + (off[2] if centered else 0.0)
-    X, Y, Z = np.meshgrid(ax, ay, az, indexing="ij"); P = np.stack([X, Y, Z], -1)
-    rv = P - O; r = np.linalg.norm(rv, axis=-1)
-    R = _rot_min(D); e1 = R @ np.array([1.0, 0, 0]); e2 = R @ np.array([0, 1.0, 0])
-    d_along = (rv * D).sum(-1); lat = rv - d_along[..., None] * D
-    l1 = (lat * e1).sum(-1); l2 = (lat * e2).sum(-1)
+    X, Y, Z = np.meshgrid(ax, ay, az, indexing="ij")
+    P = np.stack([X, Y, Z], -1)
+    rv = P - O
+    r = np.linalg.norm(rv, axis=-1)
+    R = _rot_min(D)
+    e1 = R @ np.array([1.0, 0, 0])
+    e2 = R @ np.array([0, 1.0, 0])
+    d_along = (rv * D).sum(-1)
+    lat = rv - d_along[..., None] * D
+    l1 = (lat * e1).sum(-1)
+    l2 = (lat * e2).sum(-1)
     if dref is None:
         dref = float(np.linalg.norm(O))  # source -> isocenter (origin)
     in_beam = (np.abs(l1) <= hw * d_along / dref) & (np.abs(l2) <= hh * d_along / dref) & (d_along > 0)
@@ -92,7 +99,8 @@ def from_field_file(fp: str, shadow_samples: int = 64):
     """Convenience: build the analytic direct beam from a `.rf3` file's metadata +
     density channel (for validation / training-time replacement of the sim direct)."""
     from RadFiled3D.RadFiled3D import FieldStore
-    f = FieldStore.load(fp); md = FieldStore.load_metadata(fp)
+    f = FieldStore.load(fp)
+    md = FieldStore.load_metadata(fp)
     tube = md.get_header().simulation.tube
     o = tube.radiation_origin; dv = tube.radiation_direction
     rect = md.get_dynamic_metadata("xray_tube_field_rect_dimensions_m").get_data()

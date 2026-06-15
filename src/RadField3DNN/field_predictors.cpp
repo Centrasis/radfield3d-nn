@@ -523,6 +523,6 @@ void VoxelFieldPredictor::predict_into_field(const BeamParameters& beam,
 
 }  // namespace radfield3dnn
 
-// The RF3M parse+build (ModelFactory::load[/_from_memory]) lives in model_io.cpp now: it drives
+// The RF3M parse+build (ModelStore::load[/_from_memory]) lives in model_io.cpp: it drives
 // this file's predictor ctors / set_parameter_range through their public declarations, so the
 // parse+build needs no ORT headers and the predictor it returns carries the package metadata.

@@ -13,8 +13,8 @@
 // (the handle is type-erased), so callers that only need the geometry/host data never pull
 // in a GPU SDK.
 //
-// Geometry follows the repo rule (CLAUDE.md): a field box is 1.0 m, so voxel size =
-// box / resolution. Construct from `dims` + the box; never hardcode a voxel size.
+// Geometry rule: a field box is 1.0 m, so voxel size = box / resolution. Construct
+// from `dims` + the box; never hardcode a voxel size.
 
 #include <array>
 #include <map>

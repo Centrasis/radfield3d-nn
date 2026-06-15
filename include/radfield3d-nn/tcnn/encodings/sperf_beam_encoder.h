@@ -15,9 +15,8 @@ namespace rfnn::tcnn {
     //   MLP1 → LN2 → MLP2 → ParameterSetEncoding(SH(3) + None(spec))
     //                                                   → final LayerNorm.
     // Identical to PBRFBeamEncoder except for the missing distance one-blob
-    // input — used to test PBRFNetCPP's network on the simpler fixed-distance
-    // DS02 dataset (where the beam distance is constant and would only add
-    // an uninformative input).
+    // input — for fixed-distance datasets where the beam distance is constant
+    // and would only add an uninformative input.
     class SPERFBeamEncoder : public ::tcnn::DifferentiableObject<float, ::tcnn::network_precision_t, ::tcnn::network_precision_t> {
     public:
         SPERFBeamEncoder(uint32_t spectrum_dim, uint32_t d_model);

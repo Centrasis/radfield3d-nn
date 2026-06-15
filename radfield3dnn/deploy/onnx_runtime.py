@@ -1,7 +1,7 @@
 """Python entry-point to the C++ ONNX deployment runtime (rfnn_deploy bindings).
 
 This is the Python side of the *deployment* path: it loads the compiled ``rfnn_deploy`` module (the
-pybind bindings over ``rfnn::io::V1::ModelFactory`` + the ONNX field predictors) and runs an RF3M
+pybind bindings over ``rfnn::io::V1::ModelStore`` + the ONNX field predictors) and runs an RF3M
 package's exported ONNX graphs through ONNX Runtime — no torch / CUDA needed. It is the counterpart
 to :class:`~radfield3dnn.deploy.model_packager.ModelPackager`, which writes the RF3M package this
 loads.
@@ -39,7 +39,7 @@ if TYPE_CHECKING:
         EncodedBeam,
         ExecutionOptions,
         ModelDomain,
-        ModelFactory,
+        ModelStore,
         ModelProvenance,
         ParameterRange,
         PredictorType,
@@ -106,7 +106,7 @@ def _ensure_loaded():
 # Eager-load so the names below are real classes (and IDEs resolve them via lib/rfnn_deploy.pyi).
 rfnn_deploy = _ensure_loaded()
 
-# re-export the binding surface (mirrors the C++ structure: rfnn::io::V1::ModelFactory + the
+# re-export the binding surface (mirrors the C++ structure: rfnn::io::V1::ModelStore + the
 # radfield3dnn:: predictor hierarchy; package metadata lives ON the loaded predictor). The names
 # are typed by the TYPE_CHECKING block above; these runtime assignments are invisible to linters.
 if not TYPE_CHECKING:
@@ -116,7 +116,7 @@ if not TYPE_CHECKING:
     PredictorType = rfnn_deploy.PredictorType
     VolumeFieldPredictor = rfnn_deploy.VolumeFieldPredictor
     VoxelFieldPredictor = rfnn_deploy.VoxelFieldPredictor
-    ModelFactory = rfnn_deploy.ModelFactory
+    ModelStore = rfnn_deploy.ModelStore
     ModelDomain = rfnn_deploy.ModelDomain
     ModelProvenance = rfnn_deploy.ModelProvenance
     BeamParameterSpec = rfnn_deploy.BeamParameterSpec
@@ -127,11 +127,11 @@ def load_rf3m(path: str, use_cuda: bool = False) -> "VoxelFieldPredictor | Volum
     """Load an RF3M package STRAIGHT to the runnable predictor (:class:`VoxelFieldPredictor` for
     per-voxel models, :class:`VolumeFieldPredictor` for field-wise ones). The package metadata is
     attached to the predictor: ``.domain``, ``.provenance``, ``.metrics``, ``.graph_names``."""
-    return rfnn_deploy.ModelFactory.load(path, use_cuda=use_cuda)
+    return rfnn_deploy.ModelStore.load(path, use_cuda=use_cuda)
 
 
 __all__ = [
-    "load_rf3m", "ModelFactory", "BeamParameters", "ExecutionOptions", "EncodedBeam",
+    "load_rf3m", "ModelStore", "BeamParameters", "ExecutionOptions", "EncodedBeam",
     "PredictorType", "VolumeFieldPredictor", "VoxelFieldPredictor", "ModelDomain",
     "ModelProvenance", "BeamParameterSpec", "ParameterRange", "rfnn_deploy",
 ]

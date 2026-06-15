@@ -14,7 +14,7 @@ The per-volume maxima used for normalisation are stored on the returned
 existing dataloader collation. Loss and inference helpers read it back
 to (a) recover physical flux at inference and (b) compute the per-field
 ``scatter_max / direct_max`` ratio that the model's ratio head is
-trained against (architecture-change.md §0c).
+trained against.
 """
 from typing import Union
 

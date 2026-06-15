@@ -21,7 +21,6 @@ from rich import print
 
 from radfield3dnn.models import ModelConstructor
 from radfield3dnn.preprocessing.normalizations import NormalizerConstructor
-from radfield3dnn.preprocessing.normalizations.asinh import SplitChannelAsinhNormalizer
 from radfield3dnn.datasets import DatasetType, OriginalGroundTruthPreservation, construct_datamodule, get_dataset_dimensions_and_voxel_size
 from radfield3dnn.datasets.channel_join import ChannelsJoin
 from radfield3dnn.metrics.airkerma_accuracy import (
@@ -44,43 +43,6 @@ from tasks.base import Task
 def load_config(path: str) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
-
-
-def _auto_tune_asinh(dataset_path: str, seed: int) -> SplitChannelAsinhNormalizer:
-    """Scan dataset to pick per-channel asinh σ values empirically."""
-    import glob, random, numpy as np
-    from RadFiled3D.RadFiled3D import FieldStore
-
-    paths = sorted(glob.glob(os.path.join(dataset_path, "**", "*.rf3"), recursive=True))
-    if not paths:
-        print("[yellow]asinh_auto: no .rf3 files found, using defaults.")
-        return SplitChannelAsinhNormalizer()
-
-    random.seed(seed)
-    random.shuffle(paths)
-    sample = paths[:min(40, len(paths))]
-    print(f"[yellow]asinh_auto: scanning {len(sample)}/{len(paths)} fields for σ.")
-
-    sc_vals, dr_vals = [], []
-    for p in sample:
-        try:
-            f = FieldStore.load(p)
-            sc = np.asarray(f.get_channel('scatter_field').get_layer_as_ndarray('flux'), dtype=np.float64).ravel()
-            dr = np.asarray(f.get_channel('direct_beam').get_layer_as_ndarray('flux'), dtype=np.float64).ravel()
-        except Exception:
-            continue
-        if sc.max() > 0:
-            n = sc / sc.max(); sc_vals.append(n[n > 0])
-        if dr.max() > 0:
-            n = dr / dr.max(); dr_vals.append(n[n > 0])
-
-    if not sc_vals or not dr_vals:
-        return SplitChannelAsinhNormalizer()
-
-    sigma_sc = float(np.clip(np.quantile(np.concatenate(sc_vals), 0.10), 1e-6, 1e-1))
-    sigma_dr = float(np.clip(np.quantile(np.concatenate(dr_vals), 0.90), 1e-6, 1e-1))
-    print(f"[green]asinh_auto: σ_scatter={sigma_sc:.3e}, σ_direct={sigma_dr:.3e}")
-    return SplitChannelAsinhNormalizer(scatter_sigma=sigma_sc, direct_sigma=sigma_dr)
 
 
 if __name__ == "__main__":
@@ -186,10 +148,7 @@ if __name__ == "__main__":
 
     # ── Normalizer (from model JSON) ──────────────────────────────────────────
     norm_name = raw_model_cfg.get("parameters", {}).get("normalizer", "linear0_1")
-    if norm_name == "asinh_auto":
-        normalizer = _auto_tune_asinh(dataset_path, args.seed)
-    else:
-        normalizer = NormalizerConstructor.construct_by_name(norm_name)
+    normalizer = NormalizerConstructor.construct_by_name(norm_name)
 
     # ── Data processings ──────────────────────────────────────────────────────
     # MC floor noise removal runs AFTER OriginalGroundTruthPreservation snapshots the GT, so
@@ -200,8 +159,8 @@ if __name__ == "__main__":
     # uses importance_threshold=0, i.e. it scores EVERY voxel. If MCFloorCut zeroes a voxel
     # in the GT the metric sees, then SMAPE(small_pred, 0) = 2 (worst case) for the implicit
     # MLP's small-but-nonzero prediction there — turning every cut voxel into an accuracy-0
-    # landmine and collapsing scatter accuracy (~0.10 in the r7t0nhoh run). Snapshotting the
-    # uncut GT first keeps the metric comparable to the published (no-MC-floor) 0.84 baseline.
+    # landmine and collapsing scatter accuracy. Snapshotting the uncut GT first keeps the
+    # metric comparable to the no-MC-floor baseline.
     dataprocessings = [OriginalGroundTruthPreservation()]
     mc_floor = aug_cfg.get("mc_floor_cut", None)
     if mc_floor:
@@ -245,21 +204,8 @@ if __name__ == "__main__":
         ]
 
     if aug_cfg.get("join_channels", False):
-        # Channel handling is selected by the normalizer:
-        #   * asinh_split  -> per-channel-relative split (each ÷ own per-field max, then asinh).
-        #   * linear_joint -> RAW split (both channels kept physical; the shared-scale normalizer
-        #                     preserves the scatter:direct relation, ChannelMaxBalancedLoss balances
-        #                     the gradient). The implicit relation-preservation stack.
-        #   * otherwise    -> join scatter + direct into a single flux target.
-        from radfield3dnn.preprocessing.normalizations import JointLinearNormalizer
-        if isinstance(normalizer, JointLinearNormalizer):
-            from radfield3dnn.datasets.channel_split_relative import ChannelsSplitRelative
-            dataprocessings.append(ChannelsSplitRelative(normalize_per_channel=False))
-        elif isinstance(normalizer, SplitChannelAsinhNormalizer):
-            from radfield3dnn.datasets.channel_split_relative import ChannelsSplitRelative
-            dataprocessings.append(ChannelsSplitRelative())
-        else:
-            dataprocessings.append(ChannelsJoin())
+        # Join scatter + direct into a single flux target.
+        dataprocessings.append(ChannelsJoin())
 
     if aug_cfg.get("smooth_spectra", False):
         from radfield3dnn.preprocessing.augmentations.smooth_spectra import SmoothingSpectra
@@ -452,11 +398,10 @@ if __name__ == "__main__":
             'airkerma_accuracy_scatter_sv8': AirkermaSupervoxelScatterAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, supervoxel=8),
             'spectrum_accuracy': HistogramOverlapAccuracy(),
             #'top95_energy_weighted_airkerma_accuracy': AirkermaAccuracyEnergyWeighted(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, importance_threshold=0.05),
-            # Gammas now use the clinical 10% low-dose cutoff (AirkermaAccuracy dose_threshold=0.1
-            # default; the old un-forwarded 1e-5 cutoff let a ZERO prediction pass at GPR 0.992 —
-            # values logged before 2026-06-12 are trivially inflated (post-mutation-fix runs) or
-            # mutation-contaminated (before)). The _cut1pct variant scores down into the bright
-            # scatter ring (>=1% of max), which the clinical cutoff excludes.
+            # Gammas use the clinical 10% low-dose cutoff (AirkermaAccuracy dose_threshold=0.1
+            # default); a very low cutoff would let a ZERO prediction pass by scoring almost only
+            # near-zero voxels. The _cut1pct variant scores down into the bright scatter ring
+            # (>=1% of max), which the clinical cutoff excludes.
             'global_airkerma_gamma_3pct_4cm_cut1pct': AirkermaAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, metric_type='gpr', voxel_size_m=vx, rel_dose_diff=0.03, dist_crit_mm=40.0, dose_threshold=0.01),
             'global_airkerma_gamma_3pct_2cm': AirkermaAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, metric_type='gpr', voxel_size_m=vx, rel_dose_diff=0.03, dist_crit_mm=20.0),
             'global_airkerma_gamma_3pct_4cm': AirkermaAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, metric_type='gpr', voxel_size_m=vx, rel_dose_diff=0.03, dist_crit_mm=40.0),

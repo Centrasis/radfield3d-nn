@@ -30,39 +30,6 @@ class FeedforwardPointwiseModel(BaseNeuralRadFieldModel):
             self.relevance_discriminator = self.relevance_discriminator.eval()
         super().on_fit_start()
 
-    def jacobian_norm(self, x: PositionalInput) -> Tensor:
-        x = PositionalInput(
-            position=x.position.clone().detach().requires_grad_(True),
-            direction=x.direction.clone().detach().requires_grad_(True),
-            spectrum=x.spectrum.clone().detach().requires_grad_(True),
-            geometry=x.geometry.clone().detach().requires_grad_(True) if x.geometry is not None else None,
-            origin=x.origin.clone().detach().requires_grad_(True) if x.origin is not None else None,
-            beam_shape_parameters=x.beam_shape_parameters.clone().detach().requires_grad_(True) if x.beam_shape_parameters is not None else None,
-            beam_shape_type=x.beam_shape_type.clone().detach().requires_grad_(True) if x.beam_shape_type is not None else None
-        )
-        field = self.forward(x)
-        y = torch.stack([field.scatter_field.flux, field.scatter_field.spectrum.sum(dim=-1)], dim=-1)
-        batch_size = y.size(0)
-        norms = torch.empty(batch_size, device=x.position.device)
-        for i in range(batch_size):
-            grads = torch.autograd.grad(
-                y[i].sum(), 
-                [
-                    x.position,
-                    x.direction,
-                    x.spectrum,
-                    x.geometry,
-                    x.origin,
-                    x.beam_shape_parameters,
-                    x.beam_shape_type
-                ],
-                create_graph=False, 
-                retain_graph=False,
-                allow_unused=True
-            )[0][i]
-            norms[i] = grads.norm()  # L2 norm of gradient row i
-        return norms.mean()
-
     @staticmethod
     def write_linear_output_to_volume(output: RadiationFieldChannel, target_volume: RadiationFieldChannel, indices: Tensor):
         """

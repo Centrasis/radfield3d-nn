@@ -22,11 +22,9 @@ class AirkermaAccuracy(MetricBase):
             self.metric = NCCAccuracy(layer_name=None, reduction='mean', weight_with_error=weight_with_error, importance_threshold=importance_threshold)
         elif metric_type == 'gpr':
             # dose_threshold = the gamma low-dose cutoff (fraction of per-field max that a GT voxel
-            # must exceed to be SCORED). Default 0.1 = the clinical 10% convention. The previous
-            # effective value (GammaPassingRate's 1e-5 default, never forwarded) scored ~99% of
-            # voxels with a GLOBAL 3%-of-max dose tolerance — a ZERO prediction passed at GPR 0.992
-            # (measured on 8 DS03 fields), so models predicting "tiny everywhere" started at ~0.98
-            # GPR and stayed there regardless of quality. At 0.1 the same zero prediction scores 0.
+            # must exceed to be SCORED). Default 0.1 = the clinical 10% convention, under which a
+            # zero prediction scores 0. A very low cutoff would instead score almost only near-zero
+            # voxels, letting a "tiny everywhere" prediction pass.
             self.metric = GammaPassingRate(layer_name=None, reduction='mean', weight_with_error=weight_with_error, keep_dim=keep_dim, voxel_size_m=voxel_size_m, rel_dose_diff=rel_dose_diff, dist_crit_mm=dist_crit_mm, dose_threshold=dose_threshold)
         else:
             raise ValueError(f"Unknown metric_type: {metric_type}")
@@ -290,12 +288,12 @@ class AirkermaScatterAccuracy(AirkermaAccuracy):
         * ``use_roi=True`` (THE shared ROI definition — matches radfield3dnn.roi, TwoROIGammaLoss
           and the ROI sampler): scores exactly the scatter ROI = NOT beam AND joined >=
           ``scatter_lo``·joined_max. The beam is excluded (direct > ``max_relative_flux``·direct_max)
-          and the floor (joined < ``scatter_lo``·max) is excluded. On DS03 (scatter_lo=5e-5) this
-          scores ~80% of voxels with ~3.8% MC-noise (perfect-model SMAPE ceiling ≈0.985).
+          and the floor (joined < ``scatter_lo``·max) is excluded. With scatter_lo=5e-5 this
+          scores most of the scatter region (perfect-model SMAPE ceiling ≈0.985).
         * ``use_error=True``: voxels whose per-voxel MC error marks the GT noise-dominated
-          (error >= error_threshold) are excluded instead — ~86–91% of voxels.
-        * ``use_error=False`` (LEGACY bright-ring): voxels below ``min_relative_flux`` of the
-          total-flux max are excluded — only the bright ring (~3%). Kept for the published 0.84.
+          (error >= error_threshold) are excluded instead.
+        * ``use_error=False`` (bright-ring): voxels below ``min_relative_flux`` of the
+          total-flux max are excluded — only the bright ring.
 
         The beam exclusion (direct > ``max_relative_flux``·direct_max) applies in every mode.
         ``use_roi`` takes precedence over ``use_error``.

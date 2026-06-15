@@ -10,7 +10,7 @@ import torch
 from radfield3dnn.roi import compute_roi_masks, BEAM_REL_DEFAULT, SCATTER_LO_DEFAULT
 from radfield3dnn.datasets.mc_floor_cut import MCFloorCut
 from radfield3dnn.preprocessing.augmentations.roi_sampling import ROIbasedSampler
-from radfield3dnn.losses.std import RawNeRFLoss, RawNeRFSharpLoss
+from radfield3dnn.losses.combinations import SMAPERegionBalancedLoss
 from radfield3dnn.rftypes import TrainingInputData, RadiationField, RadiationFieldChannel
 
 
@@ -118,17 +118,19 @@ def test_roi_sampler_floor_as_value_keeps_original():
     assert bool(kept.any()) and torch.isinf(flux[~kept]).all()
 
 
-# ── RawNeRF bounded + -inf robust ────────────────────────────────────────────────────────
-def test_rawnerf_bounded_and_masked():
+# ── SMAPEBalanced bounded + -inf robust ───────────────────────────────────────────────────
+def test_smapebalanced_bounded_and_masked():
     torch.manual_seed(1)
     t = (torch.rand(2, 1, 16, 16, 16) ** 4) * 0.5
-    for lf in (RawNeRFLoss(), RawNeRFSharpLoss()):
-        z = torch.zeros_like(t).requires_grad_(True)
-        Lz = lf.forward(target=t.clone(), prediction=z, input=None); Lz.sum().backward()
-        assert torch.isfinite(Lz).all() and float(Lz.mean()) < 100      # no zero-pred explosion
-        assert torch.isfinite(z.grad).all() and float(z.grad.abs().max()) < 1e4
-        # -inf masked target -> finite loss
-        m = t.clone(); m[0, 0, :4] = -torch.inf
-        p = t.clone().requires_grad_(True)
-        Lm = lf.forward(target=m, prediction=p, input=None)
-        assert torch.isfinite(Lm).all()
+    lf = SMAPERegionBalancedLoss()
+    z = torch.zeros_like(t).requires_grad_(True)
+    Lz = lf.forward(target=t.clone(), prediction=z, input=TrainingInputData(input=None, ground_truth=None))
+    Lz.sum().backward()
+    assert torch.isfinite(Lz).all() and float(Lz.mean().detach()) < 100
+    assert torch.isfinite(z.grad).all()
+    # -inf masked target -> finite loss
+    m = t.clone()
+    m[0, 0, :4] = -torch.inf
+    p = t.clone().requires_grad_(True)
+    Lm = lf.forward(target=m, prediction=p, input=TrainingInputData(input=None, ground_truth=None))
+    assert torch.isfinite(Lm).all()

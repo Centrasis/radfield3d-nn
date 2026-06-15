@@ -4,7 +4,7 @@ the AIR direct-beam field analytically (no Monte Carlo, no simulated direct).
 Shared by the field-wise model (FieldScatterUNet) and the per-voxel MLP scatter-only
 variant: both learn ONLY the scatter and obtain the direct beam from this module.
 
-Physics (validated vs the DS03 GT direct, corr(log) ~0.96):
+Physics (validated vs the GT direct, corr(log) ~0.96):
   direct(p) = C · (1/r²) · air_transmission(spectrum, r) · in_beam(p) · ¬shadow(p)
   - source = origin·field − 0.5·field (field-relative origin → centred metres),
   - in_beam: diverging rectangle; local axis (0,0,−1) + rect in local X/Y mapped by
@@ -92,18 +92,25 @@ class AnalyticDirectBeam(nn.Module):
         mu_eff = (w * self.air_mu_bins[: w.shape[1]].to(dev, dt)[None]).sum(1)
         # rect axes via minimal rotation (Rodrigues, (1-c)/s² = 1/(1+c))
         up = torch.tensor([0., 0., -1.], device=dev, dtype=dt).expand(B, 3)
-        v = torch.cross(up, D, dim=1); cdot = (up * D).sum(1)
+        v = torch.cross(up, D, dim=1)
+        cdot = (up * D).sum(1)
         k = 1.0 / (1.0 + cdot).clamp_min(1e-6)
         Vx = torch.zeros(B, 3, 3, device=dev, dtype=dt)
-        Vx[:, 0, 1] = -v[:, 2]; Vx[:, 0, 2] = v[:, 1]; Vx[:, 1, 0] = v[:, 2]
-        Vx[:, 1, 2] = -v[:, 0]; Vx[:, 2, 0] = -v[:, 1]; Vx[:, 2, 1] = v[:, 0]
+        Vx[:, 0, 1] = -v[:, 2]
+        Vx[:, 0, 2] = v[:, 1]
+        Vx[:, 1, 0] = v[:, 2]
+        Vx[:, 1, 2] = -v[:, 0]
+        Vx[:, 2, 0] = -v[:, 1]
+        Vx[:, 2, 1] = v[:, 0]
         R = torch.eye(3, device=dev, dtype=dt)[None] + Vx + torch.bmm(Vx, Vx) * k[:, None, None]
-        e1 = R[:, :, 0]; e2 = R[:, :, 1]
+        e1 = R[:, :, 0]
+        e2 = R[:, :, 1]
         rv = (P - O[:, None, :]) if point_mode else (P[None] - O[:, None, :])
         r = rv.norm(dim=2)
         d_along = (rv * D[:, None, :]).sum(2)
         lat = rv - d_along[..., None] * D[:, None, :]
-        l1 = (lat * e1[:, None, :]).sum(2); l2 = (lat * e2[:, None, :]).sum(2)
+        l1 = (lat * e1[:, None, :]).sum(2)
+        l2 = (lat * e2[:, None, :]).sum(2)
         dref = O.norm(dim=1)
         # half-widths at this depth (diverging cone); the MC 50% edge sits at the
         # geometric half-width (measured ratio 1.03), so place the sigmoid 50% point
