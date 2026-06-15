@@ -212,7 +212,7 @@ if __name__ == "__main__":
         from radfield3dnn.preprocessing.augmentations.augmentation_limit import LimitedAugmentation
         dataprocessings.append(LimitedAugmentation(
             SmoothingSpectra(kernel_size=3, sigma=1.0, p=0.75, dataset_multiplier=1.0),
-            end_epoch=epochs // 2,
+            end_epoch=epochs,
         ))
 
     is_cfg = aug_cfg.get("importance_sampling", {})

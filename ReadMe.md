@@ -106,7 +106,7 @@ dataset:
 
 augmentations:
   enabled: false                     # Gaussian fluence noise + smoothing (first half of training)
-  smooth_spectra: false              # 1D Gaussian smoothing over the spectrum bin axis
+  smooth_spectra: false              # 3D Gaussian smoothing over the spatial domain
   join_channels: false               # join scatter + direct into one flux target
   mc_floor_cut:                      # remove the Monte-Carlo noise floor from the TRAINING target
     mask: true                       #   MASK mode: set the floor ROI to -inf (not 0), join-safe
