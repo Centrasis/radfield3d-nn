@@ -91,7 +91,8 @@ if __name__ == "__main__":
         )
 
     # ── Working directory per run ─────────────────────────────────────────────
-    new_cwd = os.path.join(os.getcwd(), f"{model_name}_{dataset_base}")
+    # Lives UNDER the logs folder (never the repo), so a run only writes into --logs_path.
+    new_cwd = os.path.join(os.path.abspath(args.logs_path), f"{model_name}_{dataset_base}")
     os.makedirs(new_cwd, exist_ok=True)
     os.chdir(new_cwd)
 
