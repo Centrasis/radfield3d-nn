@@ -169,16 +169,23 @@ PYBIND11_MODULE(rfnn_deploy, m) {
         .def_readwrite("physics", &rfnn::io::ModelProvenance::physics);
 
     // ── ModelStore: parses an RF3M package AND builds the runnable predictor in one call (no
-    //    LoadedModel handle). pybind transfers the returned unique_ptr into the shared_ptr holder
-    //    and downcasts a per-voxel model to VoxelFieldPredictor automatically; the package metadata
-    //    rides along as the predictor's `.domain` / `.provenance` / `.metrics` / `.graph_names`. ──
+    //    LoadedModel handle). The C++ API hands back a unique_ptr<VolumeFieldPredictor> whose
+    //    dynamic type may be VoxelFieldPredictor; we hand pybind a shared_ptr built in this TU so
+    //    it adopts a single, well-formed control block and downcasts a per-voxel model to
+    //    VoxelFieldPredictor via RTTI. The package metadata rides along as the predictor's
+    //    `.domain` / `.provenance` / `.metrics` / `.graph_names`. ──
     py::class_<ModelStore>(m, "ModelStore")
-        .def_static("load", &ModelStore::load,
+        .def_static("load",
+                    [](const std::string& path, bool use_cuda)
+                        -> std::shared_ptr<VolumeFieldPredictor> {
+                        return ModelStore::load(path, use_cuda);
+                    },
                     py::arg("path"), py::arg("use_cuda") = false,
                     "Load an RF3M package and return the runnable predictor "
                     "(VoxelFieldPredictor for per-voxel models, VolumeFieldPredictor for field-wise).")
         .def_static("load_from_memory",
-                    [](py::bytes data, bool use_cuda) {
+                    [](py::bytes data, bool use_cuda)
+                        -> std::shared_ptr<VolumeFieldPredictor> {
                         std::string s = data;
                         return ModelStore::load_from_memory(s.data(), s.size(), use_cuda);
                     },

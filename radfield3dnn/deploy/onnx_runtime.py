@@ -68,8 +68,8 @@ def _find_onnxruntime(want_version: str | None) -> str | None:
     """Locate libonnxruntime.so, preferring the exact version the binding was linked against
     (mismatched ABIs raise `version VERS_x not found` at import)."""
     candidates = []
-    for base in (os.path.join(_REPO, "build_novk"), os.path.join(_REPO, "build_cmake"),
-                 os.path.join(_REPO, "build"), "/tmp"):
+    for base in (os.path.join(_REPO, "build_deploy"), os.path.join(_REPO, "build_novk"),
+                 os.path.join(_REPO, "build_cmake"), os.path.join(_REPO, "build"), "/tmp"):
         candidates += glob.glob(os.path.join(base, "**", "libonnxruntime.so*"), recursive=True)
     if not candidates:
         return None
@@ -89,9 +89,11 @@ def _ensure_loaded():
     so = glob.glob(os.path.join(_LIB, "rfnn_deploy*.so"))
     if not so:
         raise ImportError(
-            "rfnn_deploy native module not found in ./lib. Build it:\n"
-            "  cd build_novk && PYTHON_EXECUTABLE=$(which python) cmake .. -DBuild_DeployPyBindings=ON "
-            "-DPython_EXECUTABLE=$(which python) && cmake --build . --target rfnn_deploy -j")
+            "rfnn_deploy native module not found in ./lib. It is built by default with the package "
+            "(`pip install -e .`); build it standalone with:\n"
+            "  pip install -e .   # or, directly:\n"
+            "  cmake -S . -B build_deploy -G Ninja -DBuild_DeployPyBindings=ON "
+            "-DPython_EXECUTABLE=$(which python) && cmake --build build_deploy --target rfnn_deploy -j")
     ort = _find_onnxruntime(_linked_ort_version(so[0]))
     if ort:
         # RTLD_GLOBAL so the predictor lib's undefined ORT symbols bind to this handle.
