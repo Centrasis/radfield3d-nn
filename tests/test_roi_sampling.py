@@ -96,6 +96,29 @@ def test_sampler_varies_scatter_subset_but_always_keeps_beam():
     assert bool((k1 & beam).sum() == beam.sum()) and bool((k2 & beam).sum() == beam.sum())
 
 
+def test_sampler_scatter_ratio_schedule():
+    # scatter_ratio_end + schedule_switch: ratio is `scatter_ratio` until `schedule_switch` progress,
+    # then `scatter_ratio_end` — and the SAMPLED scatter count follows the active ratio.
+    D = 20
+    direct, scatter, joined = _synthetic_field(D)
+    beam, sc, fl = compute_roi_masks(direct, joined, BEAM_REL_DEFAULT, SCATTER_LO_DEFAULT)
+    nb = int(beam.sum())
+    samp = ROIbasedSampler(scatter_ratio=2.5, scatter_ratio_end=1.0, schedule_switch=0.8,
+                           floor_ratio=0.0, floor_as_zero=False); samp.train()
+    samp.set_schedule_progress(0.0)
+    assert samp._eff_scatter_ratio == 2.5
+    out_early = samp.forward(_make_input(direct, scatter, joined, D))
+    n_early = int(torch.isfinite(out_early.ground_truth.scatter_field.flux).sum())
+    samp.set_schedule_progress(0.85)
+    assert samp._eff_scatter_ratio == 1.0
+    out_late = samp.forward(_make_input(direct, scatter, joined, D))
+    n_late = int(torch.isfinite(out_late.ground_truth.scatter_field.flux).sum())
+    # early keeps ~beam + 2.5*beam, late keeps ~beam + 1*beam → fewer kept voxels late
+    assert n_early > n_late
+    assert abs(n_early - (nb + round(2.5 * nb))) <= 2
+    assert abs(n_late - (nb + round(1.0 * nb))) <= 2
+
+
 def test_sampler_eval_mode_is_noop():
     D = 16
     direct, scatter, joined = _synthetic_field(D)

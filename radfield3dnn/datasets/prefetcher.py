@@ -9,10 +9,16 @@ class CudaStreamPrefetcher:
     Prefetches fields non_blocking to GPU memory to overlap training and upload.
     """
 
-    def __init__(self, loader, device: torch.device, processings: Optional[list] = None):
+    def __init__(self, loader, device: torch.device, processings: Optional[list] = None,
+                 is_training: bool = True):
         self.loader = loader
         self.device = device
         self.processings = processings if processings is not None else []
+        # Train/val state for the processings. Augmentations and the MCFloorCut/ROI samplers
+        # self-gate on their own ``self.training``; nothing else sets it on the prefetch path, so
+        # we propagate it here (this loader is created per-split: train_dataloader → True,
+        # val/test → False) — that is what turns the samplers OFF during validation.
+        self.is_training = bool(is_training)
         self._stream = torch.cuda.Stream(device)
         self._uploaded_processings = False
         self._it = None
@@ -43,9 +49,10 @@ class CudaStreamPrefetcher:
                 for i in range(len(self.processings)):
                     self.processings[i] = self.processings[i].to(self.device)
                 self._uploaded_processings = True
-            # Each processing self-gates on its own training/epoch state, exactly as in the
-            # synchronous on_after_batch_transfer path.
+            # Set each processing's train/val mode, then apply. Each self-gates on its own
+            # training/epoch state (exactly as in the synchronous on_after_batch_transfer path).
             for process in self.processings:
+                process.train(self.is_training)
                 batch = process(batch)
             self._next = batch
 

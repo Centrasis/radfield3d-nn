@@ -18,9 +18,17 @@ class SimpleMLP(FeedforwardPointwiseModel):
     def _compute_dtype(self) -> torch.dtype:
         return torch.float16 if self._precision == "fp16" else torch.float32
 
-    def __init__(self, d_model: int = 128, precision: str = "fp32", learning_rate = 0.001, normalizer=None):
+    def __init__(self, d_model: int = 128, precision: str = "fp32", learning_rate = 0.001, normalizer=None,
+                 flux_loss: str = "FluxLoss", spectrum_loss: str = "HistogramLoss"):
         super().__init__(learning_rate, True, False, normalizer)
-        #self._flux_loss_fn = RawNeRFLoss(eps=1e-4)
+        # Losses are config-wired (ModuleBuilder registry names, e.g. "FluxLoss",
+        # "TwoROIGammaLoss", "HotspotAwareFluxLoss", "RawNeRFSharp") so the SimpleMLP loss study
+        # can sweep them from JSON configs exactly like PBRFNet.
+        from radfield3dnn.models.base import ModuleBuilder
+        self.flux_loss_name = flux_loss
+        self.spectrum_loss_name = spectrum_loss
+        self._flux_loss_fn = ModuleBuilder.ConstructLoss_fn(flux_loss)
+        self._spectrum_loss_fn = ModuleBuilder.ConstructLoss_fn(spectrum_loss)
         self.d_model = d_model
         self._precision = precision
         self.location_encoding  = SinusoidalFrequencyEncoding(10, 3, True)
@@ -75,6 +83,29 @@ class SimpleMLP(FeedforwardPointwiseModel):
             nn.SiLU(True),
             nn.Linear(d_model, d_model)
         )
+
+        self._init_flux_bias()
+
+    def _init_flux_bias(self):
+        # The flux output is element 32 of the final decoder Linear (32 spectrum + 1 flux). Bias it
+        # by the NORMALIZER family: linear → just above the floor (anti-collapse), log → midpoint.
+        # Default PyTorch init starts the bias ~0 → sigmoid(0)=0.5, the collapse-prone midpoint.
+        if self._normalizer is None:
+            return
+        from radfield3dnn.models.activations.flux_activations import flux_head_init_bias
+        out = self.decoder[-1]
+        if isinstance(out, nn.Linear) and out.bias is not None:
+            with torch.no_grad():
+                out.bias[32] = flux_head_init_bias(self.flux_act, self._normalizer)
+
+    def get_custom_parameters(self) -> dict:
+        return {
+            "d_model": self.d_model,
+            "precision": self._precision,
+            "flux_loss": self.flux_loss_name,
+            "spectrum_loss": self.spectrum_loss_name,
+            "normalizer": self._normalizer.get_type() if self._normalizer is not None else None,
+        }
 
     def encode_additional_parameters(self, batch: PositionalInput) -> Tensor:
         dtype = self._compute_dtype

@@ -27,7 +27,7 @@ from radfield3dnn.datasets.channel_join import ChannelsJoin
 from radfield3dnn.metrics.airkerma_accuracy import (
     AirkermaAccuracy, AirkermaRelDifferencesStdDev,
     AirkermaSphereAccuracy, AirkermaScatterAccuracy, AirkermaAccuracyEnergyWeighted,
-    AirkermaSupervoxelScatterAccuracy,
+    AirkermaSupervoxelScatterAccuracy, AirkermaBeamAccuracy,
 )
 from radfield3dnn.metrics.ssim import AirkermaSSIM
 from radfield3dnn.metrics import HistogramOverlapAccuracy
@@ -210,7 +210,15 @@ if __name__ == "__main__":
         # {scatter: <rel>, direct: <rel>} — scatter is diffuse/low-DR (cut gently,
         # keeps its spatial info) while the direct beam is sharp/high-DR (cut harder
         # to strip the MC leakage floor). See radfield3dnn/datasets/mc_floor_cut.py.
-        if isinstance(mc_floor, dict) and mc_floor.get("use_error", False):
+        if isinstance(mc_floor, dict) and (mc_floor.get("mask", False) or str(mc_floor.get("mode", "")).lower() == "neginf"):
+            # MASKING mode: set the shared FLOOR ROI to -inf (not 0), TRAINING-ONLY, join-safe.
+            # Pairs with the ROIbasedSampler (floor_as_zero) which re-injects a few floor zeros.
+            from radfield3dnn.roi import BEAM_REL_DEFAULT, SCATTER_LO_DEFAULT
+            b_rel = float(mc_floor.get("beam_rel", BEAM_REL_DEFAULT))
+            s_lo = float(mc_floor.get("scatter_lo", SCATTER_LO_DEFAULT))
+            dataprocessings.append(MCFloorCut(as_neginf=True, beam_rel=b_rel, scatter_lo=s_lo))
+            print(f"[green]MC floor cut (training target only, -inf MASK): floor ROI (NOT beam & joined < {s_lo:.0e}·joined_max) → -inf in both channels; validation sees the full field.")
+        elif isinstance(mc_floor, dict) and mc_floor.get("use_error", False):
             et = float(mc_floor.get("error_threshold", 0.5))
             dataprocessings.append(MCFloorCut(use_error=True, error_threshold=et))
             print(f"[green]MC floor cut (training target only, ERROR-based): zeroing per-channel voxels with MC error >= {et} (data-adaptive; joined keeps the union of confident voxels).")
@@ -279,10 +287,17 @@ if __name__ == "__main__":
                 scatter_ratio=is_cfg.get("scatter_ratio", 2.0),
                 floor_ratio=is_cfg.get("floor_ratio", 1.0),
                 field_multiplier=is_cfg.get("field_multiplier", 3.0),
+                floor_as_zero=is_cfg.get("floor_as_zero", True),
+                scatter_ratio_end=is_cfg.get("scatter_ratio_end", None),
+                schedule_switch=is_cfg.get("schedule_switch", 0.8),
             )
+            _sr_end = is_cfg.get("scatter_ratio_end", None)
+            _sched = "" if _sr_end is None else (f" → {_sr_end}×beam scatter for the last "
+                     f"{(1.0 - is_cfg.get('schedule_switch', 0.8)) * 100:.0f}% of epochs (fine-tune)")
             print(f"[green]ROI-based voxel sampling: keep {is_cfg.get('beam_keep_ratio',1.0)}·beam "
                   f"(>= {is_cfg.get('beam_rel',BEAM_REL_DEFAULT):.0e}·direct_max) + "
-                  f"{is_cfg.get('scatter_ratio',2.0)}×beam scatter + {is_cfg.get('floor_ratio',1.0)}×beam floor; "
+                  f"{is_cfg.get('scatter_ratio',2.0)}×beam scatter + {is_cfg.get('floor_ratio',1.0)}×beam floor"
+                  f"{' (floor→0)' if is_cfg.get('floor_as_zero', True) else ''}{_sched}; "
                   f"field ×{is_cfg.get('field_multiplier',3.0)}.")
         else:
             # ErrorbasedImportanceSampler: drop unreliable high-MC-error voxels as a WARMUP, then
@@ -426,6 +441,9 @@ if __name__ == "__main__":
             'airkerma_ssim': AirkermaSSIM(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, reduction='mean'),
             #'airkerma_onsphere_accuracy_radius25cm': AirkermaSphereAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, sphere_radius_m=0.25, voxel_size_m=vx),
             'airkerma_accuracy_scatter': AirkermaScatterAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, use_roi=True, scatter_lo=5e-5),
+            # Direct-beam SMAPE accuracy over the beam ROI (>= 5e-2*direct_max) — the complement of
+            # the scatter metric. STUDY TARGETS: scatter >= 0.8, beam >= 0.8, one gamma >= 0.9.
+            'airkerma_accuracy_beam': AirkermaBeamAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5),
             'noiseaware_airkerma_accuracy_scatter': AirkermaScatterAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, use_error=True, error_threshold=0.5),
             'legacy_airkerma_accuracy_scatter': AirkermaScatterAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, use_error=False),
             'airkerma_accuracy_roi': AirkermaAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, importance_threshold=0.01),

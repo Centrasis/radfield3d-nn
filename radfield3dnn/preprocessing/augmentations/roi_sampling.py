@@ -26,7 +26,8 @@ from radfield3dnn.roi import compute_roi_masks, BEAM_REL_DEFAULT, SCATTER_LO_DEF
 class ROIbasedSampler(DataProcessing):
     def __init__(self, beam_rel: float = BEAM_REL_DEFAULT, scatter_lo: float = SCATTER_LO_DEFAULT,
                  beam_keep_ratio: float = 1.0, scatter_ratio: float = 2.0, floor_ratio: float = 1.0,
-                 field_multiplier: float = 3.0):
+                 field_multiplier: float = 3.0, floor_as_zero: bool = True,
+                 scatter_ratio_end: float = None, schedule_switch: float = 0.8):
         """
         :param beam_rel:       beam = direct >= beam_rel * direct_max (matches the metric/loss).
         :param scatter_lo:     scatter floor = joined >= scatter_lo * joined_max.
@@ -36,6 +37,17 @@ class ROIbasedSampler(DataProcessing):
                                number of floor voxels that exist (may be 0), default 1.0.
         :param field_multiplier: how many times each field is repeated per epoch (>1). Each repeat
                                re-keeps the beam but draws a fresh random scatter/floor subset.
+        :param floor_as_zero:  if True (default), the sampled FLOOR voxels are set to a genuine 0
+                               (not their noisy MC value), so the network is shown "a bit of zero"
+                               and does not hallucinate signal in the background; the rest of the
+                               floor (and non-sampled scatter) stays -inf/masked. If False the
+                               sampled floor keeps its original (noisy) target value.
+        :param scatter_ratio_end: if set, the scatter_ratio is SCHEDULED — ``scatter_ratio`` for the
+                               first ``schedule_switch`` fraction of training, then this value for
+                               the rest (e.g. start 2.5 → end 1.0 over the last 20% for fine-tuning).
+                               Driven by LimitedAugmentation.set_schedule_progress. None = constant.
+        :param schedule_switch: training-progress fraction [0..1] at which scatter_ratio switches to
+                               scatter_ratio_end (default 0.8 = last 20% of epochs).
         """
         super().__init__()
         assert 0.0 <= beam_keep_ratio <= 1.0, "beam_keep_ratio must be in [0, 1]"
@@ -46,6 +58,21 @@ class ROIbasedSampler(DataProcessing):
         self.scatter_ratio = float(scatter_ratio)
         self.floor_ratio = float(floor_ratio)
         self.field_multiplier = float(field_multiplier)
+        self.floor_as_zero = bool(floor_as_zero)
+        self.scatter_ratio_end = float(scatter_ratio_end) if scatter_ratio_end is not None else None
+        self.schedule_switch = float(schedule_switch)
+        self._progress = 0.0   # 0→1 over the active training window (set by LimitedAugmentation)
+
+    def set_schedule_progress(self, p: float):
+        """Hook driven by LimitedAugmentation: fraction of the active window elapsed (0→1)."""
+        self._progress = float(p)
+
+    @property
+    def _eff_scatter_ratio(self) -> float:
+        """Current scatter_ratio honouring the optional start→end schedule."""
+        if self.scatter_ratio_end is None:
+            return self.scatter_ratio
+        return self.scatter_ratio_end if self._progress >= self.schedule_switch else self.scatter_ratio
 
     def to(self, *args, **kwargs):
         super().to(*args, **kwargs)
@@ -65,18 +92,20 @@ class ROIbasedSampler(DataProcessing):
         out[idx[perm]] = True
         return out.view_as(mask)
 
-    def _keep_mask(self, direct: torch.Tensor, joined: torch.Tensor) -> torch.Tensor:
-        """Boolean keep-mask over the field: all (or beam_keep_ratio of) beam + a random
-        scatter_ratio×beam scatter subset + a random floor_ratio×beam floor subset (floor capped)."""
+    def _keep_masks(self, direct: torch.Tensor, joined: torch.Tensor):
+        """Return (keep_real, keep_floor) boolean masks: keep_real = all (or beam_keep_ratio of)
+        beam + a random scatter_ratio×beam scatter subset (targets kept at their real value);
+        keep_floor = a random floor_ratio×beam floor subset (capped; set to 0 when floor_as_zero).
+        Everything in NEITHER mask is dropped (-inf)."""
         beam, scatter, floor = compute_roi_masks(direct, joined, self.beam_rel, self.scatter_lo)
 
         keep_beam = beam if self.beam_keep_ratio >= 1.0 else \
             self._subsample(beam, int(round(self.beam_keep_ratio * int(beam.sum()))))
         n_beam = int(keep_beam.sum())
 
-        keep_scatter = self._subsample(scatter, int(round(self.scatter_ratio * n_beam)))
+        keep_scatter = self._subsample(scatter, int(round(self._eff_scatter_ratio * n_beam)))
         keep_floor = self._subsample(floor, int(round(self.floor_ratio * n_beam)))  # capped inside
-        return keep_beam | keep_scatter | keep_floor
+        return keep_beam | keep_scatter, keep_floor
 
     def forward(self, x: TrainingInputData) -> TrainingInputData:
         if not self.training:
@@ -98,20 +127,33 @@ class ROIbasedSampler(DataProcessing):
         else:
             return x  # AirKermaField etc. — ROI sampling not defined
 
-        keep = self._keep_mask(direct, joined)
-        drop_mask = ~keep
-        if not drop_mask.any():
+        keep_real, keep_floor = self._keep_masks(direct, joined)
+        # zero_mask: floor voxels re-injected as genuine 0 (only when floor_as_zero); otherwise the
+        # sampled floor keeps its real value and just joins keep_real.
+        if self.floor_as_zero:
+            zero_mask = keep_floor
+        else:
+            keep_real = keep_real | keep_floor
+            zero_mask = torch.zeros_like(keep_real)
+        drop_mask = ~(keep_real | zero_mask)   # neither kept-real nor zero-injected → -inf
+        if not drop_mask.any() and not zero_mask.any():
             return x
+
+        def _apply(t: torch.Tensor, dm: torch.Tensor, zm: torch.Tensor) -> torch.Tensor:
+            # zero-inject first (floor → 0), then mask the dropped voxels to -inf.
+            out = torch.where(zm, torch.zeros_like(t), t)
+            out = torch.where(dm, torch.full_like(t, -torch.inf), out)
+            return out.contiguous()
 
         def _mask_channel(ch: RadiationFieldChannel) -> RadiationFieldChannel:
             if ch is None:
                 return None
-            neg = torch.full_like(ch.flux, -torch.inf)
             spec = None
             if ch.spectrum is not None:
-                dm = drop_mask.expand_as(ch.spectrum)
-                spec = torch.where(dm, torch.full_like(ch.spectrum, -torch.inf), ch.spectrum).contiguous()
-            return ch._replace(flux=torch.where(drop_mask, neg, ch.flux).contiguous(), spectrum=spec)
+                dm_s = drop_mask.expand_as(ch.spectrum)
+                zm_s = zero_mask.expand_as(ch.spectrum)
+                spec = _apply(ch.spectrum, dm_s, zm_s)
+            return ch._replace(flux=_apply(ch.flux, drop_mask, zero_mask), spectrum=spec)
 
         tgt = x.ground_truth
         if isinstance(tgt, RadiationField):
@@ -120,8 +162,7 @@ class ROIbasedSampler(DataProcessing):
         elif isinstance(tgt, RadiationFieldChannel):
             new_gt = _mask_channel(tgt)
         elif isinstance(tgt, AirKermaField):
-            neg = torch.full_like(tgt.air_kerma, -torch.inf)
-            new_gt = tgt._replace(air_kerma=torch.where(drop_mask, neg, tgt.air_kerma).contiguous())
+            new_gt = tgt._replace(air_kerma=_apply(tgt.air_kerma, drop_mask, zero_mask))
         else:
             raise TypeError("Unsupported ground truth type for ROI sampling.")
 
@@ -138,4 +179,7 @@ class ROIbasedSampler(DataProcessing):
             "scatter_ratio": self.scatter_ratio,
             "floor_ratio": self.floor_ratio,
             "field_multiplier": self.field_multiplier,
+            "floor_as_zero": self.floor_as_zero,
+            "scatter_ratio_end": self.scatter_ratio_end if self.scatter_ratio_end is not None else self.scatter_ratio,
+            "schedule_switch": self.schedule_switch,
         }

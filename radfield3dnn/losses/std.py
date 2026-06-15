@@ -439,10 +439,20 @@ class RawNeRFLoss(Loss):
                 prediction = prediction.squeeze(-1)
             elif target.ndim == prediction.ndim + 1 and target.shape[-1] == 1:
                 target = target.squeeze(-1)
+        # -inf = masked / not-sampled. Excluded from the loss AND the reduction (vf below), so a
+        # masked voxel never contributes — robust to the MCFloorCut / ROIbasedSampler sentinel.
         valid = torch.isfinite(target) & torch.isfinite(prediction)
         t = target.masked_fill(~valid, 0.0)
         p = prediction.masked_fill(~valid, 0.0)
-        w = 1.0 / (p.detach().abs() + self.eps)              # sg(p): self-normalizing HDR weight
+        # Self-normalizing HDR weight (Mildenhall et al.) is ``1/(sg(p)+eps)`` — but at p→0 with a
+        # nonzero target it blows up to (t/eps)² (≈700 on DS03, unbounded as eps→0), which the
+        # study diagnostics flagged (loss(zero-pred)=681, |grad|=16) and which destabilised DB-MTL
+        # and the rawnerfsharp run. FIX: floor the denominator by the (detached) TARGET scale,
+        # ``1/(max(sg(p), |t|)+eps)``. This keeps the cross-decade relative weighting (when p≈t,
+        # w≈1/t) but BOUNDS every term to ≤1: under-prediction p→0 → ((0−t)/(|t|+eps))²≤1,
+        # over-prediction p≫t → ((p−t)/p)²≤1. The weight stays a pure stop-gradient factor.
+        scale = torch.maximum(p.detach().abs(), t.detach().abs())
+        w = 1.0 / (scale + self.eps)
         per_voxel = ((p - t) * w) ** 2
         per_voxel = torch.nan_to_num(per_voxel, nan=0.0, posinf=0.0, neginf=0.0)
         if per_voxel.ndim <= 1:

@@ -59,7 +59,9 @@ class TrainTask(Task):
         # high-LR sweep overflows their fp16 fused weights to NaN, and their
         # `configure_optimizers` clamps the LR to `max_lr` anyway, so the sweep
         # is both harmful and pointless — they run at their configured LR.
-        if getattr(model, "use_lr_finder", True):
+        # On resume the checkpoint restores the optimizer (incl. its LR), so the
+        # finder's 250-step sweep would be pure overhead and overwrite it.
+        if getattr(model, "use_lr_finder", True) and not os.environ.get("RF_RESUME_CKPT"):
             print(f"[blue]Search learning rate with batch size {datamodule.batch_size}...")
             lr_trainer = pl.Trainer(
                 accelerator="gpu",

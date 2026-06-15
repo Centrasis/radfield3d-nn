@@ -17,18 +17,35 @@ Each threshold is relative to that channel's own per-field peak. The spectrum is
 where the flux is, so air-kerma there is exactly zero (matching how the metric masks low
 flux).
 """
+import torch
 from RadFiled3D.pytorch.datasets.processing import DataProcessing
 from radfield3dnn.rftypes import RadiationField, RadiationFieldChannel, rf3RadiationField
+from radfield3dnn.roi import compute_roi_masks, BEAM_REL_DEFAULT, SCATTER_LO_DEFAULT
 
 
 class MCFloorCut(DataProcessing):
     def __init__(self, rel_threshold: float = 1e-3,
                  scatter_rel: float = None, direct_rel: float = None,
-                 use_error: bool = False, error_threshold: float = 0.5):
+                 use_error: bool = False, error_threshold: float = 0.5,
+                 as_neginf: bool = False,
+                 beam_rel: float = BEAM_REL_DEFAULT, scatter_lo: float = SCATTER_LO_DEFAULT):
         super().__init__()
         # Per-channel value thresholds; fall back to the single rel_threshold when not given.
         self.scatter_rel = float(scatter_rel if scatter_rel is not None else rel_threshold)
         self.direct_rel = float(direct_rel if direct_rel is not None else rel_threshold)
+        # MASKING mode (``as_neginf``): instead of ZEROING the noise floor per channel, mask the
+        # shared FLOOR ROI (radfield3dnn.roi: NOT beam AND joined < scatter_lo·joined_max) to -inf
+        # in BOTH channels — the same sentinel the ROIbasedSampler/losses use, so the loss simply
+        # excludes those voxels (a zero floor still trains the net toward zero and feeds the
+        # all-zero collapse; -inf removes that pressure entirely). It is JOIN-SAFE: it masks on the
+        # joined floor, so a scatter-region voxel whose direct channel is floor is NOT masked (its
+        # joined value is above the floor) — unlike per-channel zeroing, where -inf in one channel
+        # would poison the joined voxel after ChannelsJoin. It is TRAINING-ONLY (validation sees the
+        # whole, unmasked field) and matches the ROI floor so the sampler can re-inject a few floor
+        # voxels as genuine zeros.
+        self.as_neginf = bool(as_neginf)
+        self.beam_rel = float(beam_rel)
+        self.scatter_lo = float(scatter_lo)
         # Error-based mode: zero each channel where its per-voxel MC error flags the voxel
         # as noise-dominated (error >= error_threshold; the DS03 error field is ~binary {0,1}).
         # This is data-adaptive — the dropped fraction is whatever is genuinely noise-dominated
@@ -54,10 +71,43 @@ class MCFloorCut(DataProcessing):
             new_spec = ch.spectrum * keep
         return ch._replace(flux=flux * keep, spectrum=new_spec)
 
+    def _mask_floor_neginf(self, gt):
+        """Mask the shared FLOOR ROI to -inf in both channels (join-safe, see __init__)."""
+        scatter = gt.scatter_field
+        direct = gt.direct_beam
+        sc_flux = scatter.flux if scatter is not None else None
+        dr_flux = direct.flux if direct is not None else None
+        if sc_flux is None and dr_flux is None:
+            return gt
+        joined = (sc_flux if sc_flux is not None else 0) + (dr_flux if dr_flux is not None else 0)
+        direct_for_beam = dr_flux if dr_flux is not None else joined  # no split → beam from joined
+        _, _, floor = compute_roi_masks(direct_for_beam, joined, self.beam_rel, self.scatter_lo)
+        if not bool(floor.any()):
+            return gt
+
+        def _mask(ch):
+            if ch is None or ch.flux is None:
+                return ch
+            neg = torch.full_like(ch.flux, -torch.inf)
+            new_flux = torch.where(floor, neg, ch.flux)
+            new_spec = ch.spectrum
+            if ch.spectrum is not None:
+                fm = floor.expand_as(ch.spectrum)
+                new_spec = torch.where(fm, torch.full_like(ch.spectrum, -torch.inf), ch.spectrum)
+            return ch._replace(flux=new_flux, spectrum=new_spec)
+
+        return gt._replace(scatter_field=_mask(scatter), direct_beam=_mask(direct))
+
     def forward(self, x):
         gt = x.ground_truth
         if not isinstance(gt, (RadiationField, rf3RadiationField)):
             return x
+        if self.as_neginf:
+            # Masking mode is TRAINING-ONLY: validation/test must see the whole, unmasked field
+            # to check whether the model predicts the full volume despite the sparse training mask.
+            if not self.training:
+                return x
+            return x._replace(ground_truth=self._mask_floor_neginf(gt))
         return x._replace(ground_truth=gt._replace(
             scatter_field=self._cut(gt.scatter_field, self.scatter_rel),
             direct_beam=self._cut(gt.direct_beam, self.direct_rel),

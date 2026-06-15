@@ -15,6 +15,8 @@ from .feedforward import *
 from .xattn_siren import *
 from .field_unet import *
 from .mlp import *
+from .pbrf_analytic import *
+from .pbrf_spectrum_residual import *
 from radfield3dnn.rftypes import PositionalInput
 from enum import Enum
 

@@ -248,6 +248,39 @@ class AirkermaSupervoxelScatterAccuracy(AirkermaAccuracy):
         return self.metric.forward(t_sv, p_sv, input)
 
 
+class AirkermaBeamAccuracy(AirkermaAccuracy):
+    """Direct-beam air-kerma SMAPE accuracy: scores ONLY the beam ROI
+    (direct >= ``beam_rel``·direct_max — the shared definition of radfield3dnn.roi, matched to
+    AirkermaScatterAccuracy(use_roi=True) and TwoROIGammaLoss). The complement of the scatter
+    metric: together they cover the full target region of the 0.8+/0.8+ accuracy goals."""
+
+    def __init__(self, mu_tr_file: str, spectra_bins: int, max_energy_eV: float,
+                 weight_with_error: bool = False, keep_dim: bool = False,
+                 metric_type: Union[Literal['smape'], Literal['log_rmse'], Literal['ncc']] = 'smape',
+                 beam_rel: float = 5e-2):
+        super().__init__(mu_tr_file, spectra_bins, max_energy_eV, weight_with_error,
+                         importance_threshold=0.0, keep_dim=keep_dim, metric_type=metric_type)
+        self.beam_rel = float(beam_rel)
+
+    def forward(self, target: Union[RadiationFieldChannel, AirKermaField, Tensor], prediction: Union[RadiationFieldChannel, AirKermaField, Tensor], input: TrainingInputData = None) -> Tensor:
+        assert (isinstance(input.ground_truth, RadiationField) and input.ground_truth.direct_beam is not None) or (input.original_ground_truth is not None and input.original_ground_truth.direct_beam is not None), "Input TrainingInputData must contain direct_beam for beam accuracy."
+        xgt_ch = input.original_ground_truth.direct_beam if input.original_ground_truth is not None and input.original_ground_truth.direct_beam is not None else input.ground_truth.direct_beam
+        xgt = xgt_ch.flux if isinstance(xgt_ch, RadiationFieldChannel) else xgt_ch
+        non_beam = ~(xgt > xgt.max() * self.beam_rel)   # exclude everything OUTSIDE the beam
+
+        def _masked(x):
+            if isinstance(x, RadiationFieldChannel):
+                f = x.flux.clone(); f[non_beam] = -torch.inf
+                return x._replace(flux=f)
+            elif isinstance(x, AirKermaField):
+                a = x.air_kerma.clone(); a[non_beam] = -torch.inf
+                return x._replace(air_kerma=a)
+            x = x.clone(); x[non_beam] = -torch.inf
+            return x
+
+        return super().forward(_masked(target), _masked(prediction), input)
+
+
 class AirkermaScatterAccuracy(AirkermaAccuracy):
     def __init__(self, mu_tr_file: str, spectra_bins: int, max_energy_eV: float, weight_with_error: bool = False, keep_dim: bool = False, max_relative_flux: float = 5e-2, min_relative_flux: float = 5e-3, metric_type: Union[Literal['smape'], Literal['log_rmse'], Literal['ncc']] = 'smape',
                  use_error: bool = True, error_threshold: float = 0.5,

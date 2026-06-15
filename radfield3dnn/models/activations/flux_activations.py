@@ -3,6 +3,34 @@ from torch import nn
 from torch import Tensor
 
 
+# Fraction of the codomain ABOVE the floor at which a LINEAR-normalizer flux head starts. DS03
+# linear0_1 targets are crushed near 0 (median ~1e-4, mean ~2e-3), so starting the head at the
+# codomain MIDPOINT (0.5) puts ~99% of voxels far above their target → the bulk L1 gradient sweeps
+# the whole field DOWN and overshoots into the all-zero basin (the documented collapse). Starting
+# just above the floor (~1% of range) instead means the bulk is already ~correct (≈0 gradient) and
+# the only live signal is the bright beam/scatter voxels pulling UP — collapse-aligned.
+LINEAR_INIT_FRACTION = 0.01
+
+
+def flux_head_init_bias(activation, normalizer) -> float:
+    """Pre-activation bias for the flux output head, chosen by the NORMALIZER family:
+
+      * LINEAR normalizer (linear0_1 / linear-1_1): the target bulk sits at the codomain floor, so
+        start the head just above it (``LINEAR_INIT_FRACTION`` of the range) — see the constant.
+      * LOG-like normalizer (log_scale / asinh tonemap): the transform already spreads the dynamic
+        range, so the codomain MIDPOINT (each activation's ``init_bias``, the max-gradient point) is
+        the right, well-conditioned start.
+    """
+    # Duck-typed normalizer family detection (avoids importing the normalizer classes here).
+    is_log_like = hasattr(normalizer, "log_max") or any(
+        k in type(normalizer).__name__.lower() for k in ("log", "asinh", "tonemap"))
+    if is_log_like or not hasattr(activation, "bias_for_output"):
+        return float(getattr(activation, "init_bias", 0.0))
+    lo, hi = getattr(normalizer, "range", (0.0, 1.0))
+    target_output = lo + (hi - lo) * LINEAR_INIT_FRACTION
+    return float(activation.bias_for_output(target_output))
+
+
 class GradientConservingClamping(nn.Module):
     def __init__(self, min_value=0.0, max_value=1.0):
         super().__init__()
@@ -15,6 +43,10 @@ class GradientConservingClamping(nn.Module):
         # initial output at the codomain midpoint (max distance from both saturating floors)
         # is the midpoint itself.
         return 0.5 * (self.min_value + self.max_value)
+
+    def bias_for_output(self, y: float) -> float:
+        # Identity inside the range → the pre-activation producing output y is y itself (clamped).
+        return float(min(max(y, self.min_value), self.max_value))
 
     def forward(self, x: Tensor) -> Tensor:
         clamped_x = torch.clamp(x, min=self.min_value, max=self.max_value)
@@ -53,6 +85,12 @@ class SoftClip(nn.Module):
         # tanh is centered at 0: output 0.5 (codomain midpoint), maximum gradient k/2.
         return 0.0
 
+    def bias_for_output(self, y: float) -> float:
+        # y = 0.5*(tanh(kx)+1) → x = atanh(2y-1)/k. Clamp y off the asymptotes.
+        import math
+        y = min(max(y, 1e-6), 1.0 - 1e-6)
+        return float(math.atanh(2.0 * y - 1.0) / self.k)
+
     def forward(self, x: Tensor) -> Tensor:
         return 0.5 * (torch.tanh(self.k * x) + 1.0)
 
@@ -86,6 +124,13 @@ class LogitSigmoid(nn.Module):
     def init_bias(self) -> float:
         # sigmoid(0) = 0.5: codomain midpoint and maximum-gradient point of the logistic.
         return 0.0
+
+    def bias_for_output(self, y: float) -> float:
+        # y = sigmoid(z) → z = logit(y) = log(y/(1-y)); clamped to the grad-conserving logit range.
+        import math
+        y = min(max(y, 1e-12), 1.0 - 1e-12)
+        z = math.log(y / (1.0 - y))
+        return float(min(max(z, -self.logit_range), self.logit_range))
 
     def forward(self, x: Tensor) -> Tensor:
         z = x + (torch.clamp(x, -self.logit_range, self.logit_range) - x).detach()

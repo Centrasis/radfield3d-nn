@@ -10,7 +10,8 @@ class HistogramLoss(Loss):
     """Loss for comparing spectral histograms: Wasserstein + L1."""
 
     def __init__(self, bin_dim: int = -1, weight_with_error: bool = False,
-                 penalize_out_of_range: bool = False, calc_moments: bool = False):
+                 penalize_out_of_range: bool = False, calc_moments: bool = False,
+                 ws_weight: float = 0.7, l1_weight: float = 0.3):
         super().__init__()
         self.weight_with_error = weight_with_error
         self.penalize_out_of_range = penalize_out_of_range
@@ -18,6 +19,11 @@ class HistogramLoss(Loss):
         self.wasserstein_loss = WassersteinLossWeighted(bin_dim, weight_with_error)
         self.bin_dim = bin_dim
         self.calc_moments = calc_moments
+        # W:L1 split for the non-moments path (default 0.7/0.3 = the historic behaviour). A pure
+        # EMD spectrum loss = (1.0, 0.0) — runs through this class's -inf-mask-safe path (the bare
+        # WassersteinLossWeighted does NOT handle the ROI/-inf masking, so go through here).
+        self.ws_weight = float(ws_weight)
+        self.l1_weight = float(l1_weight)
 
     def compute_moments(self, dist: Tensor) -> tuple[Tensor, Tensor]:
         x = torch.arange(dist.size(self.bin_dim), dtype=dist.dtype, device=dist.device)
@@ -86,4 +92,4 @@ class HistogramLoss(Loss):
             moments_loss = torch.clamp(moments_loss, max=1.0, min=0.0)
             return ws * 0.33 + l1 * 0.33 + moments_loss * 0.34
         else:
-            return ws * 0.7 + l1 * 0.3
+            return ws * self.ws_weight + l1 * self.l1_weight

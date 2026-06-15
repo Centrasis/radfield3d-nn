@@ -140,28 +140,29 @@ class RadiationFieldDataModule(pl.LightningDataModule):
             return None
         return device if device.type == "cuda" else None
 
-    def _maybe_wrap(self, dl):
+    def _maybe_wrap(self, dl, is_training: bool):
         """Wrap a dataloader in the side-stream prefetcher when prefetch is enabled and a CUDA
-        device is available; otherwise return it untouched."""
+        device is available; otherwise return it untouched. ``is_training`` is propagated to the
+        processings so train-only augmentations/samplers are skipped on the val/test loaders."""
         if not self._prefetch_to_device:
             return dl
         device = self._resolve_device()
         if device is None:
             return dl
         self._prefetch_active = True
-        return CudaStreamPrefetcher(dl, device, self.data_processings)
+        return CudaStreamPrefetcher(dl, device, self.data_processings, is_training=is_training)
 
     def train_dataloader(self):
         dl = self.dataloader_builder.build_dataloader(self.train_dataset, batch_size=self.batch_size, shuffle=True, worker_count=self.cpu_count)
-        return self._maybe_wrap(dl)
+        return self._maybe_wrap(dl, is_training=True)
 
     def val_dataloader(self):
         dl = self.dataloader_builder.build_dataloader(self.val_dataset, batch_size=self.batch_size, shuffle=False, worker_count=self.cpu_count)
-        return self._maybe_wrap(dl)
+        return self._maybe_wrap(dl, is_training=False)
 
     def test_dataloader(self):
         dl = self.dataloader_builder.build_dataloader(self.test_dataset, batch_size=self.batch_size, shuffle=False, worker_count=self.cpu_count)
-        return self._maybe_wrap(dl)
+        return self._maybe_wrap(dl, is_training=False)
 
     def transfer_batch_to_device(self, batch, device, dataloader_idx):
         # When the prefetcher is active the batch is already resident on the target device; skip
@@ -183,8 +184,11 @@ class RadiationFieldDataModule(pl.LightningDataModule):
                     self.data_processings[i] = self.data_processings[i].to(batch.ground_truth.flux.device)
             self.uploaded_processings = True
 
+        # Non-prefetch path: propagate the trainer's train/val state to each processing (same role
+        # as CudaStreamPrefetcher.is_training) so train-only augmentations/samplers self-gate off
+        # during validation, then apply.
         is_training = (self.trainer is None) or self.trainer.training
         for process in self.data_processings:
-            if is_training or not isinstance(batch, LimitedAugmentation):
-                batch = process(batch)
+            process.train(is_training)
+            batch = process(batch)
         return batch

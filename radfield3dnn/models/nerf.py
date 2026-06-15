@@ -436,9 +436,12 @@ class SRBFNet(RFNetBase):
         # sigmoid -> 0 (output 0.5). A zero bias on a clamp(0,1) head would start at the clamp
         # FLOOR, where the peak-crushed scatter band gets no gradient -> predict-0 lock-in
         # (verified in claude-notes/hdr-analysis/_init_test.py).
+        # Bias depends on the NORMALIZER: linear → just above the floor (anti-collapse), log-like →
+        # codomain midpoint (max gradient). See flux_activations.flux_head_init_bias.
         flux_linears = [m for m in self.backbone_model.flux_decoder.modules() if isinstance(m, nn.Linear)]
         if flux_linears and flux_linears[-1].bias is not None:
-            bias = float(getattr(self.backbone_model.flux_activation, "init_bias", 0.0))
+            from radfield3dnn.models.activations.flux_activations import flux_head_init_bias
+            bias = flux_head_init_bias(self.backbone_model.flux_activation, self._normalizer)
             nn.init.constant_(flux_linears[-1].bias, bias)
 
         if self.backbone_model.beam_conditioner1 is not None:

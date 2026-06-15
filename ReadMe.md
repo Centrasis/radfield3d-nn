@@ -76,6 +76,13 @@ augmentations:
   enabled: false
   smooth_spectra: false
   join_channels: false
+  mc_floor_cut:             # remove the MC noise floor from the TRAINING target (off for val/test)
+    # scalar (e.g. 1.0e-3) or {scatter, direct} → ZERO per-channel voxels below rel*peak; OR:
+    mask: true              # MASK mode: set the FLOOR ROI to -inf (not 0) in both channels.
+    # beam_rel: 0.05        #   floor = NOT beam AND joined < scatter_lo*joined_max (shared ROI),
+    # scatter_lo: 5.0e-5    #   join-safe; a zero floor trains toward zero (feeds collapse), -inf
+    #                       #   excludes it. Pair with the roi sampler's floor_as_zero to re-inject
+    #                       #   a few floor zeros so the net still sees "a bit of zero".
   importance_sampling:
     enabled: false
     method: error            # "error" (default) or "roi" — selects the voxel sampler
@@ -88,7 +95,10 @@ augmentations:
     beam_keep_ratio: 1.0     # fraction of beam voxels kept (0..1, default 1 = keep all)
     scatter_ratio: 2.0       # scatter voxels sampled per kept beam voxel (0..inf)
     floor_ratio: 1.0         # floor voxels sampled per kept beam voxel (capped by what exists)
+    floor_as_zero: true      # re-inject the sampled floor as genuine 0 (else keep its noisy value)
     field_multiplier: 3.0    # repeat each field ×N/epoch; beam always kept, fresh scatter subset each repeat
+    # NOTE: both mc_floor_cut and the roi/error sampler are TRAINING-ONLY — validation/test see the
+    #       whole, unmasked field, so accuracy measures whole-field generalisation.
 
 tune:
   n_trials: 50

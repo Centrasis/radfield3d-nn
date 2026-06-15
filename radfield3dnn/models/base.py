@@ -72,6 +72,12 @@ class ModuleBuilder:
             return std.WassersteinLossWeighted(dim=1, weight_with_error=False)
         elif loss_fn_name == "HistogramLoss":
             return comb_loss.HistogramLoss(bin_dim=1, weight_with_error=False, penalize_out_of_range=False, calc_moments=False)
+        elif loss_fn_name == "SpectrumWasserstein":
+            # PURE Earth-Mover (no L1 term) spectrum loss. Routed through HistogramLoss so it inherits
+            # the -inf/ROI-mask-safe bin-permute path (the bare WassersteinLossWeighted scrambles
+            # histograms under masking). = HistogramLoss with the W:L1 split set to (1.0, 0.0).
+            return comb_loss.HistogramLoss(bin_dim=1, weight_with_error=False, penalize_out_of_range=False,
+                                           calc_moments=False, ws_weight=1.0, l1_weight=0.0)
         elif loss_fn_name == "StructuralSimilarity3DLoss":
             return std.StructuralSimilarity3DLoss(weight_with_error=False)
         elif loss_fn_name == "L1ChannelBalanced":
@@ -563,7 +569,8 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
         with torch.no_grad():
             if is_complete_volume:
                 bins = self.out_spectra_dim if hasattr(self, "out_spectra_dim") else 32
-                return self.forward2volume(batch.input, torch.tensor([2, 2, 2]), spectra_bins=bins)
+                dims = torch.tensor([2, 2, 2], dtype=torch.int32, device=batch.input.direction.device)
+                return self.forward2volume(batch.input, dims, spectra_bins=bins)
             x = batch.input
             x2 = type(x)(*[(v[:2] if isinstance(v, Tensor) else v) for v in x])
             return self(x2)

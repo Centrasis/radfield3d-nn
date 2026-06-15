@@ -14,11 +14,25 @@ class ChannelsJoin(DataProcessing):
         scatter_flux = field.scatter_field.flux
         beam_flux = field.direct_beam.flux
 
-        # Valid datasets are required to be NaN/Inf-free; surface any
-        # violation as a hard error here so the pipeline can't silently
-        # corrupt training data downstream.
-        assert torch.isfinite(scatter_flux).all() and torch.isfinite(beam_flux).all(), \
-            "ChannelsJoin: non-finite values in scatter/direct flux — dataset is invalid."
+        # -inf is the MASK sentinel (MCFloorCut/ROIbasedSampler): those voxels are excluded
+        # downstream. MCFloorCut masks the FLOOR ROI in BOTH channels at the same voxels, so the
+        # mask is consistent. Replace the sentinel with 0 for the join arithmetic, then re-apply
+        # -inf to the joined flux/spectrum. NaN or +inf is still real corruption — reject it.
+        neg_mask = torch.isneginf(scatter_flux) | torch.isneginf(beam_flux)
+        assert (torch.isfinite(scatter_flux) | torch.isneginf(scatter_flux)).all() \
+            and (torch.isfinite(beam_flux) | torch.isneginf(beam_flux)).all(), \
+            "ChannelsJoin: NaN/+inf in scatter/direct flux — dataset is invalid."
+        if neg_mask.any():
+            scatter_flux = scatter_flux.masked_fill(neg_mask, 0.0)
+            beam_flux = beam_flux.masked_fill(neg_mask, 0.0)
+            field = field._replace(
+                scatter_field=field.scatter_field._replace(
+                    flux=scatter_flux,
+                    spectrum=torch.nan_to_num(field.scatter_field.spectrum, neginf=0.0)),
+                direct_beam=field.direct_beam._replace(
+                    flux=beam_flux,
+                    spectrum=torch.nan_to_num(field.direct_beam.spectrum, neginf=0.0)),
+            )
 
         total_flux = scatter_flux + beam_flux
 
@@ -78,6 +92,13 @@ class ChannelsJoin(DataProcessing):
             total_error = field.direct_beam.error
         elif field.direct_beam.error is not None:
             total_error = (total_error + field.direct_beam.error) / 2.0
+
+        # Propagate the -inf mask sentinel onto the joined flux + spectrum so the downstream losses
+        # exclude exactly the masked (floor) voxels.
+        if neg_mask.any():
+            total_flux = total_flux.masked_fill(neg_mask, -torch.inf)
+            spec_mask = neg_mask if spectrum.ndim == total_flux.ndim else neg_mask.unsqueeze(bin_axis)
+            spectrum = spectrum.masked_fill(spec_mask.expand_as(spectrum), -torch.inf)
 
         return RadiationFieldChannel(
             spectrum=spectrum,
