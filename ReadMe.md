@@ -210,7 +210,7 @@ The byte layout is owned by `rfnn::io::V1::ModelStore` (the reference implementa
 
 ```
 [4]    magic "RF3M"
-[u32]  version (== 2)
+[u32]  version (== 2)            # version == 1 would be tcnn; version 2 uses ONNX
 [str]  dataset_name              # str = [u32 length][UTF-8 bytes]
 [str]  software_version
 [str]  physics
