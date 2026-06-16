@@ -40,7 +40,6 @@ runs:
           deploy-deps-${{ runner.os }}-
 
     - name: Configure & build (deployment, TCNN off)
-      shell: bash
       # pwsh (not bash) on BOTH OSes: under Git-bash on Windows, /usr/bin/link shadows MSVC's
       # link.exe and the Ninja build fails at link time. pwsh keeps the MSVC env clean. It is
       # preinstalled on the Linux runners too, so one shell covers both.
