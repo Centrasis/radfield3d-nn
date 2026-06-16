@@ -63,6 +63,25 @@ runs:
         cmake --build build_deploy --target rfnn_deploy 2>&1 | Tee-Object -FilePath build.log
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+    # Diagnostics: on a build failure, emit the tail of the captured log as a GitHub ::error::
+    # annotation. Unlike run logs (admin-only) and artifacts (auth-only), check-run annotations
+    # are readable on a public repo without auth. Remove once the matrix is stable.
+    - name: Emit build error as annotation on failure
+      if: failure()
+      shell: bash
+      run: |
+        python - <<'PY'
+        import os
+        log = "build.log" if os.path.exists("build.log") and os.path.getsize("build.log") else "configure.log"
+        try:
+            lines = open(log, encoding="utf-8", errors="replace").read().splitlines()
+        except FileNotFoundError:
+            lines = [f"(no {log} produced)"]
+        tail = "\n".join(lines[-70:])[-4000:]
+        enc = tail.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print(f"::error title=deploy-build ({log})::{enc}")
+        PY
+
     # Diagnostics: on a build failure, surface the captured logs as an artifact (admin-only run
     # logs make remote debugging hard). Remove once the matrix is stable.
     - name: Upload build logs on failure
