@@ -68,7 +68,7 @@ endif()
 FetchContent_Declare(
   fetch_radfiled3d
   GIT_REPOSITORY https://github.com/Centrasis/RadFiled3D.git
-  GIT_TAG        1.3.3
+  GIT_TAG        1.3.4
 )
 FetchContent_MakeAvailable(fetch_radfiled3d)
 
