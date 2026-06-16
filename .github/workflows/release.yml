@@ -76,14 +76,16 @@ jobs:
       - name: Build wheel (deployment, TCNN off, CPU ORT)
         # No build isolation: the deploy build needs no torch, so reuse the toolchain installed
         # above. setup.py reads the version straight from the CI tag (GITHUB_REF_NAME).
-        shell: bash
+        # pwsh (not bash): setup.py drives the same Ninja/MSVC build, which fails under Git-bash
+        # on Windows (its /usr/bin/link shadows MSVC's link.exe). pwsh works on both OSes.
+        shell: pwsh
         run: python -m build --no-isolation --wheel
 
       - name: Vendor ONNX Runtime into wheel (Linux)
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          python -m pip install auditwheel
+          python -m pip install auditwheel patchelf  # auditwheel needs patchelf on PATH
           export LD_LIBRARY_PATH="$PWD/build_deploy/_deps/fetch_onnxruntime-src/lib:${LD_LIBRARY_PATH:-}"
           mkdir -p wheelhouse
           for whl in dist/*.whl; do

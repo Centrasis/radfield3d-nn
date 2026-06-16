@@ -41,21 +41,27 @@ runs:
 
     - name: Configure & build (deployment, TCNN off)
       shell: bash
+      # pwsh (not bash) on BOTH OSes: under Git-bash on Windows, /usr/bin/link shadows MSVC's
+      # link.exe and the Ninja build fails at link time. pwsh keeps the MSVC env clean. It is
+      # preinstalled on the Linux runners too, so one shell covers both.
+      shell: pwsh
       env:
         PYTHON_EXECUTABLE: python
       run: |
-        PYEXE="$(python -c 'import sys; print(sys.executable.replace(chr(92), "/"))')"
-        cmake -S . -B build_deploy -G Ninja \
-          -DPython_EXECUTABLE="$PYEXE" \
-          -DPYTHON_VERSION="${{ inputs.python-version }}" \
-          -DBuild_DeployPyBindings=ON \
-          -DRFNN_WITH_TCNN=OFF \
-          -DRFNN_BACKEND_VULKAN=OFF \
-          -DBUILD_RADFIELDNN_TESTS=OFF \
-          -DBUILD_EXAMPLES=OFF \
-          -DORT_GPU=OFF \
+        $pyexe = (python -c "import sys; print(sys.executable.replace(chr(92), '/'))")
+        cmake -S . -B build_deploy -G Ninja `
+          "-DPython_EXECUTABLE=$pyexe" `
+          "-DPYTHON_VERSION=${{ inputs.python-version }}" `
+          -DBuild_DeployPyBindings=ON `
+          -DRFNN_WITH_TCNN=OFF `
+          -DRFNN_BACKEND_VULKAN=OFF `
+          -DBUILD_RADFIELDNN_TESTS=OFF `
+          -DBUILD_EXAMPLES=OFF `
+          -DORT_GPU=OFF `
           -DCMAKE_BUILD_TYPE=Release
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         cmake --build build_deploy --target rfnn_deploy
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
     # The module links ONNX Runtime's shared lib (libonnxruntime.so / onnxruntime.dll). Copy it
     # next to the module in lib/: on Windows the loader searches the module's own directory, and
