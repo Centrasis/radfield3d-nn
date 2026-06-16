@@ -47,6 +47,7 @@ runs:
       env:
         PYTHON_EXECUTABLE: python
       run: |
+        # Tee output to log files too (Tee-Object is a cmdlet, so $LASTEXITCODE still reflects cmake).
         $pyexe = (python -c "import sys; print(sys.executable.replace(chr(92), '/'))")
         cmake -S . -B build_deploy -G Ninja `
           "-DPython_EXECUTABLE=$pyexe" `
@@ -57,10 +58,24 @@ runs:
           -DBUILD_RADFIELDNN_TESTS=OFF `
           -DBUILD_EXAMPLES=OFF `
           -DORT_GPU=OFF `
-          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_BUILD_TYPE=Release 2>&1 | Tee-Object -FilePath configure.log
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-        cmake --build build_deploy --target rfnn_deploy
+        cmake --build build_deploy --target rfnn_deploy 2>&1 | Tee-Object -FilePath build.log
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    # Diagnostics: on a build failure, surface the captured logs as an artifact (admin-only run
+    # logs make remote debugging hard). Remove once the matrix is stable.
+    - name: Upload build logs on failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-logs-${{ runner.os }}-py${{ inputs.python-version }}
+        path: |
+          configure.log
+          build.log
+          build_deploy/CMakeFiles/CMakeError.log
+          build_deploy/CMakeFiles/CMakeOutput.log
+        if-no-files-found: warn
 
     # The module links ONNX Runtime's shared lib (libonnxruntime.so / onnxruntime.dll). Copy it
     # next to the module in lib/: on Windows the loader searches the module's own directory, and
