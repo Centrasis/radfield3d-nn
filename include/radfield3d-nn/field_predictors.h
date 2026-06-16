@@ -97,6 +97,9 @@ public:
     virtual PredictorType type() const { return PredictorType::VolumeField; }
     bool is_voxelwise() const { return voxelwise_; }   // trunk graph has a per-point position input
     int  spectrum_bins() const { return out_bins_; }
+    // True when the ONNX graph emits fp16 outputs — predict_into_field then builds the field's flux
+    // layer as fp16 (RadFiled3D float16) instead of float32.
+    bool predicts_fp16() const { return out_fp16_; }
 
     // Register the [min,max] metric range of a beam parameter (taken from the RF3M ModelDomain).
     // Parameters the model trained on in NORMALIZED form — i.e. a metric input it does not normalise
@@ -146,6 +149,7 @@ protected:
     std::unique_ptr<Impl> impl_;
     bool voxelwise_ = false;
     int  out_bins_  = 32;
+    bool out_fp16_  = false;   // ONNX graph emits fp16 outputs (set by introspect())
 
     // RF3M package metadata (empty unless set by the factory). Plain members so the defaulted
     // move-adopt ctor carries them when the factory wraps a built trunk into a VoxelFieldPredictor.

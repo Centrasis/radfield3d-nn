@@ -132,10 +132,14 @@ void VolumeFieldPredictor::introspect() {
     for (const auto& n : impl_->in_names)
         if (name_is(n, {"position", "pos", "query", "xyz", "location", "loc"})) voxelwise_ = true;
 
-    // Spectrum bin count from the largest spectrum-shaped output's last dim (>=2).
+    // Spectrum bin count from the largest spectrum-shaped output's last dim (>=2). Also detect fp16:
+    // if any output tensor is FLOAT16 the model predicts in half precision, so predict_into_field
+    // builds the field's flux layer as fp16 (RadFiled3D float16) rather than float32.
     for (size_t i = 0; i < impl_->out_names.size(); ++i) {
-        auto s = impl_->session->GetOutputTypeInfo(i).GetTensorTypeAndShapeInfo().GetShape();
+        auto info = impl_->session->GetOutputTypeInfo(i).GetTensorTypeAndShapeInfo();
+        auto s = info.GetShape();
         if (!s.empty() && s.back() > 1 && s.back() <= 1024) out_bins_ = static_cast<int>(s.back());
+        if (info.GetElementType() == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) out_fp16_ = true;
     }
 }
 
@@ -284,17 +288,31 @@ static std::vector<Ort::Value> run_field(VolumeFieldPredictor::Impl& im, const B
 // null to skip). Writing into a caller buffer (e.g. a DeviceCartesianRadiationField layer)
 // avoids the intermediate std::vector copies. The first non-spectrum output is taken as flux;
 // outputs are identified by their trailing dim (== n_bins => spectrum).
+// Copy a model output tensor's `count` values into `dst` as float, converting from fp16 when the
+// tensor is FLOAT16 (ONNX Runtime does not auto-convert). float32 tensors are a straight memcpy.
+static void copy_tensor_floats(const Ort::Value& o, float* dst, size_t count) {
+    if (!dst) return;
+    if (o.GetTensorTypeAndShapeInfo().GetElementType() == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
+        const uint16_t* h = reinterpret_cast<const uint16_t*>(o.GetTensorData<Ort::Float16_t>());
+        for (size_t i = 0; i < count; ++i) {
+            RadFiled3D::Typing::float16 v; std::memcpy(&v, &h[i], sizeof(uint16_t));
+            dst[i] = static_cast<float>(v);
+        }
+    } else {
+        std::memcpy(dst, o.GetTensorData<float>(), count * sizeof(float));
+    }
+}
+
 static void collect(std::vector<Ort::Value>& outs, int n_bins, size_t valid_rows,
                     float* flux_dst, float* spec_dst) {
     bool got_flux = false;
     for (auto& o : outs) {
         auto shp = o.GetTensorTypeAndShapeInfo().GetShape();
         const bool is_spec = !shp.empty() && shp.back() == n_bins;
-        const float* p = o.GetTensorData<float>();
         if (is_spec) {
-            if (spec_dst) std::memcpy(spec_dst, p, valid_rows * static_cast<size_t>(n_bins) * sizeof(float));
+            copy_tensor_floats(o, spec_dst, valid_rows * static_cast<size_t>(n_bins));
         } else if (!got_flux) {
-            if (flux_dst) std::memcpy(flux_dst, p, valid_rows * sizeof(float));
+            copy_tensor_floats(o, flux_dst, valid_rows);
             got_flux = true;
         }
     }
@@ -302,17 +320,20 @@ static void collect(std::vector<Ort::Value>& outs, int n_bins, size_t valid_rows
 
 // Ensure `out`'s prediction channel + flux (scalar) / spectrum (HistogramVoxel<float>) layers
 // exist, and return their contiguous base pointers (the destinations collect() writes into).
-static void ensure_pred_layers(DeviceCartesianRadiationField& out, int bins,
-                               float*& flux_dst, float*& spec_dst) {
+static std::shared_ptr<DeviceVoxelBuffer> ensure_pred_layers(DeviceCartesianRadiationField& out,
+                                                             int bins, bool fp16) {
     auto channel = out.has_channel(kPredictionChannel)
                        ? out.get_channel(kPredictionChannel)
                        : std::static_pointer_cast<DeviceVoxelBuffer>(out.add_channel(kPredictionChannel));
-    if (!channel->has_layer(kFluxLayer)) channel->add_layer<float>(kFluxLayer, 0.f, "flux");
+    if (!channel->has_layer(kFluxLayer)) {
+        if (fp16) channel->add_layer<RadFiled3D::Typing::float16>(kFluxLayer, RadFiled3D::Typing::float16(0.f), "flux");
+        else      channel->add_layer<float>(kFluxLayer, 0.f, "flux");
+    }
+    // Spectrum stays a float HistogramVoxel — RadFiled3D's histogram (de)serialiser is float-only.
     if (!channel->has_layer(kSpectrumLayer))
         channel->add_custom_layer<RadFiled3D::HistogramVoxel<float>, float>(
             kSpectrumLayer, RadFiled3D::HistogramVoxel<float>(static_cast<size_t>(bins), 1.f, nullptr), 0.f, "spectrum");
-    flux_dst = channel->get_layer<float>(kFluxLayer);
-    spec_dst = channel->get_layer<float>(kSpectrumLayer);
+    return channel;
 }
 
 std::vector<float> VolumeFieldPredictor::run_field_raw(const BeamParameters& beam) const {
@@ -322,8 +343,9 @@ std::vector<float> VolumeFieldPredictor::run_field_raw(const BeamParameters& bea
     if (outs.empty()) throw std::runtime_error("run_field_raw: graph produced no output");
     auto shp = outs.front().GetTensorTypeAndShapeInfo().GetShape();
     size_t count = 1; for (auto d : shp) count *= (d > 0 ? static_cast<size_t>(d) : 1);
-    const float* p = outs.front().GetTensorData<float>();
-    return std::vector<float>(p, p + count);
+    std::vector<float> v(count);
+    copy_tensor_floats(outs.front(), v.data(), count);  // fp16-safe (encoder may emit half)
+    return v;
 }
 
 EncodedBeam VoxelFieldPredictor::encode_beam(const BeamParameters& beam) const {
@@ -447,23 +469,37 @@ void VolumeFieldPredictor::predict_into_field(const BeamParameters& beam,
                                               int max_inner_batch) const {
     (void)max_inner_batch;  // field-wise: one Run() emits the whole volume
     const size_t n = out.voxel_count();
-    float* flux_dst = nullptr; float* spec_dst = nullptr;
-    ensure_pred_layers(out, out_bins_, flux_dst, spec_dst);
-    // Run the field graph and copy its outputs straight into the field's layer buffers.
+    auto channel = ensure_pred_layers(out, out_bins_, out_fp16_);
+    float* spec_dst = channel->get_layer<float>(kSpectrumLayer);
     std::vector<Ort::Value> res = run_field(*impl_, beam);
-    collect(res, out_bins_, n, flux_dst, spec_dst);
+    if (out_fp16_) {
+        // Collect flux as float, then store fp16 (ONNX fp16 -> float -> fp16 is lossless).
+        std::vector<float> flux(n);
+        collect(res, out_bins_, n, flux.data(), spec_dst);
+        auto* flux16 = channel->get_layer<RadFiled3D::Typing::float16>(kFluxLayer);
+        for (size_t i = 0; i < n; ++i) flux16[i] = RadFiled3D::Typing::float16(flux[i]);
+    } else {
+        collect(res, out_bins_, n, channel->get_layer<float>(kFluxLayer), spec_dst);
+    }
 }
 
 void VoxelFieldPredictor::predict_into_field(const BeamParameters& beam,
                                              DeviceCartesianRadiationField& out,
                                              int max_inner_batch) const {
     const glm::uvec3 c = out.get_voxel_counts();
-    float* flux_dst = nullptr; float* spec_dst = nullptr;
-    ensure_pred_layers(out, out_bins_, flux_dst, spec_dst);
-    // Encode once, then tile per-voxel predictions straight into the field's layer buffers.
-    tile_into(encode_beam(beam),
-              {static_cast<int>(c.x), static_cast<int>(c.y), static_cast<int>(c.z)},
-              max_inner_batch, flux_dst, spec_dst);
+    const size_t n = out.voxel_count();
+    auto channel = ensure_pred_layers(out, out_bins_, out_fp16_);
+    float* spec_dst = channel->get_layer<float>(kSpectrumLayer);
+    const std::array<int, 3> dims{static_cast<int>(c.x), static_cast<int>(c.y), static_cast<int>(c.z)};
+    // Encode once, then tile per-voxel predictions into the field's layer buffers.
+    if (out_fp16_) {
+        std::vector<float> flux(n);
+        tile_into(encode_beam(beam), dims, max_inner_batch, flux.data(), spec_dst);
+        auto* flux16 = channel->get_layer<RadFiled3D::Typing::float16>(kFluxLayer);
+        for (size_t i = 0; i < n; ++i) flux16[i] = RadFiled3D::Typing::float16(flux[i]);
+    } else {
+        tile_into(encode_beam(beam), dims, max_inner_batch, channel->get_layer<float>(kFluxLayer), spec_dst);
+    }
 }
 
 // ── VoxelFieldPredictor ────────────────────────────────────────────────────────────────────────
@@ -491,14 +527,26 @@ void VoxelFieldPredictor::predict_into_field(const BeamParameters& beam,
     const size_t n = out.voxel_count();
     const int bins = out_bins_;
 
-    float* flux_dst = nullptr; float* spec_dst = nullptr;
-    ensure_pred_layers(out, bins, flux_dst, spec_dst);
+    auto channel = ensure_pred_layers(out, bins, out_fp16_);
+    float* spec_dst = channel->get_layer<float>(kSpectrumLayer);
 
     // Unpredicted voxels are -inf (flux and every spectrum bin); predicted ones get their values.
     const float neg_inf = -std::numeric_limits<float>::infinity();
-    std::fill(flux_dst, flux_dst + n, neg_inf);
     std::fill(spec_dst, spec_dst + n * static_cast<size_t>(bins), neg_inf);
-    if (voxel_locations.empty()) return;
+
+    // Flux is scattered into a float work buffer, then stored as fp16 or float32 per the model.
+    std::vector<float> flux_storage;
+    float* flux_work = nullptr;
+    if (out_fp16_) { flux_storage.assign(n, neg_inf); flux_work = flux_storage.data(); }
+    else { flux_work = channel->get_layer<float>(kFluxLayer); std::fill(flux_work, flux_work + n, neg_inf); }
+
+    auto store_flux16 = [&]() {
+        if (!out_fp16_) return;
+        auto* flux16 = channel->get_layer<RadFiled3D::Typing::float16>(kFluxLayer);
+        for (size_t i = 0; i < n; ++i) flux16[i] = RadFiled3D::Typing::float16(flux_work[i]);
+    };
+
+    if (voxel_locations.empty()) { store_flux16(); return; }
 
     std::vector<std::array<float, 3>> pts;
     pts.reserve(voxel_locations.size());
@@ -513,12 +561,13 @@ void VoxelFieldPredictor::predict_into_field(const BeamParameters& beam,
         const auto& v = voxel_locations[m];
         const size_t idx = (static_cast<size_t>(v[0]) * H + v[1]) * W + v[2];
         if (idx >= n) continue;
-        if (m < pred.flux.size()) flux_dst[idx] = pred.flux[m];
+        if (m < pred.flux.size()) flux_work[idx] = pred.flux[m];
         for (int b = 0; b < bins; ++b) {
             const size_t s = m * static_cast<size_t>(bins) + b;
             if (s < pred.spectrum.size()) spec_dst[idx * static_cast<size_t>(bins) + b] = pred.spectrum[s];
         }
     }
+    store_flux16();
 }
 
 }  // namespace radfield3dnn
