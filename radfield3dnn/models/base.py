@@ -845,6 +845,45 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
             master.grad = gf.clone() if master.grad is None else master.grad.add_(gf)
             pdict[name].grad = None
 
+    # ── fp16 train / fp32 eval ────────────────────────────────────────────────
+    # Pure-fp16 (self.half()) PBRFNet trains fine, but the full-volume validation/test inference
+    # overflows to NaN in fp16 (a NaN trunk logit -> the inverse normaliser asserts). So for fp16
+    # models we upcast the compute params to fp32 for the whole validation/test epoch — the
+    # authoritative weights are the fp32 masters anyway, and `_precision` is flipped so the forward
+    # casts its inputs (`_compute_dtype`) to fp32 to match — then restore fp16 + re-sync from the
+    # masters afterwards. No-op for fp32 training.
+    def _set_precision_flag(self, value: str):
+        # `_precision` is carried by the LightningModule AND the nested backbone (each reads its OWN
+        # flag in `_compute_dtype` to cast the forward's inputs), so flip every submodule that has it.
+        for mod in self.modules():
+            if "_precision" in mod.__dict__:
+                mod._precision = value
+
+    def _enter_fp32_eval(self):
+        if getattr(self, "_precision", "fp32") == "fp16" and not getattr(self, "_in_fp32_eval", False):
+            self._in_fp32_eval = True
+            self.float()
+            self._set_precision_flag("fp32")
+
+    def _exit_fp32_eval(self):
+        if getattr(self, "_in_fp32_eval", False):
+            self._in_fp32_eval = False
+            self._set_precision_flag("fp16")
+            self.half()
+            self._sync_masters_to_fp16()
+
+    def on_validation_epoch_start(self):
+        self._enter_fp32_eval()
+
+    def on_validation_epoch_end(self):
+        self._exit_fp32_eval()
+
+    def on_test_epoch_start(self):
+        self._enter_fp32_eval()
+
+    def on_test_epoch_end(self):
+        self._exit_fp32_eval()
+
     def validation_step(self, batch: TrainingInputData, batch_idx):
         with torch.no_grad():
             metrics = self.evaluate_forward(batch)

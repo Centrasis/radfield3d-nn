@@ -198,7 +198,7 @@ setup(
     python_requires=">=3.12",
     install_requires=[
         "rich>=15.0.0",
-        "RadFiled3D>=1.3.3",
+        "RadFiled3D>=1.3.4",
         "torch>=2.10.0",
         "numpy>=2.4.6",
         "pyyaml>=6.0.3",
@@ -213,7 +213,10 @@ setup(
         "onnxruntime>=1.26.0",
     ],
     packages=packages,
-    package_data={"radfield3dnn": ["*.pyi", "py.typed"]},
+    package_data={
+        "radfield3dnn": ["*.pyi", "py.typed"],
+        "radfield3dnn.deploy": ["*.pyi"],
+    },
     ext_modules=ext_modules,
     cmdclass={"build_ext": CMakeBuild},
     zip_safe=False,

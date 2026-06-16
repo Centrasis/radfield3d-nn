@@ -88,19 +88,51 @@ class ModelPackager:
 
         dist = _range("tube_distances_m")
         ang = _range("tube_opening_angles_deg")
+        in_bins, in_max_ev = self._input_spectrum_layout()
         # Ordered beam-parameter descriptors: (name, slot count in the input vector, range_min,
-        # range_max, unit) — the layout of the model's beam-parameter input vector.
+        # range_max, unit) — the layout of the model's beam-parameter input vector. The "spectrum"
+        # slot count is the model's INPUT tube-spectrum length, which is distinct from spectrum_bins
+        # (the OUTPUT per-voxel histogram size).
         beam_parameters = [
             ("direction",     3, -1.0, 1.0, ""),
             ("distance",      1, dist[0], dist[1], "m"),
             ("opening_angle", 1, ang[0], ang[1], "deg"),
-            ("spectrum",      int(self.spectra_bins), 0.0, self.max_energy_eV, "eV"),
+            ("spectrum",      int(in_bins), 0.0, float(in_max_ev), "eV"),
         ]
         return dict(
             spectrum_bins=self.spectra_bins,
             spectrum_max_energy_ev=self.max_energy_eV,
+            field_dimensions_m=self._field_dimensions_m(),
             beam_parameters=beam_parameters,
         )
+
+    def _field_dimensions_m(self) -> list:
+        """The training dataset's physical field box (metres) the normalised [0,1]^3 positions map
+        into. Read from a sample .rf3 field; falls back to [0,0,0] (unknown) on any failure."""
+        rf3 = self._sample_rf3()
+        if rf3:
+            try:
+                from RadFiled3D.utils import FieldStore
+                field = FieldStore.load(rf3)
+                d = field.get_field_dimensions()   # glm::vec3, metres
+                return [float(d.x), float(d.y), float(d.z)]
+            except Exception as e:  # best-effort — geometry stays "unknown" if unavailable
+                print(f"[yellow]ModelPackager: could not read field dimensions ({e})[/yellow]")
+        return [0.0, 0.0, 0.0]
+
+    def _input_spectrum_layout(self) -> tuple[int, float]:
+        """The model's INPUT tube-spectrum histogram size + energy span (eV) — distinct from the
+        OUTPUT per-voxel histogram bins. Read from the dataset (input_spectra_bins /
+        max_spectrum_energy_eV); fall back to the configured values."""
+        bins, max_ev = None, None
+        try:
+            ds = self.datamodule.test_dataloader().dataset
+            bins = getattr(ds, "input_spectra_bins", None)
+            max_ev = getattr(ds, "max_spectrum_energy_eV", None)
+        except Exception:
+            pass
+        return int(bins if bins is not None else self.spectra_bins), \
+               float(max_ev if max_ev is not None else self.max_energy_eV)
 
     def _provenance(self, sample_rf3: str | None) -> dict:
         software_version, physics = "", ""
@@ -158,6 +190,7 @@ class ModelPackager:
         rd_domain = rd.ModelDomain(
             spectrum_bins=int(domain["spectrum_bins"]),
             spectrum_max_energy_ev=float(domain["spectrum_max_energy_ev"]),
+            field_dimensions_m=[float(x) for x in domain["field_dimensions_m"]],
             beam_parameters=[
                 rd.BeamParameterSpec(str(name), int(count),
                                      rd.ParameterRange(float(rmin), float(rmax), str(unit)))

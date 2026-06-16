@@ -99,6 +99,8 @@ PYBIND11_MODULE(rfnn_deploy, m) {
         .def_property_readonly("type", &VolumeFieldPredictor::type)
         .def_property_readonly("is_voxelwise", &VolumeFieldPredictor::is_voxelwise)
         .def_property_readonly("spectrum_bins", &VolumeFieldPredictor::spectrum_bins)
+        .def_property_readonly("input_spectrum_bins", &VolumeFieldPredictor::input_spectrum_bins)
+        .def_property_readonly("field_dimensions_m", &VolumeFieldPredictor::field_dimensions)
         .def_property_readonly("domain", &VolumeFieldPredictor::domain)
         .def_property_readonly("provenance", &VolumeFieldPredictor::provenance)
         .def_property_readonly("metrics", &VolumeFieldPredictor::metrics)
@@ -129,7 +131,21 @@ PYBIND11_MODULE(rfnn_deploy, m) {
                  py::gil_scoped_acquire acquire;
                  return prediction_to_dict(fp);
              },
-             py::arg("positions"), py::arg("encoded_beam"));
+             py::arg("positions"), py::arg("encoded_beam"))
+        .def("predict_voxelwise_absolute",
+             [](const VoxelFieldPredictor& self,
+                py::array_t<float, py::array::c_style | py::array::forcecast> positions_m,
+                const EncodedBeam& beam) {
+                 if (positions_m.ndim() != 2 || positions_m.shape(1) != 3)
+                     throw std::invalid_argument("positions_m must be a (N,3) float array in metres");
+                 std::vector<std::array<float, 3>> pts((size_t)positions_m.shape(0));
+                 std::memcpy(pts.data(), positions_m.data(), pts.size() * 3 * sizeof(float));
+                 py::gil_scoped_release release;
+                 FieldPrediction fp = self.predict_voxelwise_absolute(pts, beam);
+                 py::gil_scoped_acquire acquire;
+                 return prediction_to_dict(fp);
+             },
+             py::arg("positions_m"), py::arg("encoded_beam"));
 
     // ── RF3M container (rfnn::io::V1) ────────────────────────────────────────
     using rfnn::io::V1::ModelStore;
@@ -152,13 +168,16 @@ PYBIND11_MODULE(rfnn_deploy, m) {
         .def_readwrite("count", &rfnn::io::BeamParameter::count)
         .def_readwrite("range", &rfnn::io::BeamParameter::range);
     py::class_<rfnn::io::ModelDomain>(m, "ModelDomain")
-        .def(py::init([](int bins, float max_e, std::vector<rfnn::io::BeamParameter> bp) {
+        .def(py::init([](int bins, float max_e, std::array<float, 3> field_dims,
+                         std::vector<rfnn::io::BeamParameter> bp) {
                  rfnn::io::ModelDomain d; d.spectrum_bins = bins; d.spectrum_max_energy_ev = max_e;
-                 d.beam_parameters = std::move(bp); return d;
+                 d.field_dimensions_m = field_dims; d.beam_parameters = std::move(bp); return d;
              }), py::arg("spectrum_bins") = 0, py::arg("spectrum_max_energy_ev") = 0.f,
+             py::arg("field_dimensions_m") = std::array<float, 3>{ {0.f, 0.f, 0.f} },
              py::arg("beam_parameters") = std::vector<rfnn::io::BeamParameter>{})
         .def_readwrite("spectrum_bins", &rfnn::io::ModelDomain::spectrum_bins)
         .def_readwrite("spectrum_max_energy_ev", &rfnn::io::ModelDomain::spectrum_max_energy_ev)
+        .def_readwrite("field_dimensions_m", &rfnn::io::ModelDomain::field_dimensions_m)
         .def_readwrite("beam_parameters", &rfnn::io::ModelDomain::beam_parameters);
     py::class_<rfnn::io::ModelProvenance>(m, "ModelProvenance")
         .def(py::init([](std::string ds, std::string sw, std::string ph) {

@@ -158,16 +158,17 @@ class RFBackboneModel(nn.Module):
         #   "sigmoid"  — y = sigmoid(z), logit clamped (grad-conserving) to ±30. Spans the
         #               full (0,1) codomain so crushed scatter AND the peak stay representable
         #               with a recovery gradient everywhere. Requires the (0,1) codomain.
+        # The sigmoid / softclip heads only need a (0,1) codomain — any normalizer that declares
+        # range=(0,1) qualifies (LinearNormalizer(0,1) AND the asinh tonemap, whose codomain is
+        # [0,1]), so gate on the declared range rather than the concrete normalizer class.
         if flux_activation == "sigmoid":
-            if issubclass(self._normalizer.__class__, LinearNormalizer) \
-                    and self._normalizer.range == (0.0, 1.0):
+            if getattr(self._normalizer, "range", None) == (0.0, 1.0):
                 self.flux_activation = LogitSigmoid(logit_range=30.0)
             else:
                 print(f"Warning: sigmoid requires normalizer.range=(0,1); falling back to clamp for {self._normalizer.__class__}.")
                 self.flux_activation = GradientConservingClamping(0.0, 1.0)
         elif flux_activation == "softclip":
-            if issubclass(self._normalizer.__class__, LinearNormalizer) \
-                    and self._normalizer.range == (0.0, 1.0):
+            if getattr(self._normalizer, "range", None) == (0.0, 1.0):
                 self.flux_activation = SoftClip(k=1.0)
             else:
                 print(f"Warning: SoftClip requires normalizer.range=(0,1); falling back to clamp for {self._normalizer.__class__}.")

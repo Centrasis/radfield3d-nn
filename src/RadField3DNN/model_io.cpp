@@ -44,6 +44,10 @@ std::string get_str(std::istream& is) {
 void put_domain(std::ostream& os, const ModelDomain& d) {
     put<int32_t>(os, d.spectrum_bins);
     put<float>(os, d.spectrum_max_energy_ev);
+    // v3: physical field dimensions (metres) the normalised [0,1]^3 positions map into.
+    put<float>(os, d.field_dimensions_m[0]);
+    put<float>(os, d.field_dimensions_m[1]);
+    put<float>(os, d.field_dimensions_m[2]);
     put<uint32_t>(os, static_cast<uint32_t>(d.beam_parameters.size()));
     for (const auto& p : d.beam_parameters) {
         put_str(os, p.name);
@@ -57,6 +61,9 @@ ModelDomain get_domain(std::istream& is) {
     ModelDomain d;
     d.spectrum_bins = get<int32_t>(is);
     d.spectrum_max_energy_ev = get<float>(is);
+    d.field_dimensions_m[0] = get<float>(is);
+    d.field_dimensions_m[1] = get<float>(is);
+    d.field_dimensions_m[2] = get<float>(is);
     const uint32_t n = get<uint32_t>(is);
     d.beam_parameters.reserve(n);
     for (uint32_t i = 0; i < n; ++i) {

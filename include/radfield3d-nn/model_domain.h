@@ -8,6 +8,7 @@
 // and by the runtime predictor (radfield3dnn::VolumeFieldPredictor, field_predictors.h) which
 // carries them once loaded — so this header sits below both and neither has to include the other.
 //
+#include <array>
 #include <string>
 #include <vector>
 
@@ -32,11 +33,14 @@ struct BeamParameter {
 
 // The model's fixed I/O domain, in metric units. A model generalises over a *range* of beam
 // parameters, so we store that range and how the normalised inputs/outputs map to physical units
-// rather than any single simulation's tube settings. The spatial field geometry (resolution /
-// voxel size) is NOT part of the model — it is chosen at inference and may vary across a dataset.
+// rather than any single simulation's tube settings. The voxel *resolution* is NOT part of the model
+// (chosen at inference, varies across a dataset), but the physical *field dimensions* (the metric box
+// the normalised [0,1]^3 positions map into, from the training dataset) ARE — they fix what metric
+// location a relative location inside the neural field corresponds to.
 struct ModelDomain {
     int                        spectrum_bins = 0;            // output spectrum histogram bins …
     float                      spectrum_max_energy_ev = 0.f; // … bin i spans [i, i+1)·max/bins eV
+    std::array<float, 3>       field_dimensions_m{ {0.f, 0.f, 0.f} }; // metric field box (m); 0 = unknown
     std::vector<BeamParameter> beam_parameters;              // ordered model input-vector layout
 };
 

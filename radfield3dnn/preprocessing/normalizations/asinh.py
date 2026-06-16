@@ -21,6 +21,10 @@ class AsinhTonemapNormalizer(Normalizer):
         super().__init__()
         assert sigma > 0.0, f"Require sigma > 0, got sigma={sigma}."
         self.sigma = float(sigma)
+        # The tonemap codomain is the closed [0, 1] interval (y = asinh(x/σ)/asinh(1/σ) with
+        # x ∈ [0, 1] after per-field max-normalisation). Declaring it lets the (0,1)-codomain flux
+        # heads — sigmoid / softclip — engage on asinh targets, not just LinearNormalizer(0,1).
+        self.range = (0.0, 1.0)
         # Precompute the constant denominator asinh(1/sigma) once. Stored as
         # a python float; tensor versions are constructed per-call to match
         # the input tensor's device/dtype.

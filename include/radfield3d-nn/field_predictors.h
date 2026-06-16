@@ -96,7 +96,14 @@ public:
 
     virtual PredictorType type() const { return PredictorType::VolumeField; }
     bool is_voxelwise() const { return voxelwise_; }   // trunk graph has a per-point position input
-    int  spectrum_bins() const { return out_bins_; }
+    int  spectrum_bins() const { return out_bins_; }   // OUTPUT per-voxel histogram bins (graph output)
+    // INPUT beam-spectrum length the graph's "spectrum" input requires (0 if the graph has no such
+    // input). Read straight from the ONNX graph by introspect(), so it is the ground truth regardless
+    // of what the RF3M ModelDomain metadata claims.
+    int  input_spectrum_bins() const { return in_spectrum_bins_; }
+    // The training dataset's metric field box (metres) the normalised [0,1]^3 positions map into.
+    // {0,0,0} if the package predates field-dimension metadata. Carried by the RF3M ModelDomain.
+    const std::array<float, 3>& field_dimensions() const { return domain_.field_dimensions_m; }
     // True when the ONNX graph emits fp16 outputs — predict_into_field then builds the field's flux
     // layer as fp16 (RadFiled3D float16) instead of float32.
     bool predicts_fp16() const { return out_fp16_; }
@@ -149,6 +156,7 @@ protected:
     std::unique_ptr<Impl> impl_;
     bool voxelwise_ = false;
     int  out_bins_  = 32;
+    int  in_spectrum_bins_ = 0;   // length of the graph's "spectrum" input (set by introspect())
     bool out_fp16_  = false;   // ONNX graph emits fp16 outputs (set by introspect())
 
     // RF3M package metadata (empty unless set by the factory). Plain members so the defaulted
@@ -185,6 +193,12 @@ public:
     // Per-voxel query. `positions`: M points in normalised [0,1]^3; `beam`: a cached EncodedBeam.
     FieldPrediction predict_voxelwise(const std::vector<std::array<float, 3>>& positions,
                                       const EncodedBeam& beam) const;
+
+    // Per-voxel query with ABSOLUTE positions in metres: each xyz is normalised by the model's field
+    // dimensions (domain().field_dimensions_m, the training dataset's box in metres) into [0,1]^3, then
+    // forwarded to predict_voxelwise. An unknown (0) field dimension leaves that axis untouched.
+    FieldPrediction predict_voxelwise_absolute(const std::vector<std::array<float, 3>>& positions_m,
+                                               const EncodedBeam& beam) const;
     // Same, over a CONTIGUOUS [count, 3] (x,y,z) buffer bound DIRECTLY as the ONNX position input
     // (no copy) — e.g. vulkan::VoxelVisibilityCuller::cull(...).positions, for a zero-copy GPU-cull
     // → ONNX hand-off. The buffer must stay alive for the call.

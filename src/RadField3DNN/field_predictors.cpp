@@ -132,6 +132,16 @@ void VolumeFieldPredictor::introspect() {
     for (const auto& n : impl_->in_names)
         if (name_is(n, {"position", "pos", "query", "xyz", "location", "loc"})) voxelwise_ = true;
 
+    // Input beam-spectrum length: the trailing dim of the "spectrum" input (the model's required
+    // tube-spectrum histogram size — distinct from the OUTPUT per-voxel histogram bins below).
+    for (size_t i = 0; i < impl_->in_names.size(); ++i) {
+        if (name_is(impl_->in_names[i], {"spectrum", "spec", "sp"})) {
+            const auto& s = impl_->in_shapes[i];
+            if (!s.empty() && s.back() > 1) in_spectrum_bins_ = static_cast<int>(s.back());
+            break;
+        }
+    }
+
     // Spectrum bin count from the largest spectrum-shaped output's last dim (>=2). Also detect fp16:
     // if any output tensor is FLOAT16 the model predicts in half precision, so predict_into_field
     // builds the field's flux layer as fp16 (RadFiled3D float16) rather than float32.
@@ -377,6 +387,20 @@ FieldPrediction VoxelFieldPredictor::predict_voxelwise(const std::vector<std::ar
                                                        const EncodedBeam& beam) const {
     // std::array<float,3> is contiguous, so the vector is a packed [M,3] float buffer.
     return predict_voxelwise(reinterpret_cast<const float*>(positions.data()), positions.size(), beam);
+}
+
+FieldPrediction VoxelFieldPredictor::predict_voxelwise_absolute(
+        const std::vector<std::array<float, 3>>& positions_m, const EncodedBeam& beam) const {
+    // Normalise absolute (metre) positions by the dataset field box, then run the normalised query.
+    const std::array<float, 3>& fd = domain().field_dimensions_m;
+    std::vector<std::array<float, 3>> normalized;
+    normalized.reserve(positions_m.size());
+    for (const auto& p : positions_m) {
+        normalized.push_back({ fd[0] > 0.f ? p[0] / fd[0] : p[0],
+                               fd[1] > 0.f ? p[1] / fd[1] : p[1],
+                               fd[2] > 0.f ? p[2] / fd[2] : p[2] });
+    }
+    return predict_voxelwise(normalized, beam);
 }
 
 FieldPrediction VolumeFieldPredictor::predict_volume(const BeamParameters& beam, std::array<int, 3> dims,

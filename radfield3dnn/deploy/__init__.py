@@ -1,13 +1,13 @@
-from typing import TYPE_CHECKING
-
 from radfield3dnn.deploy.model_packager import ModelPackager
 
-if TYPE_CHECKING:
-    # resolved via typings/rfnn_deploy.pyi — gives load_rf3m a fully-typed return in the IDE
-    from rfnn_deploy import VolumeFieldPredictor, VoxelFieldPredictor
+# The full static types for everything re-exported here live in the shipped inline stub
+# `radfield3dnn/deploy/__init__.pyi` (PEP 561) — it is the authoritative typed surface for the
+# deploy inference API and is what linters read. This module stays runtime-only: the native
+# inference types are served lazily by `__getattr__` so importing the package never requires the
+# compiled `rfnn_deploy` bindings to be built.
 
 
-def load_rf3m(path: str, use_cuda: bool = False) -> "VoxelFieldPredictor | VolumeFieldPredictor":
+def load_rf3m(path: str, use_cuda: bool = False):
     """Load an RF3M package via the C++ ONNX deployment bindings (rfnn_deploy) straight to the
     runnable predictor. Imported lazily so importing :mod:`radfield3dnn.deploy` never requires the
     compiled deploy module to be built."""
@@ -26,4 +26,9 @@ def __getattr__(name: str):
         raise AttributeError(f"module 'radfield3dnn.deploy' has no attribute {name!r}") from None
 
 
-__all__ = ["ModelPackager", "load_rf3m", "ModelStore"]
+# Only the names safe to expose without the compiled bindings go in the runtime __all__: the
+# inference types are served lazily by __getattr__, so listing them here would make `import *`
+# eagerly load the native module (and defeats the lazy design). They are still importable by name
+# (`from radfield3dnn.deploy import BeamParameters`) and the full public surface — with types — is
+# declared in the inline stub __init__.pyi.
+__all__ = ["ModelPackager", "load_rf3m"]
