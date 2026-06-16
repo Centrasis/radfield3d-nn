@@ -104,7 +104,11 @@ VolumeFieldPredictor::VolumeFieldPredictor(const void* onnx_bytes, size_t n, boo
 VolumeFieldPredictor::VolumeFieldPredictor(const std::string& onnx_path, const ExecutionOptions& exec)
     : impl_(std::make_unique<Impl>()) {
     configure_options(*impl_, exec);
-    impl_->session = std::make_unique<Ort::Session>(impl_->env, onnx_path.c_str(), impl_->opts);
+    // ORT model paths are ORTCHAR_T* (wchar_t on Windows, char on POSIX); std::filesystem::path
+    // yields the correct character type per platform. The temporary lives for the full expression,
+    // so the pointer stays valid through Session construction.
+    const std::filesystem::path p(onnx_path);
+    impl_->session = std::make_unique<Ort::Session>(impl_->env, p.c_str(), impl_->opts);
     introspect();
 }
 
