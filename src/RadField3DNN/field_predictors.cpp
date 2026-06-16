@@ -155,6 +155,24 @@ void VolumeFieldPredictor::introspect() {
 
 VolumeFieldPredictor::~VolumeFieldPredictor() = default;
 
+SpectrumInputLayout VolumeFieldPredictor::input_spectrum_layout() const {
+    SpectrumInputLayout L;
+    for (const auto& bp : domain_.beam_parameters) {
+        if (bp.name == "spectrum" && bp.range.type == rfnn::io::ParameterRangeType::Spectrum) {
+            float scale = 1.f;   // -> eV
+            if (bp.range.unit == "keV") scale = 1e3f;
+            else if (bp.range.unit == "MeV") scale = 1e6f;
+            L.min_energy_ev = bp.range.min * scale;
+            L.max_energy_ev = bp.range.max * scale;
+            L.bin_width_ev  = bp.range.bin_width * scale;
+            L.bins = (L.bin_width_ev > 0.f)
+                ? static_cast<int>(std::lround((L.max_energy_ev - L.min_energy_ev) / L.bin_width_ev)) : 0;
+            break;
+        }
+    }
+    return L;
+}
+
 void VolumeFieldPredictor::set_parameter_range(const std::string& name, float min, float max) {
     impl_->param_ranges[name] = {min, max};
 }

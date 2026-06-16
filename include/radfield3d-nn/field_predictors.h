@@ -75,6 +75,17 @@ struct EncodedBeam {
 // Which predictor a model loads as (each instance reports its own).
 enum class PredictorType { VolumeField, VoxelField };
 
+// The model's INPUT tube-spectrum histogram layout, in eV — everything needed to reconstruct the
+// energy binning the model expects: `bins` values spanning [min_energy_ev, max_energy_ev], each
+// `bin_width_ev` wide (bin i covers [min + i*width, min + (i+1)*width)). Sourced from the RF3M
+// ModelDomain's "spectrum" beam parameter (a Spectrum range). `bins == 0` means no spectrum input.
+struct SpectrumInputLayout {
+    int   bins          = 0;
+    float min_energy_ev = 0.f;
+    float max_energy_ev = 0.f;
+    float bin_width_ev  = 0.f;
+};
+
 // VolumeFieldPredictor — runs ONE exported ONNX graph (the model trunk) through ONNX Runtime.
 // Field-wise models emit the whole D×H×W volume in a single Run(). Base of the hierarchy.
 class VolumeFieldPredictor {
@@ -104,6 +115,11 @@ public:
     // The training dataset's metric field box (metres) the normalised [0,1]^3 positions map into.
     // {0,0,0} if the package predates field-dimension metadata. Carried by the RF3M ModelDomain.
     const std::array<float, 3>& field_dimensions() const { return domain_.field_dimensions_m; }
+
+    // The input tube-spectrum binning (bins + min/max energy + bin width, in eV) the model expects,
+    // reconstructed from the ModelDomain "spectrum" beam parameter. Use this to build a beam spectrum
+    // of the right length and energy mapping regardless of the model's graph topology.
+    SpectrumInputLayout input_spectrum_layout() const;
     // True when the ONNX graph emits fp16 outputs — predict_into_field then builds the field's flux
     // layer as fp16 (RadFiled3D float16) instead of float32.
     bool predicts_fp16() const { return out_fp16_; }

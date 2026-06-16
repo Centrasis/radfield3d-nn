@@ -60,14 +60,18 @@ def _make_trunk_onnx() -> bytes:
     return model.SerializeToString()
 
 
+BIN_WIDTH_EV = MAX_ENERGY_EV / IN_BINS   # 1000 eV
+
+
 def _domain():
-    # spectrum_bins is the OUTPUT histogram; the "spectrum" beam-parameter count is the INPUT length.
+    # spectrum_bins is the OUTPUT histogram; the input tube spectrum is a typed Spectrum range whose
+    # (min, max, bin_width) reconstruct the INPUT binning (bins = (max-min)/bin_width).
     return rd.ModelDomain(
         spectrum_bins=OUT_BINS,
         spectrum_max_energy_ev=MAX_ENERGY_EV,
         beam_parameters=[
-            rd.BeamParameterSpec("direction", 3, rd.ParameterRange(-1.0, 1.0, "")),
-            rd.BeamParameterSpec("spectrum", IN_BINS, rd.ParameterRange(0.0, MAX_ENERGY_EV, "eV")),
+            rd.BeamParameterSpec("direction", rd.ParameterRange.min_max(-1.0, 1.0, "")),
+            rd.BeamParameterSpec("spectrum", rd.ParameterRange.spectrum(0.0, MAX_ENERGY_EV, BIN_WIDTH_EV, "eV")),
         ],
     )
 
@@ -87,13 +91,29 @@ def _load_roundtrip():
 
 def test_rf3m_roundtrip_reports_input_and_output_spectrum_layout():
     pred = _load_roundtrip()
-    # INPUT length is read from the ONNX graph; OUTPUT bins from the spectrum output.
-    assert pred.input_spectrum_bins == IN_BINS
-    assert pred.spectrum_bins == OUT_BINS
-    # The package metadata also carries the input layout (the "spectrum" beam parameter).
+    assert pred.spectrum_bins == OUT_BINS                      # OUTPUT per-voxel histogram
+
+    # Reconstruct the INPUT tube-spectrum binning from the metadata range (min/max/bin_width).
+    L = pred.input_spectrum_layout
+    assert L.bins == IN_BINS
+    assert L.min_energy_ev == pytest.approx(0.0)
+    assert L.max_energy_ev == pytest.approx(MAX_ENERGY_EV)
+    assert L.bin_width_ev == pytest.approx(BIN_WIDTH_EV)
+
+    # The "spectrum" parameter is a typed Spectrum range carrying exactly those fields.
     spec_bp = next(bp for bp in pred.domain.beam_parameters if bp.name == "spectrum")
-    assert spec_bp.count == IN_BINS
-    assert spec_bp.range.unit == "eV" and spec_bp.range.max == pytest.approx(MAX_ENERGY_EV)
+    assert spec_bp.range.type == rd.ParameterRangeType.Spectrum
+    assert spec_bp.range.unit == "eV"
+    assert spec_bp.range.max == pytest.approx(MAX_ENERGY_EV)
+    assert spec_bp.range.bin_width == pytest.approx(BIN_WIDTH_EV)
+
+    # Names remain iterable regardless of range kind (self-describing, skip-friendly format), and a
+    # different kind (MinMax) coexists.
+    names = [bp.name for bp in pred.domain.beam_parameters]
+    assert names == ["direction", "spectrum"]
+    dir_bp = next(bp for bp in pred.domain.beam_parameters if bp.name == "direction")
+    assert dir_bp.range.type == rd.ParameterRangeType.MinMax
+    assert (dir_bp.range.min, dir_bp.range.max) == pytest.approx((-1.0, 1.0))
 
 
 def test_rf3m_predicts_with_metadata_sized_spectrum():

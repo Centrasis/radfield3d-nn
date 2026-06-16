@@ -89,15 +89,16 @@ class ModelPackager:
         dist = _range("tube_distances_m")
         ang = _range("tube_opening_angles_deg")
         in_bins, in_max_ev = self._input_spectrum_layout()
-        # Ordered beam-parameter descriptors: (name, slot count in the input vector, range_min,
-        # range_max, unit) — the layout of the model's beam-parameter input vector. The "spectrum"
-        # slot count is the model's INPUT tube-spectrum length, which is distinct from spectrum_bins
-        # (the OUTPUT per-voxel histogram size).
+        bin_width_ev = float(in_max_ev) / max(1, int(in_bins))
+        # Ordered beam-parameter descriptors: (name, typed-range spec). Most parameters are a
+        # ("minmax", min, max, unit) interval; the tube spectrum is a ("spectrum", min, max, bin_width,
+        # unit) histogram range — its bins = (max-min)/bin_width, distinct from spectrum_bins (the
+        # OUTPUT per-voxel histogram size).
         beam_parameters = [
-            ("direction",     3, -1.0, 1.0, ""),
-            ("distance",      1, dist[0], dist[1], "m"),
-            ("opening_angle", 1, ang[0], ang[1], "deg"),
-            ("spectrum",      int(in_bins), 0.0, float(in_max_ev), "eV"),
+            ("direction",     ("minmax", -1.0, 1.0, "")),
+            ("distance",      ("minmax", dist[0], dist[1], "m")),
+            ("opening_angle", ("minmax", ang[0], ang[1], "deg")),
+            ("spectrum",      ("spectrum", 0.0, float(in_max_ev), bin_width_ev, "eV")),
         ]
         return dict(
             spectrum_bins=self.spectra_bins,
@@ -187,14 +188,23 @@ class ModelPackager:
         from radfield3dnn.deploy.onnx_runtime import rfnn_deploy as rd
         domain = self._domain()
         prov = self._provenance(self._sample_rf3())
+        def _mk_range(spec):
+            kind = spec[0]
+            if kind == "minmax":
+                _, mn, mx, unit = spec
+                return rd.ParameterRange.min_max(float(mn), float(mx), str(unit))
+            if kind == "spectrum":
+                _, mn, mx, bw, unit = spec
+                return rd.ParameterRange.spectrum(float(mn), float(mx), float(bw), str(unit))
+            raise ValueError(f"unknown range kind {kind!r}")
+
         rd_domain = rd.ModelDomain(
             spectrum_bins=int(domain["spectrum_bins"]),
             spectrum_max_energy_ev=float(domain["spectrum_max_energy_ev"]),
             field_dimensions_m=[float(x) for x in domain["field_dimensions_m"]],
             beam_parameters=[
-                rd.BeamParameterSpec(str(name), int(count),
-                                     rd.ParameterRange(float(rmin), float(rmax), str(unit)))
-                for name, count, rmin, rmax, unit in domain["beam_parameters"]
+                rd.BeamParameterSpec(str(name), _mk_range(spec))
+                for name, spec in domain["beam_parameters"]
             ],
         )
         rd_prov = rd.ModelProvenance(dataset_name=prov["dataset_name"],

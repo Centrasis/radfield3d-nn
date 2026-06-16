@@ -91,6 +91,13 @@ PYBIND11_MODULE(rfnn_deploy, m) {
         .value("VolumeField", PredictorType::VolumeField)
         .value("VoxelField", PredictorType::VoxelField);
 
+    // Reconstructed input tube-spectrum binning (eV).
+    py::class_<radfield3dnn::SpectrumInputLayout>(m, "SpectrumInputLayout")
+        .def_readonly("bins", &radfield3dnn::SpectrumInputLayout::bins)
+        .def_readonly("min_energy_ev", &radfield3dnn::SpectrumInputLayout::min_energy_ev)
+        .def_readonly("max_energy_ev", &radfield3dnn::SpectrumInputLayout::max_energy_ev)
+        .def_readonly("bin_width_ev", &radfield3dnn::SpectrumInputLayout::bin_width_ev);
+
     // The package metadata is carried ON the predictor (set by ModelStore::load), exposed as
     // read-only properties .domain / .provenance / .metrics / .graph_names (inherited by
     // VoxelFieldPredictor). dynamic_attr stays so callers may still attach their own attributes.
@@ -100,6 +107,7 @@ PYBIND11_MODULE(rfnn_deploy, m) {
         .def_property_readonly("is_voxelwise", &VolumeFieldPredictor::is_voxelwise)
         .def_property_readonly("spectrum_bins", &VolumeFieldPredictor::spectrum_bins)
         .def_property_readonly("input_spectrum_bins", &VolumeFieldPredictor::input_spectrum_bins)
+        .def_property_readonly("input_spectrum_layout", &VolumeFieldPredictor::input_spectrum_layout)
         .def_property_readonly("field_dimensions_m", &VolumeFieldPredictor::field_dimensions)
         .def_property_readonly("domain", &VolumeFieldPredictor::domain)
         .def_property_readonly("provenance", &VolumeFieldPredictor::provenance)
@@ -153,19 +161,39 @@ PYBIND11_MODULE(rfnn_deploy, m) {
     // Read/WRITE + constructible: these double as the SAVE-side metadata builders, so the Python
     // packager assembles a domain/provenance here and the bytes are produced by the SAME C++
     // serialiser the deploy lib uses (no duplicated byte layout).
-    py::class_<rfnn::io::ParameterRange>(m, "ParameterRange")
-        .def(py::init([](float mn, float mx, std::string u) {
-                 return rfnn::io::ParameterRange{mn, mx, std::move(u)};
-             }), py::arg("min") = 0.f, py::arg("max") = 0.f, py::arg("unit") = "")
+    py::enum_<rfnn::io::ParameterRangeType>(m, "ParameterRangeType")
+        .value("MinMax", rfnn::io::ParameterRangeType::MinMax)
+        .value("Spectrum", rfnn::io::ParameterRangeType::Spectrum)
+        .value("Map", rfnn::io::ParameterRangeType::Map);
+
+    // A beam parameter's typed range (tagged variant). Convenience factories build the common kinds;
+    // the serialiser stores type + byte length per entry so unknown kinds can be skipped on read.
+    py::class_<rfnn::io::ParameterRange> beam_range(m, "ParameterRange");
+    beam_range
+        .def(py::init<>())
+        .def_readwrite("type", &rfnn::io::ParameterRange::type)
         .def_readwrite("min", &rfnn::io::ParameterRange::min)
         .def_readwrite("max", &rfnn::io::ParameterRange::max)
-        .def_readwrite("unit", &rfnn::io::ParameterRange::unit);
+        .def_readwrite("bin_width", &rfnn::io::ParameterRange::bin_width)
+        .def_readwrite("unit", &rfnn::io::ParameterRange::unit)
+        .def_readwrite("children", &rfnn::io::ParameterRange::children)
+        .def_static("min_max", [](float mn, float mx, std::string u) {
+                rfnn::io::ParameterRange r; r.type = rfnn::io::ParameterRangeType::MinMax;
+                r.min = mn; r.max = mx; r.unit = std::move(u); return r;
+            }, py::arg("min"), py::arg("max"), py::arg("unit") = "")
+        .def_static("spectrum", [](float mn, float mx, float bw, std::string u) {
+                rfnn::io::ParameterRange r; r.type = rfnn::io::ParameterRangeType::Spectrum;
+                r.min = mn; r.max = mx; r.bin_width = bw; r.unit = std::move(u); return r;
+            }, py::arg("min"), py::arg("max"), py::arg("bin_width"), py::arg("unit") = "")
+        .def_static("nested", [](std::vector<std::pair<std::string, rfnn::io::ParameterRange>> ch) {
+                rfnn::io::ParameterRange r; r.type = rfnn::io::ParameterRangeType::Map; r.children = std::move(ch); return r;
+            }, py::arg("children"));
+
     py::class_<rfnn::io::BeamParameter>(m, "BeamParameterSpec")
-        .def(py::init([](std::string n, int c, rfnn::io::ParameterRange r) {
-                 return rfnn::io::BeamParameter{std::move(n), c, std::move(r)};
-             }), py::arg("name"), py::arg("count"), py::arg("range") = rfnn::io::ParameterRange{})
+        .def(py::init([](std::string n, rfnn::io::ParameterRange r) {
+                 return rfnn::io::BeamParameter{std::move(n), std::move(r)};
+             }), py::arg("name"), py::arg("range") = rfnn::io::ParameterRange{})
         .def_readwrite("name", &rfnn::io::BeamParameter::name)
-        .def_readwrite("count", &rfnn::io::BeamParameter::count)
         .def_readwrite("range", &rfnn::io::BeamParameter::range);
     py::class_<rfnn::io::ModelDomain>(m, "ModelDomain")
         .def(py::init([](int bins, float max_e, std::array<float, 3> field_dims,

@@ -41,20 +41,75 @@ std::string get_str(std::istream& is) {
     return s;
 }
 
+// Serialise a range's PAYLOAD (everything after the entry's type + length header) to bytes, so the
+// caller can prefix the byte count and a reader can skip the whole range by that count.
+std::string range_payload(const ParameterRange& r) {
+    std::ostringstream p(std::ios::binary);
+    switch (r.type) {
+        case ParameterRangeType::MinMax:
+            put<float>(p, r.min); put<float>(p, r.max); put_str(p, r.unit);
+            break;
+        case ParameterRangeType::Spectrum:
+            put<float>(p, r.min); put<float>(p, r.max); put<float>(p, r.bin_width); put_str(p, r.unit);
+            break;
+        case ParameterRangeType::Map:
+            put<uint32_t>(p, static_cast<uint32_t>(r.children.size()));
+            for (const auto& [name, child] : r.children) {
+                put_str(p, name);
+                put<uint8_t>(p, static_cast<uint8_t>(child.type));
+                const std::string cp = range_payload(child);
+                put<uint32_t>(p, static_cast<uint32_t>(cp.size()));   // bytes until the next child
+                p.write(cp.data(), static_cast<std::streamsize>(cp.size()));
+            }
+            break;
+    }
+    return p.str();
+}
+
+// Inverse of range_payload: parse a range of `type` from its payload bytes (skip-friendly — the
+// caller already read the exact byte count). Unknown types yield a default range (bytes ignored).
+ParameterRange parse_range(ParameterRangeType type, const std::string& payload) {
+    ParameterRange r; r.type = type;
+    std::istringstream p(payload, std::ios::binary);
+    switch (type) {
+        case ParameterRangeType::MinMax:
+            r.min = get<float>(p); r.max = get<float>(p); r.unit = get_str(p);
+            break;
+        case ParameterRangeType::Spectrum:
+            r.min = get<float>(p); r.max = get<float>(p); r.bin_width = get<float>(p); r.unit = get_str(p);
+            break;
+        case ParameterRangeType::Map: {
+            const uint32_t n = get<uint32_t>(p);
+            r.children.reserve(n);
+            for (uint32_t i = 0; i < n; ++i) {
+                std::string name = get_str(p);
+                const auto ctype = static_cast<ParameterRangeType>(get<uint8_t>(p));
+                const uint32_t clen = get<uint32_t>(p);
+                std::string cbuf(clen, '\0');
+                p.read(cbuf.data(), clen);
+                r.children.emplace_back(std::move(name), parse_range(ctype, cbuf));
+            }
+            break;
+        }
+    }
+    return r;
+}
+
 void put_domain(std::ostream& os, const ModelDomain& d) {
     put<int32_t>(os, d.spectrum_bins);
     put<float>(os, d.spectrum_max_energy_ev);
-    // v3: physical field dimensions (metres) the normalised [0,1]^3 positions map into.
     put<float>(os, d.field_dimensions_m[0]);
     put<float>(os, d.field_dimensions_m[1]);
     put<float>(os, d.field_dimensions_m[2]);
+    // Beam parameters: a name -> typed-range map. Each entry is self-describing (type + byte length
+    // + payload) so a reader can deserialise by type or skip the payload and just read the names.
     put<uint32_t>(os, static_cast<uint32_t>(d.beam_parameters.size()));
-    for (const auto& p : d.beam_parameters) {
-        put_str(os, p.name);
-        put<int32_t>(os, p.count);
-        put<float>(os, p.range.min);
-        put<float>(os, p.range.max);
-        put_str(os, p.range.unit);
+    for (const auto& bp : d.beam_parameters) {
+        put_str(os, bp.name);
+        put<uint8_t>(os, static_cast<uint8_t>(bp.range.type));
+        const std::string payload = range_payload(bp.range);
+        put<uint32_t>(os, static_cast<uint32_t>(payload.size()));   // bytes until the next entry
+        os.write(payload.data(), static_cast<std::streamsize>(payload.size()));
     }
 }
 ModelDomain get_domain(std::istream& is) {
@@ -67,13 +122,15 @@ ModelDomain get_domain(std::istream& is) {
     const uint32_t n = get<uint32_t>(is);
     d.beam_parameters.reserve(n);
     for (uint32_t i = 0; i < n; ++i) {
-        BeamParameter p;
-        p.name       = get_str(is);
-        p.count      = get<int32_t>(is);
-        p.range.min  = get<float>(is);
-        p.range.max  = get<float>(is);
-        p.range.unit = get_str(is);
-        d.beam_parameters.push_back(std::move(p));
+        BeamParameter bp;
+        bp.name = get_str(is);
+        const auto type = static_cast<ParameterRangeType>(get<uint8_t>(is));
+        const uint32_t len = get<uint32_t>(is);
+        std::string payload(len, '\0');
+        is.read(payload.data(), len);
+        if (!is) throw std::runtime_error("model_io: truncated beam-parameter range");
+        bp.range = parse_range(type, payload);
+        d.beam_parameters.push_back(std::move(bp));
     }
     return d;
 }

@@ -9,26 +9,42 @@
 // carries them once loaded — so this header sits below both and neither has to include the other.
 //
 #include <array>
+#include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace rfnn {
 namespace io {
 
-// Valid range + physical unit of one beam parameter (a segment of the model's input vector).
-struct ParameterRange {
-    float       min  = 0.f;
-    float       max  = 0.f;
-    std::string unit;        // e.g. "m", "deg", "eV", "" (dimensionless, e.g. a unit direction)
+// What kind of value a beam parameter's range carries. Stored per entry so the format is
+// self-describing and forward-compatible: a reader reads the type + the entry's byte length and
+// either deserialises the payload it understands or skips those bytes — so existing metadata can
+// gain new range kinds without breaking older readers (they just iterate the names).
+enum class ParameterRangeType : uint8_t {
+    MinMax   = 0,   // a [min, max] interval (+ unit): direction, distance, opening angle, …
+    Spectrum = 1,   // a histogram range [min, max] with a fixed bin_width (+ unit): the tube spectrum
+    Map      = 2,   // a nested name -> range map (children)
 };
 
-// One entry of the model's beam-parameter input vector: its name, how many scalar slots of the
-// input vector it occupies, and the metric range/unit those slots are valid over. The ordered
-// list describes the whole beam-parameter vector passed to volume prediction.
+// One beam parameter's range — a tagged variant. Which members are meaningful depends on `type`:
+//   MinMax   -> min, max, unit
+//   Spectrum -> min, max, bin_width, unit   (bins = round((max - min) / bin_width))
+//   Map      -> children (ordered name -> range)
+struct ParameterRange {
+    ParameterRangeType type      = ParameterRangeType::MinMax;
+    float         min       = 0.f;
+    float         max       = 0.f;
+    float         bin_width = 0.f;   // Spectrum only
+    std::string   unit;              // MinMax / Spectrum
+    std::vector<std::pair<std::string, ParameterRange>> children;   // Map only
+};
+
+// One entry of the model's beam-parameter input layout: a name and its typed range. The ordered
+// list describes the whole beam-parameter vector the model generalises over.
 struct BeamParameter {
-    std::string    name;       // e.g. "direction", "distance", "spectrum", "opening_angle"
-    int            count = 0;  // number of input-vector slots this parameter spans
-    ParameterRange range;
+    std::string name;     // e.g. "direction", "distance", "spectrum", "opening_angle"
+    ParameterRange   range;
 };
 
 // The model's fixed I/O domain, in metric units. A model generalises over a *range* of beam
