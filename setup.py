@@ -28,6 +28,21 @@ def _truthy(name: str, default: str = "") -> bool:
     return os.environ.get(name, default).strip().lower() in ("1", "on", "true", "yes")
 
 
+def _version() -> str:
+    """Package version from the CI toolchain.
+
+    On a GitHub Actions tag build the runner sets ``GITHUB_REF_TYPE=tag`` and ``GITHUB_REF_NAME``
+    to the tag itself. Release tags are plain ``x.y.z`` (see ``.github/workflows/release.yml``), so
+    the tag *is* the version — no prefix to strip. Branch builds and local installs fall back to a
+    dev version (never published).
+    """
+    if os.environ.get("GITHUB_REF_TYPE") == "tag":
+        tag = os.environ.get("GITHUB_REF_NAME", "").strip()
+        if tag:
+            return tag
+    return os.environ.get("RFNN_VERSION", "0.0.0.dev0")
+
+
 def _ensure_generator(build_dir: Path, generator: str) -> None:
     """CMake refuses to switch generators on an existing build dir. If ``build_dir`` was configured
     with a different generator (e.g. an older Makefiles build), wipe it so the requested generator
@@ -99,6 +114,8 @@ class CMakeBuild(build_ext):
             "-DRFNN_BACKEND_VULKAN=OFF",
             "-DBUILD_RADFIELDNN_TESTS=OFF",
             "-DBUILD_EXAMPLES=OFF",
+            # CPU-only ONNX Runtime for self-contained wheels (RFNN_ORT_GPU=0); GPU by default.
+            f"-DORT_GPU={'ON' if _truthy('RFNN_ORT_GPU', '1') else 'OFF'}",
             f"-DCMAKE_BUILD_TYPE={self.build_type}",
         ]
 
@@ -118,9 +135,10 @@ class CMakeBuild(build_ext):
 
         # CMake outputs rfnn_deploy into <repo>/lib (where the Python loader resolves it for an
         # editable install). Mirror it into the wheel's package dir so non-editable installs ship
-        # it too.
-        for so in (HERE / "lib").glob("rfnn_deploy*.so"):
-            shutil.copy2(so, extdir / so.name)
+        # it too. The module is a .so on Linux and a .pyd on Windows.
+        for pattern in ("rfnn_deploy*.so", "rfnn_deploy*.pyd"):
+            for so in (HERE / "lib").glob(pattern):
+                shutil.copy2(so, extdir / so.name)
 
     # ── tiny-cuda-nn fused models (opt-in: RFNN_WITH_TCNN=1) ──────────────────────────────────────
     def _build_tcnn(self, ext: CMakeExtension) -> None:
@@ -190,7 +208,7 @@ if _truthy("RFNN_WITH_TCNN"):
 
 setup(
     name="radfield3d-nn",
-    version=os.environ.get("CI_COMMIT_TAG") or os.environ.get("CI_COMMIT_REF_NAME") or "1.0.0",
+    version=_version(),
     author="Felix Lehner",
     author_email="felix.lehner@ptb.de",
     license=LICENSE_TEXT,

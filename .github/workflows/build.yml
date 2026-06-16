@@ -1,0 +1,36 @@
+name: Build
+
+# Verify the deployment extension builds on every commit (TCNN off, CPU-only),
+# across Linux + Windows and Python 3.12 / 3.13 / 3.14.
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.12', '3.13', '3.14']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build deploy extension
+        uses: ./.github/actions/build-deploy
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Upload deploy extension
+        uses: actions/upload-artifact@v4
+        with:
+          name: rfnn_deploy-${{ matrix.os }}-py${{ matrix.python }}-${{ github.sha }}
+          path: |
+            lib/rfnn_deploy*.so
+            lib/rfnn_deploy*.pyd
+          if-no-files-found: error

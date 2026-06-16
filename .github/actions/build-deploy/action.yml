@@ -1,0 +1,69 @@
+name: Build deploy extension
+description: >-
+  Configure and build the CPU-only `rfnn_deploy` deployment extension (RF3M loader + ONNX
+  field predictors) on Linux or Windows. Mirrors setup.py's deploy build: tiny-cuda-nn OFF,
+  Vulkan OFF, no torch/CUDA. The compiled module (.so / .pyd) lands in <repo>/lib, and the
+  fetched ONNX Runtime shared library is staged next to it so the module imports.
+
+inputs:
+  python-version:
+    description: Python version to build the extension against.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+        allow-prereleases: true
+
+    # Ninja needs the MSVC toolchain on PATH; this loads the x64 dev environment.
+    - name: Set up MSVC (Windows)
+      if: runner.os == 'Windows'
+      uses: ilammy/msvc-dev-cmd@v1
+
+    - name: Install build tooling
+      shell: bash
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install "cmake" "ninja>=1.13.0" "pybind11>=3.0.4"
+
+    # ONNX Runtime is a large prebuilt download and RadFiled3D/glm/pybind are FetchContent'd;
+    # cache the _deps tree per-OS so only the first run pays the download/compile cost.
+    - name: Cache CMake dependencies
+      uses: actions/cache@v4
+      with:
+        path: build_deploy/_deps
+        key: deploy-deps-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+        restore-keys: |
+          deploy-deps-${{ runner.os }}-
+
+    - name: Configure & build (deployment, TCNN off)
+      shell: bash
+      env:
+        PYTHON_EXECUTABLE: python
+      run: |
+        PYEXE="$(python -c 'import sys; print(sys.executable.replace(chr(92), "/"))')"
+        cmake -S . -B build_deploy -G Ninja \
+          -DPython_EXECUTABLE="$PYEXE" \
+          -DPYTHON_VERSION="${{ inputs.python-version }}" \
+          -DBuild_DeployPyBindings=ON \
+          -DRFNN_WITH_TCNN=OFF \
+          -DRFNN_BACKEND_VULKAN=OFF \
+          -DBUILD_RADFIELDNN_TESTS=OFF \
+          -DBUILD_EXAMPLES=OFF \
+          -DORT_GPU=OFF \
+          -DCMAKE_BUILD_TYPE=Release
+        cmake --build build_deploy --target rfnn_deploy
+
+    # The module links ONNX Runtime's shared lib (libonnxruntime.so / onnxruntime.dll). Copy it
+    # next to the module in lib/: on Windows the loader searches the module's own directory, and
+    # on Linux LD_LIBRARY_PATH=lib then resolves it — so a bare `import rfnn_deploy` works.
+    - name: Stage ONNX Runtime next to the module
+      shell: bash
+      run: |
+        cp -v build_deploy/_deps/fetch_onnxruntime-src/lib/*onnxruntime* lib/ 2>/dev/null || true
+        # Any other runtime libs the build produced (e.g. RadFiled3D if built shared).
+        find build_deploy -maxdepth 6 \( -name '*.dll' -o -name 'libRadFiled3D*.so*' \) \
+          -exec cp -v {} lib/ \; 2>/dev/null || true

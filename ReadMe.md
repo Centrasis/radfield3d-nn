@@ -1,5 +1,9 @@
 # RadField3D-NN
 
+[![Build](https://github.com/Centrasis/radfield3d-nn/actions/workflows/build.yml/badge.svg)](https://github.com/Centrasis/radfield3d-nn/actions/workflows/build.yml)
+[![Tests](https://github.com/Centrasis/radfield3d-nn/actions/workflows/tests.yml/badge.svg)](https://github.com/Centrasis/radfield3d-nn/actions/workflows/tests.yml)
+[![PyPI version](https://img.shields.io/pypi/v/radfield3d-nn.svg)](https://pypi.org/project/radfield3d-nn/)
+
 Neural networks that predict spatially-resolved X-ray **flux** and **spectrum** fields (and a
 derived **air-kerma** metric) from beam parameters, trained on
 [RadFiled3D](https://github.com/Centrasis/RadFiled3D) `.rf3` datasets. Pure-Python models and

@@ -1,0 +1,152 @@
+name: Release (PyPI)
+
+#  NOT ARMED. Packaging is prepared but publishing is intentionally disabled.
+
+
+on:
+  workflow_dispatch:
+  # push:
+  #   tags:
+  #     - '[0-9]+.[0-9]+.[0-9]+'
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Gate: only package a release if the tag is strictly x.y.z. The tag trigger glob
+  # already filters loosely, but this anchored check also rejects near-misses (extra
+  # components, pre-release suffixes, leading text) and guards the manual dispatch path.
+  validate-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check tag follows x.y.z
+        run: |
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
+            echo "::notice::Non-tag run ('${GITHUB_REF_NAME}') — dry-run build; version falls back to a dev version."
+            exit 0
+          fi
+          if [[ ! "${GITHUB_REF_NAME}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag '${GITHUB_REF_NAME}' is not x.y.z — refusing to package a release."
+            exit 1
+          fi
+          echo "Release tag '${GITHUB_REF_NAME}' OK."
+
+  # One self-contained wheel per OS × Python: the deploy extension is a compiled,
+  # platform-specific module, and ONNX Runtime (CPU build) is vendored into the wheel by
+  # auditwheel (Linux) / delvewheel (Windows) — each renames the bundled lib with a unique
+  # hash so it can never clash with a separately-installed `onnxruntime` in the same process.
+  build-wheels:
+    needs: validate-tag
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.12', '3.13', '3.14']
+    env:
+      RFNN_WITH_TCNN: '0'
+      RFNN_ORT_GPU: '0'  # CPU-only ONNX Runtime — small, vendorable, no CUDA host needed.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          allow-prereleases: true
+
+      - name: Set up MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Cache CMake dependencies
+        uses: actions/cache@v4
+        with:
+          path: build_deploy/_deps
+          key: wheel-deps-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: |
+            wheel-deps-${{ runner.os }}-
+
+      - name: Install build tooling
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build wheel setuptools "cmake" "ninja>=1.13.0" "pybind11>=3.0.4"
+
+      - name: Build wheel (deployment, TCNN off, CPU ORT)
+        # No build isolation: the deploy build needs no torch, so reuse the toolchain installed
+        # above. setup.py reads the version straight from the CI tag (GITHUB_REF_NAME).
+        shell: bash
+        run: python -m build --no-isolation --wheel
+
+      - name: Vendor ONNX Runtime into wheel (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          python -m pip install auditwheel
+          export LD_LIBRARY_PATH="$PWD/build_deploy/_deps/fetch_onnxruntime-src/lib:${LD_LIBRARY_PATH:-}"
+          mkdir -p wheelhouse
+          for whl in dist/*.whl; do
+            auditwheel repair "$whl" -w wheelhouse
+          done
+          rm -f dist/*.whl
+          mv wheelhouse/*.whl dist/
+
+      - name: Vendor ONNX Runtime into wheel (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          python -m pip install delvewheel
+          mkdir -p wheelhouse
+          for whl in dist/*.whl; do
+            delvewheel repair "$whl" -w wheelhouse \
+              --add-path "build_deploy/_deps/fetch_onnxruntime-src/lib"
+          done
+          rm -f dist/*.whl
+          mv wheelhouse/*.whl dist/
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.os }}-py${{ matrix.python }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  build-sdist:
+    needs: validate-tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build sdist
+        run: |
+          python -m pip install --upgrade pip build setuptools
+          python -m build --no-isolation --sdist
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish-pypi:
+    needs: [build-wheels, build-sdist]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # PyPI Trusted Publishing (OIDC)
+    steps:
+      - name: Download all distributions
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

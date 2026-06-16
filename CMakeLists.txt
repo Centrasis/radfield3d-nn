@@ -77,6 +77,10 @@ FetchContent_MakeAvailable(fetch_radfiled3d)
 # model trained here runs in a bare C++ runtime. Official prebuilt release (CUDA build; CPU
 # EP fallback at runtime). Override the version with -DORT_VERSION=.
 set(ORT_VERSION "1.26.0" CACHE STRING "ONNX Runtime version")
+# GPU (CUDA/TensorRT) build by default; OFF fetches the much smaller CPU-only runtime. The CPU
+# package is what gets vendored into the self-contained PyPI wheels (the GPU package drags in
+# hundreds of MB of CUDA/TRT provider libs and a matching CUDA host install).
+option(ORT_GPU "Fetch the GPU (CUDA/TensorRT) ONNX Runtime build; OFF = CPU-only runtime" ON)
 # Which CUDA major the prebuilt GPU package targets. ORT publishes a CUDA-13 build under a
 # '_cuda13' asset suffix and the legacy CUDA-12 build with no suffix; CUDA-12 support is
 # dropped from ORT 1.27.0 on. The runtime host must have the matching CUDA + cuDNN 9 (+ a
@@ -88,11 +92,16 @@ else()
   set(_ORT_CUDA_SFX "")
 endif()
 if(WIN32)
-  set(_ORT_PKG "onnxruntime-win-x64-gpu${_ORT_CUDA_SFX}-${ORT_VERSION}")
+  set(_ORT_OS "win-x64")
   set(_ORT_EXT "zip")
 else()
-  set(_ORT_PKG "onnxruntime-linux-x64-gpu${_ORT_CUDA_SFX}-${ORT_VERSION}")
+  set(_ORT_OS "linux-x64")
   set(_ORT_EXT "tgz")
+endif()
+if(ORT_GPU)
+  set(_ORT_PKG "onnxruntime-${_ORT_OS}-gpu${_ORT_CUDA_SFX}-${ORT_VERSION}")
+else()
+  set(_ORT_PKG "onnxruntime-${_ORT_OS}-${ORT_VERSION}")
 endif()
 FetchContent_Declare(
   fetch_onnxruntime
@@ -100,9 +109,17 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(fetch_onnxruntime)
 add_library(onnxruntime SHARED IMPORTED GLOBAL)
-set_target_properties(onnxruntime PROPERTIES
-  IMPORTED_LOCATION             "${fetch_onnxruntime_SOURCE_DIR}/lib/libonnxruntime.so"
-  INTERFACE_INCLUDE_DIRECTORIES "${fetch_onnxruntime_SOURCE_DIR}/include")
+if(WIN32)
+  # Windows prebuilt: link against the import library (.lib), load the .dll at runtime.
+  set_target_properties(onnxruntime PROPERTIES
+    IMPORTED_LOCATION             "${fetch_onnxruntime_SOURCE_DIR}/lib/onnxruntime.dll"
+    IMPORTED_IMPLIB               "${fetch_onnxruntime_SOURCE_DIR}/lib/onnxruntime.lib"
+    INTERFACE_INCLUDE_DIRECTORIES "${fetch_onnxruntime_SOURCE_DIR}/include")
+else()
+  set_target_properties(onnxruntime PROPERTIES
+    IMPORTED_LOCATION             "${fetch_onnxruntime_SOURCE_DIR}/lib/libonnxruntime.so"
+    INTERFACE_INCLUDE_DIRECTORIES "${fetch_onnxruntime_SOURCE_DIR}/include")
+endif()
 
 # ── Vulkan (deployment GPU export backend) ─────────────────────────────────────
 if(RFNN_BACKEND_VULKAN)
