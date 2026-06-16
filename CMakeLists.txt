@@ -18,6 +18,10 @@ option(Build_PyBindings "If the python bindings should be built" ${RFNN_WITH_TCN
 if (MSVC)
 	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /D_CRT_SECURE_NO_WARNINGS")
 	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /MP24")
+	# MSVC has no _Float16, so RadFiled3D compiles out Typing::float16. Force-include a half shim
+	# into every TU (ours AND RadFiled3D's) before its headers are parsed so float16 exists and is
+	# consistent across the library boundary. See include/radfield3d-nn/msvc_float16_shim.hpp.
+	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /FI\"${CMAKE_SOURCE_DIR}/include/radfield3d-nn/msvc_float16_shim.hpp\"")
 else()
 	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
 endif()
