@@ -9,7 +9,7 @@ from radfield3dnn.models.activations.HistogramNormalize import HistogramNormaliz
 from .base import ModuleBuilder
 from radfield3dnn.optim import OptimizerBehaviour, CosineWithWarmup
 from typing import Union, Literal
-from radfield3dnn.models.activations.flux_activations import GradientConservingClamping, SoftClip, LogitSigmoid
+from radfield3dnn.models.activations.flux_activations import GradientConservingClamping, SoftClip, LogitSigmoid, IdentityFlux
 from radfield3dnn.preprocessing.normalizations.linear import LinearNormalizer
 from radfield3dnn.preprocessing.normalizations.asinh import AsinhTonemapNormalizer
 from radfield3dnn.models.layers import FiLM, Concat, GatedFusion, ResidualFiLM, ConcatLinear, CrossAttentionFusion, TokenCrossAttentionFusion
@@ -59,7 +59,7 @@ class RFNetBase(FeedforwardPointwiseModel):
 
 
 class RFBackboneModel(nn.Module):
-    def __init__(self, d_model=256, out_spectra_dim=32, normalizer=None, precision: Literal["fp32", "fp16"] = "fp32", flux_activation: Literal["clamp", "softclip", "sigmoid"] = "clamp",
+    def __init__(self, d_model=256, out_spectra_dim=32, normalizer=None, precision: Literal["fp32", "fp16"] = "fp32", flux_activation: Literal["clamp", "softclip", "sigmoid", "none"] = "clamp",
                  location_encoding_params: dict = None,
                  direction_encoding_params: dict = None,
                  conditioning_params: dict = None,
@@ -161,7 +161,11 @@ class RFBackboneModel(nn.Module):
         # The sigmoid / softclip heads only need a (0,1) codomain — any normalizer that declares
         # range=(0,1) qualifies (LinearNormalizer(0,1) AND the asinh tonemap, whose codomain is
         # [0,1]), so gate on the declared range rather than the concrete normalizer class.
-        if flux_activation == "sigmoid":
+        if flux_activation in ("none", "identity"):
+            # Unbounded raw-logit head: no clamp/squash. The target may be the asinh tonemap
+            # ([0,1] codomain) but the head is left free to emit unbounded logits.
+            self.flux_activation = IdentityFlux()
+        elif flux_activation == "sigmoid":
             if getattr(self._normalizer, "range", None) == (0.0, 1.0):
                 self.flux_activation = LogitSigmoid(logit_range=30.0)
             else:
@@ -343,7 +347,7 @@ class SRBFNet(RFNetBase):
         global_parameters = self.backbone_model.encode_additional_parameters(x)
         return super().forward2volume(x, voxel_counts, self.out_spectra_dim, mask=mask, global_parameters=global_parameters)
 
-    def __init__(self, d_model=256, out_spectra_dim=32, flux_loss="SMAPEBalanced", spectrum_loss="HistogramLoss", normalizer=None, precision: Literal["fp32", "fp16"] = "fp32", flux_activation: Literal["clamp", "softclip", "sigmoid"] = "clamp",
+    def __init__(self, d_model=256, out_spectra_dim=32, flux_loss="SMAPEBalanced", spectrum_loss="HistogramLoss", normalizer=None, precision: Literal["fp32", "fp16"] = "fp32", flux_activation: Literal["clamp", "softclip", "sigmoid", "none"] = "clamp",
                  location_encoding_params: dict = None, direction_encoding_params: dict = None, conditioning_params: dict = None, training_params: dict = None, trunk_depth: int = 4, flux_head_hidden: int = 1):
         # Optimization/sampling knobs (learning_rate, max_lr, voxel-sampling flags) are folded into one
         # ``training_params`` dict; the individual values are unpacked here and threaded into the shared
@@ -462,7 +466,7 @@ class SPERFNet(SRBFNet):
     __model_name__ = "SPERFNet"
 
     class BackboneModel(RFBackboneModel):
-        def __init__(self, d_model=256, out_spectra_dim=32, normalizer=None, precision: Literal["fp32", "fp16"] = "fp32", flux_activation: Literal["clamp", "softclip", "sigmoid"] = "clamp",
+        def __init__(self, d_model=256, out_spectra_dim=32, normalizer=None, precision: Literal["fp32", "fp16"] = "fp32", flux_activation: Literal["clamp", "softclip", "sigmoid", "none"] = "clamp",
                      location_encoding_params: dict = None, direction_encoding_params: dict = None,
                      spectra_encoding_params: dict = None, conditioning_params: dict = None, trunk_depth: int = 4, flux_head_hidden: int = 1):
             super().__init__(d_model=d_model, out_spectra_dim=out_spectra_dim, normalizer=normalizer, conditioning_params=conditioning_params, precision=precision, flux_activation=flux_activation, location_encoding_params=location_encoding_params, direction_encoding_params=direction_encoding_params, trunk_depth=trunk_depth, flux_head_hidden=flux_head_hidden)
@@ -487,7 +491,7 @@ class SPERFNet(SRBFNet):
             beam_params = self.beam_encoder([dir_enc, spectrum])
             return beam_params
 
-    def __init__(self, d_model=256, out_spectra_dim=32, flux_loss="SMAPEBalanced", spectrum_loss="HistogramLoss", normalizer=None, precision: Literal["fp32", "fp16"] = "fp32", flux_activation: Literal["clamp", "softclip", "sigmoid"] = "clamp",
+    def __init__(self, d_model=256, out_spectra_dim=32, flux_loss="SMAPEBalanced", spectrum_loss="HistogramLoss", normalizer=None, precision: Literal["fp32", "fp16"] = "fp32", flux_activation: Literal["clamp", "softclip", "sigmoid", "none"] = "clamp",
                  location_encoding_params: dict = None, direction_encoding_params: dict = None, spectra_encoding_params: dict = None, conditioning_params: dict = None, training_params: dict = None, trunk_depth: int = 4, flux_head_hidden: int = 1):
         super().__init__(
             d_model=d_model,
@@ -532,7 +536,7 @@ class PBRFNet(SPERFNet):
     __model_name__ = "PBRFNet"
 
     class BackboneModel(SPERFNet.BackboneModel):
-        def __init__(self, d_model=256, out_spectra_dim=32, normalizer=None, scalar_encoding_dims=16, precision: Literal["fp32", "fp16"] = "fp32", flux_activation: Literal["clamp", "softclip", "sigmoid"] = "clamp",
+        def __init__(self, d_model=256, out_spectra_dim=32, normalizer=None, scalar_encoding_dims=16, precision: Literal["fp32", "fp16"] = "fp32", flux_activation: Literal["clamp", "softclip", "sigmoid", "none"] = "clamp",
                      location_encoding_params: dict = None, direction_encoding_params: dict = None,
                      spectra_encoding_params: dict = None, conditioning_params: dict = None, trunk_depth: int = 4, flux_head_hidden: int = 1):
             super().__init__(d_model=d_model, out_spectra_dim=out_spectra_dim, normalizer=normalizer, conditioning_params=conditioning_params, spectra_encoding_params=spectra_encoding_params, precision=precision, flux_activation=flux_activation, location_encoding_params=location_encoding_params, direction_encoding_params=direction_encoding_params, trunk_depth=trunk_depth, flux_head_hidden=flux_head_hidden)
@@ -589,7 +593,7 @@ class PBRFNet(SPERFNet):
             beam = self.beam_encoder(enc)
             return beam
 
-    def __init__(self, d_model=256, out_spectra_dim=32, scalar_encoding_dims=16, flux_loss="SMAPEBalanced", spectrum_loss="HistogramLoss", normalizer=None, precision: Literal["fp32", "fp16"] = "fp32", flux_activation: Literal["clamp", "softclip", "sigmoid"] = "clamp",
+    def __init__(self, d_model=256, out_spectra_dim=32, scalar_encoding_dims=16, flux_loss="SMAPEBalanced", spectrum_loss="HistogramLoss", normalizer=None, precision: Literal["fp32", "fp16"] = "fp32", flux_activation: Literal["clamp", "softclip", "sigmoid", "none"] = "clamp",
                  location_encoding_params: dict = None, direction_encoding_params: dict = None, spectra_encoding_params: dict = None, conditioning_params: dict = None, training_params: dict = None, trunk_depth: int = 4, flux_head_hidden: int = 1):
         if conditioning_params is None:
             conditioning_params = {"type": "None"}

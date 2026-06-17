@@ -99,6 +99,20 @@ public:
         load_from_memory(const void* bytes, size_t n, bool use_cuda = true);
     static std::unique_ptr<radfield3dnn::VolumeFieldPredictor>
         load(const std::string& path, bool use_cuda = true);
+
+    // The package metadata that lives in the RF3M header, ahead of the ONNX graphs.
+    struct PackageMetadata {
+        ModelProvenance              provenance;
+        ModelDomain                  domain;
+        std::map<std::string, float> metrics;
+    };
+
+    // Read ONLY the metadata header (provenance + domain + metrics) — WITHOUT loading the ONNX graphs
+    // or building a runnable predictor (no ONNX Runtime session). The graphs are serialised last, so
+    // this stops before them. Use this for UI / metadata display; it is cheap and must never touch ORT.
+    // (Predictor *type* — voxel vs volume — is NOT here; it needs the trunk graph, i.e. a real load.)
+    static PackageMetadata read_metadata_from_memory(const void* bytes, size_t n);
+    static PackageMetadata read_metadata(const std::string& path);
 };
 
 }  // namespace V1

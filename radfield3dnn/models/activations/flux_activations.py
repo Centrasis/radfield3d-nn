@@ -31,6 +31,22 @@ def flux_head_init_bias(activation, normalizer) -> float:
     return float(activation.bias_for_output(target_output))
 
 
+class IdentityFlux(nn.Module):
+    """Unbounded passthrough flux head: emits the raw logits with no clamp/squash.
+
+    For experiments that want the head's output to be unbounded (e.g. the asinh tonemap target
+    trained with raw logits). `init_bias` starts the head at the asinh codomain midpoint (0.5) so
+    the first step is well-conditioned, but nothing constrains the range thereafter.
+    """
+
+    @property
+    def init_bias(self) -> float:
+        return 0.5
+
+    def forward(self, x: Tensor) -> Tensor:
+        return x
+
+
 class GradientConservingClamping(nn.Module):
     def __init__(self, min_value=0.0, max_value=1.0):
         super().__init__()

@@ -269,6 +269,45 @@ ModelStore::load(const std::string& path, bool use_cuda) {
     return load_from_memory(buf.data(), buf.size(), use_cuda);
 }
 
+ModelStore::PackageMetadata
+ModelStore::read_metadata_from_memory(const void* bytes, size_t n) {
+    const std::string buf(static_cast<const char*>(bytes), n);
+    std::istringstream is(buf, std::ios::binary);
+
+    char magic[4]; is.read(magic, 4);
+    if (!is || std::memcmp(magic, kMagic, 4) != 0)
+        throw std::runtime_error("model_io: bad magic (not an RF3M package)");
+    const uint32_t version = get<uint32_t>(is);
+    if (version != kVersion)
+        throw std::runtime_error("model_io: unsupported RF3M version " + std::to_string(version));
+
+    // Same header order as save_to_memory; we stop before the (heavy) ONNX graph payloads — no ORT.
+    PackageMetadata md;
+    md.provenance.dataset_name     = get_str(is);
+    md.provenance.software_version = get_str(is);
+    md.provenance.physics          = get_str(is);
+    md.domain                      = get_domain(is);
+    const uint32_t n_metrics = get<uint32_t>(is);
+    for (uint32_t i = 0; i < n_metrics; ++i) {
+        const std::string k = get_str(is);
+        md.metrics[k] = get<float>(is);
+    }
+    if (!is) throw std::runtime_error("model_io: truncated RF3M metadata header");
+    return md;
+}
+
+ModelStore::PackageMetadata
+ModelStore::read_metadata(const std::string& path) {
+    std::ifstream is(path, std::ios::binary | std::ios::ate);
+    if (!is) throw std::runtime_error("model_io: cannot open '" + path + "'");
+    const std::streamsize n = is.tellg();
+    is.seekg(0);
+    std::vector<char> buf(static_cast<size_t>(n));
+    is.read(buf.data(), n);
+    if (!is) throw std::runtime_error("model_io: failed reading '" + path + "'");
+    return read_metadata_from_memory(buf.data(), buf.size());
+}
+
 }  // namespace V1
 }  // namespace io
 }  // namespace rfnn
