@@ -207,6 +207,20 @@ count. Per-voxel models (PBRFNet) export two graphs — a `beam_encoder` (beam p
 and a `trunk` (position + latent → flux/spectrum) — so the runtime encodes the beam once and reuses
 the latent across every voxel. Field-wise models export a single `trunk`.
 
+### Inference requirements (GPU)
+
+The deploy runtime needs no PyTorch. It runs on the **CPU** execution provider out of the box, but the
+**CUDA** execution provider is ~20× faster (≈20 ms vs ≈400 ms per inference) and is the intended path.
+Using the CUDA EP requires, installed on the system:
+
+- an **NVIDIA driver + GPU** capable of **CUDA 13**,
+- the **CUDA 13 runtime** (`libcudart.so.13`, `libcublas.so.13`, `libcufft.so.12`), and
+- **cuDNN 9 for CUDA 13** (`libcudnn.so.9`) — package `cudnn9-cuda-13` from NVIDIA's CUDA apt repo. Use
+  an LTS repo that carries cuDNN (e.g. `ubuntu2404`, distro-agnostic; the repo path uses `x86_64`, not
+  `amd64`). Brand-new non-LTS repos may ship only the base CUDA toolkit (no cuDNN).
+
+If the CUDA EP cannot be loaded, the runtime falls back to the CPU EP (correct, but slow).
+
 ### RF3M binary format (little-endian)
 
 The byte layout is owned by `rfnn::io::V1::ModelStore` (the reference implementation is
