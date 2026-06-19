@@ -229,6 +229,7 @@ setup(
         "onnx>=1.21.0",
         "onnxscript>=0.7.0",
         "onnxruntime>=1.26.0",
+        "onnxconverter-common>=1.14.0",   # fp16 ONNX conversion for export_fp16 packaging
     ],
     packages=packages,
     package_data={

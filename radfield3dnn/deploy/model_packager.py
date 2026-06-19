@@ -52,13 +52,19 @@ class ModelPackager:
     """
 
     def __init__(self, model, datamodule, test_metrics: Mapping[str, object], *,
-                 dataset_path: str, max_energy_eV: float = 1.5e5, spectra_bins: int = 32):
+                 dataset_path: str, max_energy_eV: float = 1.5e5, spectra_bins: int = 32,
+                 export_fp16: bool = False):
         self.model = model
         self.datamodule = datamodule
         self.metrics = {str(k): _metric_value(v) for k, v in dict(test_metrics or {}).items()}
         self.dataset_path = dataset_path
         self.max_energy_eV = float(max_energy_eV)
         self.spectra_bins = int(getattr(model, "out_spectra_dim", spectra_bins) or spectra_bins)
+        # Store the exported ONNX graphs with fp16 weights (half the file size). The graph I/O is
+        # kept fp32 (Cast nodes at the boundary), so the deploy runtime contract is unchanged — it
+        # still feeds/reads float32. Intended for models trained in mixed precision, whose fp32
+        # master weights carry no more than fp16 of useful signal anyway.
+        self.export_fp16 = bool(export_fp16)
 
     # ── metadata gathering ────────────────────────────────────────────────────
     def _sample_rf3(self) -> str | None:
@@ -166,20 +172,50 @@ class ModelPackager:
             if os.path.exists(tmp.name):
                 os.unlink(tmp.name)
 
+    @staticmethod
+    def _to_fp16(onnx_bytes: bytes) -> bytes:
+        """Convert an exported fp32 ONNX graph to fp16 weights, keeping the graph I/O in fp32.
+
+        ``keep_io_types=True`` makes the converter wrap the inputs/outputs with Cast nodes, so the
+        external interface (the tensors the deploy runtime feeds and reads) stays float32 while the
+        weights and internal compute drop to fp16 — halving the stored graph. ``max_finite_val`` is
+        raised to the true fp16 ceiling (65504) so values that genuinely fit in fp16 are not clamped
+        (the library's 1e4 default would needlessly truncate them)."""
+        from onnxconverter_common.float16 import convert_float_to_float16  # optional, lazy import
+        import onnx
+        model = onnx.load_from_string(onnx_bytes)
+        model16 = convert_float_to_float16(model, keep_io_types=True, max_finite_val=65504.0)
+        return model16.SerializeToString()
+
     def _graphs(self) -> dict:
         """Named ONNX graphs composing the model. Per-voxel NeRF models export a two-graph
         pair — a 'beam_encoder' (beam parameters -> latent) and a 'trunk' (position + latent ->
         flux/spectrum) — so the deploy runtime encodes the beam once and reuses the latent across
-        every voxel. Other models export a single 'trunk'. Keys match the rfnn k*Graph names."""
+        every voxel. Other models export a single 'trunk'. Keys match the rfnn k*Graph names.
+
+        With ``export_fp16`` each graph's weights are stored as fp16 (I/O stays fp32)."""
         if ModelExporter.supports_two_graph_split(self.model):
             try:
-                return {
+                graphs = {
                     "beam_encoder": self._export_bytes(ModelExporter.onnx_export_beam_encoder),
                     "trunk":        self._export_bytes(ModelExporter.onnx_export_trunk),
                 }
+                return self._maybe_fp16(graphs)
             except Exception as e:
                 print(f"[yellow]ModelPackager: two-graph export failed ({e}); using single trunk[/yellow]")
-        return {"trunk": self._export_bytes(ModelExporter.onnx_export)}
+        return self._maybe_fp16({"trunk": self._export_bytes(ModelExporter.onnx_export)})
+
+    def _maybe_fp16(self, graphs: dict) -> dict:
+        if not self.export_fp16:
+            return graphs
+        try:
+            out = {name: self._to_fp16(ob) for name, ob in graphs.items()}
+            print(f"[green]ModelPackager: exported graphs as fp16 "
+                  f"({', '.join(f'{n} {len(graphs[n])//1024}->{len(out[n])//1024} KiB' for n in graphs)}).[/green]")
+            return out
+        except Exception as e:                              # never lose the package over fp16 conversion
+            print(f"[yellow]ModelPackager: fp16 conversion failed ({e}); keeping fp32 graphs[/yellow]")
+            return graphs
 
     def _rf3m_metadata(self):
         """Assemble the C++ ModelDomain/ModelProvenance from the gathered metadata + ONNX graphs.

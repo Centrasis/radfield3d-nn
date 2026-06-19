@@ -12,3 +12,4 @@ optuna-integration[lightning]>=4.8.0
 onnx>=1.21.0
 onnxscript>=0.7.0
 onnxruntime>=1.26.0
+onnxconverter-common>=1.14.0
