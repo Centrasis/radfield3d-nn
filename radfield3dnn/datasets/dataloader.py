@@ -52,9 +52,10 @@ class RadiationFieldDataModule(pl.LightningDataModule):
         # reduced run still has held-out fields drawn from the same beam-parameter coverage.
         if max_fields is not None and max_fields < len(self._dataloader_builder.file_paths):
             import random
+            import torch
             from torch.utils.data import random_split
             fp = list(self._dataloader_builder.file_paths)
-            random.Random(1337).shuffle(fp)
+            random.Random(torch.initial_seed()).shuffle(fp)   # follow the global seed
             fp = fp[:int(max_fields)]
             self._dataloader_builder.file_paths = fp
             self._dataloader_builder.train_files, self._dataloader_builder.val_files, self._dataloader_builder.test_files = \
@@ -74,23 +75,21 @@ class RadiationFieldDataModule(pl.LightningDataModule):
         if cache_to_ram:
             import psutil
             from radfield3dnn.datasets.ram_cache import RamCachedDataset, compute_ram_budget
-            # Dynamic soft budget from the live system. cache_ram_gb overrides the auto sizing.
+            # ONE shared pool (preloaded in this parent process, inherited copy-on-write by the forked
+            # workers), so the budget is the whole safe RAM envelope — NOT divided by num_workers.
             total = compute_ram_budget(override_gb=cache_ram_gb)
-            workers = max(1, int(num_workers or 0))
-            per_proc = total / workers
-            # HARD guard against swap: stop caching (in every process) once live free RAM would drop
-            # below this floor — a startup byte-budget can't foresee the training process's own
-            # growing footprint (worker replicas, pinned buffers, the model). Keep ~20% of RAM free.
             try:
-                min_free = int(0.20 * psutil.virtual_memory().total)
+                # keep a generous floor free for the training process itself (model, pinned buffers,
+                # workers, prefetch) which loads AFTER the preload — undersizing this is what swaps.
+                min_free = int(0.35 * psutil.virtual_memory().total)
             except Exception:
                 min_free = 0
-            train_bytes, val_bytes = per_proc * 0.8, per_proc * 0.2
-            self._train_dataset = RamCachedDataset(self._train_dataset, max_bytes=train_bytes, min_free_bytes=min_free)
-            self._val_dataset = RamCachedDataset(self._val_dataset, max_bytes=val_bytes, min_free_bytes=min_free)
-            print(f"[green]RAM cache enabled (memory-pressure-aware): soft budget ~{total/1e9:.1f} GB "
-                  f"({per_proc/1e9:.1f} GB/proc × {workers}); caching stops if free RAM < "
-                  f"{min_free/1e9:.1f} GB. Raw decoded fields cached, augmentations stay per-epoch.[/green]")
+            train_bytes, val_bytes = total * 0.8, total * 0.2
+            self._train_dataset = RamCachedDataset(self._train_dataset, max_bytes=train_bytes, min_free_bytes=min_free).preload()
+            self._val_dataset = RamCachedDataset(self._val_dataset, max_bytes=val_bytes, min_free_bytes=min_free).preload()
+            print(f"[green]RAM cache enabled (shared COW pool): budget ~{total/1e9:.1f} GB, "
+                  f"floor {min_free/1e9:.1f} GB free. Fields decoded once in the parent and shared "
+                  f"across workers; overflow streams from disk.[/green]")
 
     def __len__(self):
         return self._fields_count

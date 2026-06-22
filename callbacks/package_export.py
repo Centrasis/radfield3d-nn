@@ -39,5 +39,7 @@ class PackageExportCallback(pl.Callback):
                 export_fp16=export_fp16,
             )
             packager.save(os.path.join(self.out_dir, f"{self.model_name}.rf3m"))
-        except Exception as e:  # never break a finished training run over packaging
-            print(f"[red]PackageExportCallback: failed to write model package ({e})[/red]")
+        except Exception:  # best-effort: don't fail a finished run, but surface the FULL error
+            import traceback
+            print("[red]PackageExportCallback: failed to write model package[/red]")
+            print(f"[red]{traceback.format_exc()}[/red]")

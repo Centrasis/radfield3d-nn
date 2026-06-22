@@ -111,9 +111,12 @@ class ROIbasedSampler(DataProcessing):
         if not self.training:
             return x
 
-        # ROIs from the preserved ORIGINAL GT (uncut, with the separate direct channel) — the same
-        # source the air-kerma metric uses, so the sampled regions match what is scored.
-        gt = x.original_ground_truth if x.original_ground_truth is not None else x.ground_truth
+        # Derive the ROIs from (and apply the mask to) ground_truth ONLY — never original_ground_truth,
+        # which stays the pristine reference the air-kerma metric scores against. Deriving + applying on
+        # the same tensor also avoids any shape mismatch. In the floor-mask pipeline the floor is already
+        # -inf here; compute_roi_masks classifies those as floor (beam/scatter come from the intact regions),
+        # so the ROIs are unchanged while the reference stays clean.
+        gt = x.ground_truth
         if isinstance(gt, RadiationField):
             scatter_flux = gt.scatter_field.flux if gt.scatter_field is not None else None
             direct_flux = gt.direct_beam.flux if gt.direct_beam is not None else None

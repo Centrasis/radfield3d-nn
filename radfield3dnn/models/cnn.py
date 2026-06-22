@@ -2,15 +2,15 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 import os
-from radfield3dnn.normalizations.linear import LinearNormalizer
+from radfield3dnn.preprocessing.normalizations.linear import LinearNormalizer
 from typing import Type
 from radfield3dnn.rftypes import RadiationField, RadiationFieldChannel, TrainingInputData
 from radfield3dnn.models.base import BaseNeuralRadFieldModel
-from radfield3dnn.activations.HistogramNormalize import HistogramNormalize
+from radfield3dnn.models.activations.HistogramNormalize import HistogramNormalize
 from RadFiled3D.pytorch.types import PositionalInput
-from radfield3dnn.activations.flux_activations import GradientConservingClamping
+from radfield3dnn.models.activations.flux_activations import GradientConservingClamping
 from radfield3dnn.models.encoders.spectra_encoder import SimpleSpectraEncoder
-from radfield3dnn.layers.film import FiLM
+from radfield3dnn.models.layers.fusions.film import FiLM
 
 
 class DeConvBlock3D(nn.Module):
@@ -60,10 +60,6 @@ class ResidualDeConvBlock3D(nn.Module):
             )
         )
         self.out_channels = out_channels
-        self.encoder = nn.Sequential(
-            nn.Conv3d(in_channels, out_channels, kernel_size=1, stride=1, padding=0),
-            nn.BatchNorm3d(out_channels)
-        )
 
     def forward(self, x: Tensor) -> Tensor:
         return self.block(x)
@@ -89,7 +85,8 @@ class ConvBlock3D(nn.Module):
 
 class DeConvBase(BaseNeuralRadFieldModel):
     def __init__(self, pos_enc_dim=10, d_model=256, spectra_bins: int = 150, out_dims: tuple[int, int, int] = (50, 50, 50), learning_rate: float = 1e-3, normalizer = None):
-        super().__init__(direction_encoding_dims=pos_enc_dim, d_model=d_model, learning_rate=learning_rate, normalizer=normalizer)
+        super().__init__(normalizer=normalizer, learning_rate=learning_rate)
+        self.d_model = d_model
         self.spectra_bins = spectra_bins
         self.out_dims = out_dims
         self.pos_enc_dim = pos_enc_dim

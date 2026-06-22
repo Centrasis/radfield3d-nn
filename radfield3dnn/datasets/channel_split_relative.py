@@ -27,13 +27,6 @@ from radfield3dnn.rftypes import (
 )
 
 
-# Marker key for the per-volume scaling metadata. Stored as a tensor of
-# shape (2,) = [scatter_max, direct_max] on the geometry slot — the only
-# place a per-volume scalar pair fits without changing the
-# RadiationField named-tuple contract.
-SCALING_META_NDIM = 1
-
-
 class ChannelsSplitRelative(DataProcessing):
     """Replace raw scatter / direct flux with their per-volume-max relative
     fields. Both output flux channels are in ``[0, 1]``.
@@ -189,7 +182,11 @@ class ChannelsSplitRelative(DataProcessing):
 
     @classmethod
     def create_from_config(cls, config: dict) -> "ChannelsSplitRelative":
-        return ChannelsSplitRelative()
+        # Honor the config keys instead of silently ignoring them.
+        return cls(
+            eps=float(config.get("eps", 1e-8)),
+            normalize_per_channel=bool(config.get("normalize_per_channel", True)),
+        )
 
     @staticmethod
     def extract_scaling(field: RadiationField) -> Union[torch.Tensor, None]:

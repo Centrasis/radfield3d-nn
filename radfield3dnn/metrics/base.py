@@ -17,7 +17,20 @@ def weight_field_by_statistical_error(tensor: Tensor, input: TrainingInputData, 
     :return: The weighted tensor.
     """
     if isinstance(input.ground_truth, RadiationField):
-        confidence = torch.clamp(1.0 - ((input.ground_truth.scatter_field.error + input.ground_truth.direct_beam.error) / 2.0), min=0.0, max=1.0)
+        gt = input.ground_truth
+        # direct_beam is None for a joined / single-channel RadiationField (e.g. after ChannelsJoin):
+        # average the per-channel errors only over the channels that actually exist.
+        sf_err = gt.scatter_field.error if gt.scatter_field is not None else None
+        db_err = gt.direct_beam.error if gt.direct_beam is not None else None
+        if sf_err is not None and db_err is not None:
+            error = (sf_err + db_err) / 2.0
+        elif sf_err is not None:
+            error = sf_err
+        elif db_err is not None:
+            error = db_err
+        else:
+            raise ValueError("RadiationField ground truth has no error field to weight by.")
+        confidence = torch.clamp(1.0 - error, min=0.0, max=1.0)
     elif isinstance(input.ground_truth, RadiationFieldChannel):
         confidence = torch.clamp(1.0 - input.ground_truth.error, min=0.0, max=1.0)
     else:

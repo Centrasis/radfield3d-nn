@@ -132,6 +132,17 @@ def construct_datamodule(dataset_path: str, batch_size: int, num_workers: int, u
         print(f"[green]Voxel resolution of dataset matches enforced resolution {voxel_resolution}!")
 
     if use_beam_parameters:
+        # A missing statistics.json is only FATAL together with use_beam_parameters: the beam
+        # normalizer needs the dataset's opening-angle / distance ranges. Without those keys, fail
+        # loudly with a fixable message instead of a raw KeyError.
+        required = ("tube_opening_angles_deg", "tube_distances_m")
+        missing = [k for k in required if k not in stats]
+        if missing:
+            raise ValueError(
+                f"use_beam_parameters=True requires dataset statistics, but "
+                f"{os.path.join(dataset_path, 'statistics.json')} is missing or lacks keys {missing}. "
+                f"Generate it with scripts/compute_dataset_statistics.py, or disable use_beam_parameters."
+            )
         print("[yellow]Using beam parameters normalization!")
         beam_normalizer = BeamParametersNormalization(
             opening_angle_range_deg=(

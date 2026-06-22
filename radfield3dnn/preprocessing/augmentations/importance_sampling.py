@@ -51,7 +51,10 @@ class ErrorbasedImportanceSampler(DataProcessing):
         if not self.training:
             return x
 
-        gt = x.original_ground_truth if x.original_ground_truth is not None else x.ground_truth
+        # Derive the drop mask from (and apply it to) ground_truth ONLY. original_ground_truth is the
+        # pristine reference the metric scores against — the sampler must never read or touch it, and
+        # deriving + applying on the same tensor also removes any shape-mismatch between the two.
+        gt = x.ground_truth
 
         assert (isinstance(gt, RadiationField) and (gt.scatter_field.error is not None or (gt.direct_beam is not None and gt.direct_beam.error is not None))) or (isinstance(gt, RadiationFieldChannel) and gt.error is not None), "Error field is missing"
         if isinstance(gt, RadiationField):

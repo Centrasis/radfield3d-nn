@@ -214,7 +214,7 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
         else:
             random_spectra2 = None
         random_flux2 = torch.abs(torch.rand((num_losses, 1), device=device))
-        random_flux2 /= random_flux1.max()
+        random_flux2 /= random_flux2.max()
 
         loss_test_in = TrainingInputData(
             input=train_in.input,
@@ -309,13 +309,13 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
             except torch.cuda.OutOfMemoryError:
                 print(f"[green]{self.max_inner_batch_size}")
                 break
-            except Exception as e:
-                error_msg = str(e)
-                if "DefaultCPUAllocator" in error_msg or "CUDA out of memory" in error_msg:
+            except (RuntimeError, MemoryError) as e:
+                # CPU-allocator OOM is a RuntimeError, not torch.cuda.OutOfMemoryError; swallow only OOM.
+                msg = str(e).lower()
+                if "out of memory" in msg or "defaultcpuallocator" in msg:
                     print(f"[green]{self.max_inner_batch_size}")
-                else:
-                    raise e
-                break
+                    break
+                raise
 
     def _search_optimal_batch_size_evaluate_forward(self, batch: TrainingInputData):
         return self.evaluate_forward(batch)
@@ -333,7 +333,7 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
     def assert_model_on_gpu(self):
         for name, param in self.named_parameters():
             if param.device.type != "cuda":
-                print("PARAM WARNUNG: {name} liegt auf {param.device}!")
+                print(f"PARAM WARNUNG: {name} liegt auf {param.device}!")
         for name, buf in self.named_buffers():
             if buf.device.type != "cuda":
                 print(f"BUFFER WARNUNG: {name} liegt auf {buf.device}!")
@@ -481,6 +481,8 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
         AirKermaField). Returns that probe prediction."""
         with torch.no_grad():
             if is_complete_volume:
+                assert self.max_inner_batch_size is not None, (
+                    "max_inner_batch_size must be set before the channel-eval probe (on_fit_start runs the search)")
                 bins = self.out_spectra_dim if hasattr(self, "out_spectra_dim") else 32
                 dims = torch.tensor([2, 2, 2], dtype=torch.int32, device=batch.input.direction.device)
                 return self.forward2volume(batch.input, dims, spectra_bins=bins)
@@ -504,11 +506,9 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
             return self._calculate_metrics_join_gt
         return self._calculate_metrics_single_channel
 
-    def _join_field(self, field):
-        """Physically join a split RadiationField (inverse -> sum channels -> re-normalise)."""
-        field = self._normalizer.inverse(field)
-        field = self._channels_join(field)
-        return self._normalizer.forward(field)
+    def _join_to_single_channel(self, x):
+        """Inverse -> ChannelsJoin -> normalizer.forward. Accepts a TrainingInputData or a RadiationField."""
+        return self._normalizer.forward(self._channels_join(self._normalizer.inverse(x)))
 
     def _calculate_metrics_single_channel(self, pred_field: RadiationField, y, batch: TrainingInputData) -> TrainingMetrics:
         """Plain single-channel eval: one predicted channel vs a single-channel GT."""
@@ -518,11 +518,13 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
         if pred_field.scatter_field.spectrum is not None:
             loss_spec = self._spectrum_loss_fn.forward(prediction=pred_field.scatter_field.spectrum, target=scatter_field_gt.spectrum, input=batch)
             if not torch.isfinite(loss_spec).all():
-                print(f"[red] Spectrum loss is not finite — letting downstream fallback set total to 1.")
+                print("[red] Spectrum loss non-finite this step — sanitising (nan/inf -> 0); task isolated.")
+                loss_spec = torch.nan_to_num(loss_spec, nan=0.0, posinf=0.0, neginf=0.0)
 
         loss_flux = self._flux_loss_fn.forward(prediction=pred_field.scatter_field.flux, target=scatter_field_gt.flux, input=batch)
         if not torch.isfinite(loss_flux).all():
-            print(f"[red] Flux loss is not finite — letting downstream fallback set total to 1.")
+            print("[red] Flux loss non-finite this step — sanitising (nan/inf -> 0); task isolated.")
+            loss_flux = torch.nan_to_num(loss_flux, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Debug-probe capture seam (callbacks/debug_probe.py): stash detached references to
         # exactly what went through the loss this step. Enabled by the TrainingDebugProbe
@@ -545,24 +547,18 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
 
     def _calculate_metrics_join_gt(self, pred_field: RadiationField, y: RadiationField, batch: TrainingInputData) -> TrainingMetrics:
         """Single-channel prediction vs a SPLIT GT: physically join the GT (and the batch the
-        loss receives as `input`), then evaluate as plain single-channel."""
-        batch = self._normalizer.forward(self._channels_join(self._normalizer.inverse(batch)))
-        y = self._join_field(y)
+        loss receives as `input`) via the shared round-trip, then evaluate as plain single-channel."""
+        batch = self._join_to_single_channel(batch)
+        y = self._join_to_single_channel(y)
         return self._calculate_metrics_single_channel(pred_field, y, batch)
 
     def _calculate_metrics_join_pred(self, pred_field: RadiationField, y, batch: TrainingInputData) -> TrainingMetrics:
-        """Two-head prediction vs a single-channel GT: physically join the PREDICTION
-        (inverse -> scatter+direct -> re-normalise), then evaluate as plain single-channel."""
-        inv = self._normalizer.inverse(pred_field)
-        joined = RadiationField(
-            scatter_field=RadiationFieldChannel(
-                flux=inv.scatter_field.flux + inv.direct_beam.flux,
-                spectrum=inv.scatter_field.spectrum,
-                error=inv.scatter_field.error,
-            ),
-            direct_beam=None,
-        )
-        return self._calculate_metrics_single_channel(self._normalizer.forward(joined), y, batch)
+        """Two-head prediction vs a single-channel GT: physically join the PREDICTION via the same
+        shared round-trip, then evaluate as plain single-channel."""
+        joined = self._join_to_single_channel(pred_field)
+        if not isinstance(joined, RadiationField):
+            joined = RadiationField(scatter_field=joined, direct_beam=None)
+        return self._calculate_metrics_single_channel(joined, y, batch)
 
     def _calculate_metrics_two_channel(self, pred_field: RadiationField, y: RadiationField, batch: TrainingInputData) -> TrainingMetrics:
         """Plain two-channel eval: scatter (flux+spectrum) and direct (flux) scored separately.

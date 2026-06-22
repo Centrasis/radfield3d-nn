@@ -22,8 +22,9 @@ class AsinhTonemapNormalizer(Normalizer):
         assert sigma > 0.0, f"Require sigma > 0, got sigma={sigma}."
         self.sigma = float(sigma)
         # The tonemap codomain is the closed [0, 1] interval (y = asinh(x/σ)/asinh(1/σ) with
-        # x ∈ [0, 1] after per-field max-normalisation). Declaring it lets the (0,1)-codomain flux
-        # heads — sigmoid / softclip — engage on asinh targets, not just LinearNormalizer(0,1).
+        # x ∈ [0, 1]; inputs above 1 are clamped to 1 in apply_transformation so the output is
+        # GUARANTEED in [0, 1]). Declaring it lets the (0,1)-codomain flux heads — sigmoid /
+        # softclip — engage on asinh targets, not just LinearNormalizer(0,1).
         self.range = (0.0, 1.0)
         # Precompute the constant denominator asinh(1/sigma) once. Stored as
         # a python float; tensor versions are constructed per-call to match
@@ -66,6 +67,9 @@ class AsinhTonemapNormalizer(Normalizer):
             # [0, 1] and always representable in fp16.
             xv32 = xv.to(torch.float32)
             y = torch.asinh(xv32 / self.sigma) / self._scale
+            # Guarantee the [0, 1] codomain: asinh(x/σ)/asinh(1/σ) == 1 at x == 1 and exceeds 1 for
+            # x > 1, so clamp the upper end (the lower end is >= 0 since validate_range rejects x < 0).
+            y = torch.clamp(y, min=0.0, max=1.0)
             assert torch.isfinite(y).all(), "Normalization resulted in non-finite values."
             y = y.to(in_dtype)
             if out is None:

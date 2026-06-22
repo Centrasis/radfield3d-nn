@@ -24,9 +24,16 @@ class CropDataset(DataProcessing):
         Returns:
             Tensor: Cropped tensor of shape (C, crop_size[0], crop_size[1], crop_size[2]).
         """
+        if tensor.ndim < 4:   # non-spatial tensors (e.g. (2,) split-relative geometry) pass through
+            return tensor
         batch_size = tensor.shape[0] if tensor.ndim == 5 else 0
         field_shape = tensor.shape[1:] if tensor.ndim == 5 else tensor.shape
         C, D, H, W = field_shape
+        if any(c > s for c, s in zip(self.crop_size, (D, H, W))):
+            raise ValueError(
+                f"crop_size {self.crop_size} exceeds the field spatial dimensions {(D, H, W)} — "
+                f"cropping cannot enlarge a field."
+            )
         diff_D = D - self.crop_size[0]
         diff_H = H - self.crop_size[1]
         diff_W = W - self.crop_size[2]

@@ -46,9 +46,11 @@ class UniformRotation(DataProcessing):
         :return: The augmented input data.
         """
         if self._should_apply_augmentation():
-            if self.max_rotation_angle_degrees.device != input_data.ground_truth.flux.device:
-                self.max_rotation_angle_degrees = self.max_rotation_angle_degrees.to(input_data.ground_truth.flux.device)
-                self.probability = self.probability.to(input_data.ground_truth.flux.device)
+            gt = input_data.ground_truth
+            device = gt.scatter_field.flux.device if isinstance(gt, RadiationField) else gt.flux.device
+            if self.max_rotation_angle_degrees.device != device:
+                self.max_rotation_angle_degrees = self.max_rotation_angle_degrees.to(device)
+                self.probability = self.probability.to(device)
 
             rotation_angles_xyz = (torch.rand((1, 3), dtype=torch.float32) - 0.5) * 2 * torch.deg2rad(self.max_rotation_angle_degrees)
             cos_x, sin_x = torch.cos(rotation_angles_xyz[0, 0]), torch.sin(rotation_angles_xyz[0, 0])
@@ -75,6 +77,7 @@ class UniformRotation(DataProcessing):
                 ], dtype=torch.float32)
             )
             R = torch.cat([R, torch.zeros(3, 1)], dim=1).unsqueeze(0)
+            R = R.to(device)   # affine_grid/grid_sample run on the field's device
 
             grid_fluence = F.affine_grid(
                 R,

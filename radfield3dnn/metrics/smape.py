@@ -25,17 +25,22 @@ class SMAPEAccuracy(MetricBase):
         assert 0.0 <= importance_threshold <= 1.0, "importance_threshold must be in the range [0, 1]."
         self.importance_threshold = torch.tensor(importance_threshold, dtype=torch.float32, requires_grad=False)
 
+    def _sync_device(self, device):
+        """Move eps and importance_threshold together so they cannot desync."""
+        if self.eps.device != device:
+            self.eps = self.eps.to(device)
+        if self.importance_threshold.device != device:
+            self.importance_threshold = self.importance_threshold.to(device)
+
     def _calc_metric(self, target: Tensor, prediction: Tensor) -> Tensor:
-        if self.eps.device != target.device:
-            self.eps = self.eps.to(target.device)
-            self.importance_threshold = self.importance_threshold.to(target.device)
+        self._sync_device(target.device)
 
         # Build mask: valid numbers only
         valid_mask = torch.isfinite(target) & torch.isfinite(prediction)
 
-        # Optionally exclude very small values via importance threshold
+        # gate on the target only (fixed GT region; prediction-independent).
         max_val = self.importance_threshold * target[valid_mask].max() if valid_mask.any() else torch.tensor(0.0, device=target.device, dtype=target.dtype)
-        importance_mask = valid_mask & ((target >= max_val) | (prediction >= max_val))
+        importance_mask = valid_mask & (target >= max_val)
 
         if self.keep_dim:
             acc_field = torch.full_like(target, -torch.inf)
@@ -80,15 +85,12 @@ class SMAPEAccuracy(MetricBase):
             return acc_map
 
     def forward(self, target: Union[RadiationFieldChannel, Tensor], prediction: Union[RadiationFieldChannel, Tensor], input: TrainingInputData = None) -> Tensor:
-        if self.importance_threshold.device != target.device:
-            self.eps = self.eps.to(target.device)
-            self.importance_threshold = self.importance_threshold.to(target.device)
+        self._sync_device(target.device if isinstance(target, Tensor) else self.eps.device)
 
         if self.weight_with_error:
             if self.importance_threshold > 0.0:
                 max_val = self.importance_threshold * target.max()
                 target_data = self.extract_tensor_from(target)
-                prediction_data = self.extract_tensor_from(prediction)
                 input = TrainingInputData(
                     input=input.input,
                     ground_truth=RadiationField(
@@ -96,7 +98,7 @@ class SMAPEAccuracy(MetricBase):
                             spectrum=input.ground_truth.scatter_field.spectrum,
                             flux=input.ground_truth.scatter_field.flux,
                             error=torch.where(
-                                (target_data >= max_val) | (prediction_data >= max_val),
+                                (target_data >= max_val),
                                 input.ground_truth.scatter_field.error,
                                 torch.zeros_like(input.ground_truth.scatter_field.error)
                             )
@@ -105,7 +107,7 @@ class SMAPEAccuracy(MetricBase):
                             spectrum=input.ground_truth.direct_beam.spectrum,
                             flux=input.ground_truth.direct_beam.flux,
                             error=torch.where(
-                                (target_data >= max_val) | (prediction_data >= max_val),
+                                (target_data >= max_val),
                                 input.ground_truth.direct_beam.error,
                                 torch.zeros_like(input.ground_truth.direct_beam.error)
                             )
@@ -114,7 +116,7 @@ class SMAPEAccuracy(MetricBase):
                         spectrum=input.ground_truth.spectrum,
                         flux=input.ground_truth.flux,
                         error=torch.where(
-                            (target_data >= max_val) | (prediction_data >= max_val),  # fixed precedence with parentheses
+                            (target_data >= max_val),
                             input.ground_truth.error,
                             torch.zeros_like(input.ground_truth.error)
                         )
@@ -129,19 +131,13 @@ class EnergyWeightedSMAPEAccuracy(SMAPEAccuracy):
         self._keep_dim_weighted_result = keep_dim
 
     def _calc_metric(self, target: Tensor, prediction: Tensor) -> Tensor:
-        smape = super()._calc_metric(target, prediction)
-        valid_mask = torch.isfinite(smape)
-        if valid_mask.all():
-            weigths = target
-        else:
-            weigths = target[valid_mask]
-            smape = smape[valid_mask]
-        denom = torch.sum(weigths)
-        wsmape = torch.sum(smape * weigths) / denom if denom > 0 else torch.tensor(0.0, device=target.device, dtype=target.dtype)
+        acc_field = super()._calc_metric(target, prediction)   # per-voxel field (keep_dim forced)
+        valid_mask = torch.isfinite(acc_field)
+        weights = target[valid_mask]
+        acc = acc_field[valid_mask]
+        denom = torch.sum(weights)
+        wsmape = torch.sum(acc * weights) / denom if denom > 0 else torch.tensor(0.0, device=target.device, dtype=target.dtype)
 
-        if self._keep_dim_weighted_result and not valid_mask.all():
-            result = torch.full_like(smape, -torch.inf)
-            result[valid_mask] = wsmape
-            return result
-        else:
-            return wsmape
+        if self._keep_dim_weighted_result:
+            return acc_field
+        return wsmape

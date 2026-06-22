@@ -16,14 +16,15 @@ from visualizers.sliced_plotter import SlicedAirkermaPlotter
 
 
 class ValidationPlotter(Callback):
-    def __init__(self, logger: LoggerBase, mu_tr_path: str, max_energy_eV: float = 1.5e+5, voxel_size: float = 0.025, voxel_resolution: tuple = (50, 50, 50), plot_spectra: bool = True, plot_volume: bool = True):
+    def __init__(self, logger: LoggerBase, mu_tr_path: str, max_energy_eV: float = 1.5e+5, voxel_size: float = 0.025, voxel_resolution: tuple = (50, 50, 50), plot_spectra: bool = True, plot_volume: bool = True, spectra_bins: int = 32):
         super().__init__()
         self.logger = logger
         self.voxel_resolution = torch.tensor(voxel_resolution, dtype=torch.int32)
+        self.spectra_bins = spectra_bins
         self.join_channels: ChannelsJoin = ChannelsJoin()
         self.plot_spectra = plot_spectra
         self.plot_volume = plot_volume
-        self.spectra_plotter = SpectrumPlotter(bins=32, max_energy_eV=max_energy_eV, used_unit="keV", bar_opacity=0.6)
+        self.spectra_plotter = SpectrumPlotter(bins=spectra_bins, max_energy_eV=max_energy_eV, used_unit="keV", bar_opacity=0.6)
         self.airkerma_plotter = AirkermaPlotter(
             mutr_path=mu_tr_path,
             max_energy_eV=max_energy_eV,
@@ -51,7 +52,7 @@ class ValidationPlotter(Callback):
                 batch,
                 pl_module,
                 voxel_resolution=self.voxel_resolution,
-                spectra_bins=32
+                spectra_bins=self.spectra_bins
             )
 
             with torch.no_grad():
@@ -91,7 +92,7 @@ class ValidationPlotter(Callback):
                     print(f"[yellow]Warning: Predicted flux is all zeros for item {idx} in validation batch.[/yellow]")
 
                 if self.plot_volume and idx == 0:
-                    vidx = int(torch.randint(0, batch_size - 1, size=(1,)).item()) if batch_size > 1 else 0
+                    vidx = int(torch.randint(0, batch_size, size=(1,)).item()) if batch_size > 1 else 0
                     self.airkerma_plotter.add_airkerma_to_figure(
                         fig=fig_volume,
                         field=pred_field,

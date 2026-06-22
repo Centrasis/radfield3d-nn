@@ -30,6 +30,7 @@ from radfield3dnn.metrics.airkerma_accuracy import (
 )
 from radfield3dnn.metrics.ssim import AirkermaSSIM
 from radfield3dnn.metrics import HistogramOverlapAccuracy
+from radfield3dnn.metrics.factory import build_airkerma_metrics
 from radfield3dnn.preprocessing.airkerma import AirkermaProcessing
 
 from callbacks.validate_gt import ValidateGroundTruth
@@ -60,6 +61,11 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=torch.randint(0, 2**31 - 1, (1,)).item(),
                         help="Random seed. Defaults to a fresh random seed each run (persisted to the run config).")
     args = parser.parse_args()
+
+    # Apply the global seed to every RNG (python / numpy / torch, and DataLoader workers) so the run
+    # is reproducible and everything downstream — including the max_fields shuffle in the datamodule —
+    # follows this single seed. (Previously --seed was parsed but never applied.)
+    pl.seed_everything(args.seed, workers=True)
 
     cfg = load_config(args.config)
     train_cfg = cfg.get("training", {})
@@ -147,9 +153,8 @@ if __name__ == "__main__":
         dataset_path = cache_path
         print("[green]Dataset cached.")
 
-    # ── Normalizer (from model JSON) ──────────────────────────────────────────
+    # ── Normalizer (from model JSON — the source of truth; ModelConstructor injects it) ──
     norm_name = raw_model_cfg.get("parameters", {}).get("normalizer", "linear0_1")
-    normalizer = NormalizerConstructor.construct_by_name(norm_name)
 
     # ── Data processings ──────────────────────────────────────────────────────
     # MC floor noise removal runs AFTER OriginalGroundTruthPreservation snapshots the GT, so
@@ -288,7 +293,6 @@ if __name__ == "__main__":
     model_cls = ModelConstructor.create_model_from_config(tmp_path)
     os.unlink(tmp_path)
     model = model_cls().cuda()
-    model._normalizer = normalizer
     # Reproducibility: `training: lr_finder: false` skips the per-seed LR sweep
     # and trains at the model's configured LR (a fixed LR removes a variance source).
     if not train_cfg.get("lr_finder", True):
@@ -382,33 +386,7 @@ if __name__ == "__main__":
     vx = VOXEL_SIZE_M if VOXEL_SIZE_M > 0.0 else 0.01
     metrics_plotter = MetricsPlotter(
         spectra_bins=32,
-        metrics={
-            'global_airkerma_accuracy': AirkermaAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5),
-            'top90_airkerma_accuracy': AirkermaAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, importance_threshold=0.1),
-            'airkerma_ssim': AirkermaSSIM(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, reduction='mean'),
-            #'airkerma_onsphere_accuracy_radius25cm': AirkermaSphereAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, sphere_radius_m=0.25, voxel_size_m=vx),
-            'airkerma_accuracy_scatter': AirkermaScatterAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, use_roi=True, scatter_lo=5e-5),
-            # Direct-beam SMAPE accuracy over the beam ROI (>= 5e-2*direct_max) — the complement of
-            # the scatter metric. STUDY TARGETS: scatter >= 0.8, beam >= 0.8, one gamma >= 0.9.
-            'airkerma_accuracy_beam': AirkermaBeamAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5),
-            'noiseaware_airkerma_accuracy_scatter': AirkermaScatterAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, use_error=True, error_threshold=0.5),
-            'legacy_airkerma_accuracy_scatter': AirkermaScatterAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, use_error=False),
-            'airkerma_accuracy_roi': AirkermaAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, importance_threshold=0.01),
-            # Secondary: supervoxel-aggregated dose (8^3 sums = 16.7cm blocks; coarse spatially but
-            # noise/22 -> ceiling ~0.92 over the WHOLE field incl. the diffuse bulk).
-            'airkerma_accuracy_scatter_sv8': AirkermaSupervoxelScatterAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, supervoxel=8),
-            'spectrum_accuracy': HistogramOverlapAccuracy(),
-            #'top95_energy_weighted_airkerma_accuracy': AirkermaAccuracyEnergyWeighted(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, importance_threshold=0.05),
-            # Gammas use the clinical 10% low-dose cutoff (AirkermaAccuracy dose_threshold=0.1
-            # default); a very low cutoff would let a ZERO prediction pass by scoring almost only
-            # near-zero voxels. The _cut1pct variant scores down into the bright scatter ring
-            # (>=1% of max), which the clinical cutoff excludes.
-            'global_airkerma_gamma_3pct_4cm_cut1pct': AirkermaAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, metric_type='gpr', voxel_size_m=vx, rel_dose_diff=0.03, dist_crit_mm=40.0, dose_threshold=0.01),
-            'global_airkerma_gamma_3pct_2cm': AirkermaAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, metric_type='gpr', voxel_size_m=vx, rel_dose_diff=0.03, dist_crit_mm=20.0),
-            'global_airkerma_gamma_3pct_4cm': AirkermaAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, metric_type='gpr', voxel_size_m=vx, rel_dose_diff=0.03, dist_crit_mm=40.0),
-            'global_airkerma_gamma_3pct_6cm': AirkermaAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, metric_type='gpr', voxel_size_m=vx, rel_dose_diff=0.03, dist_crit_mm=60.0),
-            'global_airkerma_gamma_10pct_4cm': AirkermaAccuracy(mu_tr_file=mu_tr_file, spectra_bins=32, max_energy_eV=1.5e+5, metric_type='gpr', voxel_size_m=vx, rel_dose_diff=0.1, dist_crit_mm=40.0),
-        },
+        metrics=build_airkerma_metrics(mu_tr_file, vx),
         voxel_resolution=voxel_res_for_plot,
     )
 
@@ -488,7 +466,7 @@ if __name__ == "__main__":
         check_val_every_n_epoch=int(train_cfg.get("check_val_every_n_epoch", 1)),
         num_sanity_val_steps=0,
         precision="16-mixed" if mixed_precision else "32-true",
-        profiler=os.environ.get("RF_PROFILER", "simple"),  # ON by default; set RF_PROFILER=advanced for op-level, or "" to disable
+        profiler=os.environ.get("RF_PROFILER", "simple") or None,  # ON by default; set RF_PROFILER=advanced for op-level, or "" to disable
         logger=logger.get_lightning_callback(),
         enable_checkpointing=(args.task == "train"),
         gradient_clip_val=1.0,

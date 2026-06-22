@@ -29,31 +29,25 @@ def tensor_bytes(obj) -> int:
 
 
 class RamCachedDataset(Dataset):
-    """Elastic, memory-pressure-aware RAM cache decorator for field datasets.
+    """Fill-then-freeze RAM cache decorator for field datasets.
 
-    Self-tunes the cached set during training instead of freezing at a fixed size:
-
-    The pressure signal is primarily **swap growth**, because ``virtual_memory().available`` counts
-    reclaimable buff/cache and *lags* — it can read "fine" while the kernel is already swapping. So if
-    the training process's footprint rises later, the cache gives RAM back; if memory frees up, the
-    cache fills again toward the largest safe size. ``max_bytes`` is an optional soft per-process cap.
-    Checks are amortized every ``check_every`` items so psutil cost is negligible.
+    Caches as many raw decoded fields as safely fit, then FREEZES and serves the cached ones while
+    streaming the overflow from disk. Filling is monotonic — never evict-and-refetch — so it never
+    oscillates or evicts the OS page cache (which keeps the streamed .rf3 reads fast); on a dataset
+    larger than RAM it simply caches the part that fits. Stops growing at ``max_bytes`` (hard
+    per-process cap) or once live free RAM would drop below ``min_free_bytes``, whichever comes first.
     """
 
     def __init__(self, decoratee: Dataset, max_bytes: int = 0, min_free_bytes: int = 0,
-                 headroom_bytes: int = 4_000_000_000, swap_grow_bytes: int = 2_000_000_000,
-                 check_every: int = 8, evict_per_check: int = 8):
+                 check_every: int = 8):
         self.decoratee = decoratee
         self.max_bytes = int(max_bytes) if max_bytes else 0
         self.min_free_bytes = int(min_free_bytes) if min_free_bytes else 0
-        self.headroom_bytes = int(headroom_bytes)
-        self.swap_grow_bytes = int(swap_grow_bytes)
         self.check_every = max(1, int(check_every))
-        self.evict_per_check = max(1, int(evict_per_check))
-        self._cache: "OrderedDict" = OrderedDict()
+        self._cache: dict = {}
         self._bytes = 0
         self._since_check = 0
-        self._base_swap = self._swap_used()
+        self._frozen = False
 
     def __len__(self):
         return len(self.decoratee)
@@ -63,44 +57,61 @@ class RamCachedDataset(Dataset):
             raise AttributeError(name)
         return getattr(self.decoratee, name)
 
-    @staticmethod
-    def _swap_used() -> int:
+    def _ram_pressure(self) -> bool:
+        if not self.min_free_bytes:
+            return False
         try:
             import psutil
-            return int(psutil.swap_memory().used)
+            return psutil.virtual_memory().available < self.min_free_bytes
         except Exception:
-            return 0
+            return False
 
-    def _evict(self, n: int):
-        for _ in range(n):
-            if not self._cache:
+    def preload(self, verbose: bool = True):
+        """Fill the cache in the CURRENT (parent) process up to the budget, then freeze. The
+        DataLoader workers are forked AFTER this, so they all inherit this one set copy-on-write —
+        a single shared pool (each field decoded/stored once, every worker serves from it) instead
+        of each worker building its own. Monotonic; stops at the byte cap / RAM floor."""
+        n = len(self.decoratee)
+        from rich import print as rprint
+        for i, idx in enumerate(range(n)):
+            if self.max_bytes and self._bytes >= self.max_bytes:
                 break
-            _, old = self._cache.popitem(last=False)   # oldest
-            self._bytes -= tensor_bytes(old)
+            if (i % self.check_every == 0) and self._ram_pressure():
+                break
+            item = self.decoratee[idx]
+            self._cache[idx] = item
+            self._bytes += tensor_bytes(item)
+            if verbose and i and i % 256 == 0:
+                rprint(f"[blue]  RAM cache preloading… {i}/{n} fields, {self._bytes/1e9:.1f} GB[/blue]")
+        self._frozen = True   # workers inherit this -> they never add private copies, only stream overflow
+        if verbose:
+            from rich import print as rprint
+            rprint(f"[green]RAM cache: preloaded {len(self._cache)}/{n} fields "
+                   f"({self._bytes/1e9:.1f} GB) in the parent; workers share it copy-on-write, "
+                   f"the rest streams from disk.[/green]")
+        return self
 
     def __getitem__(self, idx):
         hit = self._cache.get(idx)
         if hit is not None:
-            self._cache.move_to_end(idx)               # mark recently used
             return hit
 
         item = self.decoratee[idx]
+        if self._frozen:
+            return item
+
+        if self.max_bytes and self._bytes >= self.max_bytes:
+            self._frozen = True            # hit the byte cap -> stop growing
+            return item
         self._since_check += 1
         if self._since_check >= self.check_every:
             self._since_check = 0
-            try:
-                import psutil
-                vm = psutil.virtual_memory()
-                swap_grew = (self._swap_used() - self._base_swap) > self.swap_grow_bytes
-                budget_ok = (not self.max_bytes) or (self._bytes <= self.max_bytes)
-                if (self.min_free_bytes and vm.available < self.min_free_bytes) or swap_grew:
-                    self._evict(self.evict_per_check)                       # pressure -> shrink
-                elif budget_ok and (not self.min_free_bytes
-                                    or vm.available > self.min_free_bytes + self.headroom_bytes):
-                    self._cache[idx] = item                                     # comfortable -> grow
-                    self._bytes += tensor_bytes(item)
-            except Exception:
-                pass
+            if self._ram_pressure():
+                self._frozen = True        # hit the RAM floor -> stop growing, stream the rest
+                return item
+
+        self._cache[idx] = item
+        self._bytes += tensor_bytes(item)
         return item
 
     @property

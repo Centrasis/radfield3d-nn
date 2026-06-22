@@ -69,7 +69,7 @@ def _find_onnxruntime(want_version: str | None) -> str | None:
     (mismatched ABIs raise `version VERS_x not found` at import)."""
     candidates = []
     for base in (os.path.join(_REPO, "build_deploy"), os.path.join(_REPO, "build_novk"),
-                 os.path.join(_REPO, "build_cmake"), os.path.join(_REPO, "build"), "/tmp"):
+                 os.path.join(_REPO, "build_cmake"), os.path.join(_REPO, "build")):
         candidates += glob.glob(os.path.join(base, "**", "libonnxruntime.so*"), recursive=True)
     if not candidates:
         return None
@@ -105,31 +105,29 @@ def _ensure_loaded():
     return mod
 
 
-# Eager-load so the names below are real classes (and IDEs resolve them via lib/rfnn_deploy.pyi).
-rfnn_deploy = _ensure_loaded()
+# Names served lazily from the native module on first access (PEP 562 module __getattr__), so merely
+# importing this module never requires the compiled .so. The TYPE_CHECKING block above gives linters
+# the full typed surface; these are resolved at runtime by __getattr__.
+_LAZY_EXPORTS = frozenset({
+    "rfnn_deploy", "BeamParameters", "ExecutionOptions", "EncodedBeam", "PredictorType",
+    "VolumeFieldPredictor", "VoxelFieldPredictor", "ModelStore", "ModelDomain", "ModelProvenance",
+    "BeamParameterSpec", "ParameterRange",
+})
 
-# re-export the binding surface (mirrors the C++ structure: rfnn::io::V1::ModelStore + the
-# radfield3dnn:: predictor hierarchy; package metadata lives ON the loaded predictor). The names
-# are typed by the TYPE_CHECKING block above; these runtime assignments are invisible to linters.
-if not TYPE_CHECKING:
-    BeamParameters = rfnn_deploy.BeamParameters
-    ExecutionOptions = rfnn_deploy.ExecutionOptions
-    EncodedBeam = rfnn_deploy.EncodedBeam
-    PredictorType = rfnn_deploy.PredictorType
-    VolumeFieldPredictor = rfnn_deploy.VolumeFieldPredictor
-    VoxelFieldPredictor = rfnn_deploy.VoxelFieldPredictor
-    ModelStore = rfnn_deploy.ModelStore
-    ModelDomain = rfnn_deploy.ModelDomain
-    ModelProvenance = rfnn_deploy.ModelProvenance
-    BeamParameterSpec = rfnn_deploy.BeamParameterSpec
-    ParameterRange = rfnn_deploy.ParameterRange
+
+def __getattr__(name: str):
+    # Lazy load: build/import the native rfnn_deploy module only when one of its names is first used.
+    if name in _LAZY_EXPORTS:
+        mod = _ensure_loaded()
+        return mod if name == "rfnn_deploy" else getattr(mod, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def load_rf3m(path: str, use_cuda: bool = False) -> "VoxelFieldPredictor | VolumeFieldPredictor":
     """Load an RF3M package STRAIGHT to the runnable predictor (:class:`VoxelFieldPredictor` for
     per-voxel models, :class:`VolumeFieldPredictor` for field-wise ones). The package metadata is
     attached to the predictor: ``.domain``, ``.provenance``, ``.metrics``, ``.graph_names``."""
-    return rfnn_deploy.ModelStore.load(path, use_cuda=use_cuda)
+    return _ensure_loaded().ModelStore.load(path, use_cuda=use_cuda)
 
 
 __all__ = [

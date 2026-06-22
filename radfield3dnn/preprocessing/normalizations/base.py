@@ -27,6 +27,7 @@ class Normalizer(DataProcessing):
             return RadiationField(
                 scatter_field=self.forward(x.scatter_field, respect_to=respect_to.scatter_field if respect_to is not None else None) if x.scatter_field is not None else None,
                 direct_beam=self.forward(x.direct_beam, respect_to=respect_to.direct_beam if respect_to is not None else None) if x.direct_beam is not None else None,
+                geometry=getattr(x, "geometry", None),
             )
         elif isinstance(x, RadiationFieldChannel):
             return RadiationFieldChannel(
@@ -50,18 +51,19 @@ class Normalizer(DataProcessing):
     def inverse(self, x: Union[TrainingInputData, RadiationField, RadiationFieldChannel, AirKermaField, Tensor], respect_to: Union[TrainingInputData, RadiationField, RadiationFieldChannel, AirKermaField, Tensor, None] = None) -> Union[TrainingInputData, RadiationField, RadiationFieldChannel, AirKermaField, Tensor]:
         assert respect_to is None or (x.__class__ == respect_to.__class__), "respect_to must be of the same type as x or None."
         
-        if isinstance(x, TrainingInputData):
+        if isinstance(x, (TrainingInputData, rf3TrainingInputData)):
             return TrainingInputData(
                 input=x.input,
                 ground_truth=self.inverse(x.ground_truth, respect_to.ground_truth if respect_to is not None else None),
-                original_ground_truth=x.original_ground_truth if x.original_ground_truth is not None else None
+                original_ground_truth=x.original_ground_truth if hasattr(x, "original_ground_truth") else None
             )
-        elif isinstance(x, RadiationField):
+        elif isinstance(x, (RadiationField, rf3RadiationField)):
             return RadiationField(
                 scatter_field=self.inverse(x.scatter_field, respect_to=respect_to.scatter_field if respect_to is not None else None) if x.scatter_field is not None else None,
                 direct_beam=self.inverse(x.direct_beam, respect_to=respect_to.direct_beam if respect_to is not None else None) if x.direct_beam is not None else None,
+                geometry=getattr(x, "geometry", None),  # pass per-field scaling metadata through untouched
             )
-        elif isinstance(x, RadiationFieldChannel):   
+        elif isinstance(x, RadiationFieldChannel):
             return RadiationFieldChannel(
                 flux=self.inverse(x.flux, respect_to=respect_to.flux if respect_to is not None else None),
                 spectrum=x.spectrum,

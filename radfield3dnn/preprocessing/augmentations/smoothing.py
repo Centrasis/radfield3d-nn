@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 import random
-from radfield3dnn.rftypes import TrainingInputData, RadiationFieldChannel, RadiationField
+from radfield3dnn.rftypes import TrainingInputData, RadiationFieldChannel, RadiationField, rf3RadiationField
 from RadFiled3D.pytorch.datasets.processing import DataProcessing
 
 
@@ -61,61 +61,29 @@ class GaussianSmoothing(DataProcessing):
 
 
 class GaussianFluenceSmoothing(GaussianSmoothing):
-    def forward(self, x: TrainingInputData) -> TrainingInputData:
-        """
-        Apply gaussian smoothing to input tensor of shape (N, C, H, W, D) in a random way for each sample.
-        """
-        if self.training and torch.rand(1).item() < self.p:
-            scatter_field = x.ground_truth.scatter_field.flux
-            direct_beam = x.ground_truth.direct_beam.flux
+    def _smooth_channel(self, ch: RadiationFieldChannel) -> RadiationFieldChannel:
+        if ch is None or ch.flux is None:
+            return ch
+        return RadiationFieldChannel(spectrum=ch.spectrum, flux=self.apply_gaussian_smoothing(ch.flux), error=ch.error)
 
-            scatter_field = self.apply_gaussian_smoothing(scatter_field)
-            direct_beam = self.apply_gaussian_smoothing(direct_beam)
-            
-            x = TrainingInputData(
-                input=x.input,
-                ground_truth=RadiationField(
-                    scatter_field=RadiationFieldChannel(
-                        spectrum=x.ground_truth.scatter_field.spectrum,
-                        flux=scatter_field,
-                        error=x.ground_truth.scatter_field.error
-                    ),
-                    direct_beam=RadiationFieldChannel(
-                        spectrum=x.ground_truth.direct_beam.spectrum,
-                        flux=direct_beam,
-                        error=x.ground_truth.direct_beam.error
-                    )
-                ),
-                original_ground_truth=x.original_ground_truth # keep original_ground_truth unchanged
+    def _smooth_ground_truth(self, gt):
+        # Type-dispatched: two-channel RadiationField OR a single RadiationFieldChannel (post-ChannelsJoin).
+        if isinstance(gt, (RadiationField, rf3RadiationField)):
+            return RadiationField(
+                scatter_field=self._smooth_channel(gt.scatter_field),
+                direct_beam=self._smooth_channel(gt.direct_beam),
+                geometry=getattr(gt, "geometry", None),
             )
-        return x
+        if isinstance(gt, RadiationFieldChannel):
+            return self._smooth_channel(gt)
+        return gt
 
-
-class GaussianSpectraSmoothing(GaussianSmoothing):
     def forward(self, x: TrainingInputData) -> TrainingInputData:
-        """
-        Apply gaussian smoothing to input tensor of shape (N, C, H, W, D) in a random way for each sample.
-        """
-        if self.training:
-            scatter_field = x.ground_truth.scatter_field.spectrum
-            direct_beam = x.ground_truth.direct_beam.spectrum
-
-            scatter_field = self.apply_gaussian_smoothing(scatter_field)
-            direct_beam = self.apply_gaussian_smoothing(direct_beam)
-            
+        """Apply gaussian smoothing to the flux channel(s) in a random way for each sample."""
+        if self.training and torch.rand(1).item() < self.p:
             x = TrainingInputData(
                 input=x.input,
-                ground_truth=RadiationField(
-                    scatter_field=RadiationFieldChannel(
-                        spectrum=scatter_field,
-                        flux=x.ground_truth.scatter_field.flux,
-                        error=x.ground_truth.scatter_field.error
-                    ),
-                    direct_beam=RadiationFieldChannel(
-                        spectrum=direct_beam,
-                        flux=x.ground_truth.direct_beam.flux,
-                        error=x.ground_truth.direct_beam.error
-                    )
-                )
+                ground_truth=self._smooth_ground_truth(x.ground_truth),
+                original_ground_truth=x.original_ground_truth,  # keep original_ground_truth unchanged
             )
         return x

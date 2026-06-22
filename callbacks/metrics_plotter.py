@@ -42,7 +42,7 @@ class MetricsPlotter(Callback):
 
     def _accumulate(self, pl_module, batch):
         gt, pred_field = InferenceHelper.generate_gt_and_pred_for_validation(
-            batch, pl_module, voxel_resolution=self.voxel_resolution, spectra_bins=32
+            batch, pl_module, voxel_resolution=self.voxel_resolution, spectra_bins=self.spectra_bins
         )
         with torch.no_grad():
             for name, metric in self.metrics.items():
@@ -118,7 +118,7 @@ class ErrorFieldPlotter(Callback):
                 batch,
                 pl_module,
                 voxel_resolution=self.voxel_resolution,
-                spectra_bins=32
+                spectra_bins=self.spectra_bins
             )
 
             aikerma_gt = self.airkerma.airkerma.forward(gt.spectrum, gt.flux)

@@ -272,25 +272,12 @@ class FeedforwardPointwiseModel(BaseNeuralRadFieldModel):
                 ) if full_field.direct_beam is not None else None,
                 geometry=full_field.geometry.view(*target_flux_shape) if full_field.geometry is not None else None
             )
-            if mask is not None and mask.any():
-                if full_field.scatter_field is not None and full_field.scatter_field.flux is not None:
-                    full_field.scatter_field.flux[mask] = -torch.inf
-                    spec_mask = mask.expand_as(full_field.scatter_field.spectrum) if full_field.scatter_field.spectrum is not None else None
-                    if spec_mask is not None:
-                        full_field.scatter_field.spectrum[spec_mask] = -torch.inf
-                if full_field.direct_beam is not None and full_field.direct_beam.flux is not None:
-                    full_field.direct_beam.flux[mask] = -torch.inf
-                    spec_mask = mask.expand_as(full_field.direct_beam.spectrum) if full_field.direct_beam.spectrum is not None else None
-                    if spec_mask is not None:
-                        full_field.direct_beam.spectrum[spec_mask] = -torch.inf
+            # masked voxels were never forwarded (keep = ~mask), so they already hold the -inf pre-fill.
         elif isinstance(full_field, AirKermaField):
             full_field: AirKermaField = AirKermaField(
                 air_kerma=full_field.air_kerma.view(*target_flux_shape) if full_field.air_kerma is not None else None,
                 geometry=full_field.geometry.view(*target_flux_shape) if full_field.geometry is not None else None
             )
-            if mask is not None and mask.any():
-                if full_field.air_kerma is not None:
-                    full_field.air_kerma[mask] = -torch.inf
         else:
             raise ValueError("Unknown field type returned by the model.")
         

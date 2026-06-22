@@ -203,6 +203,10 @@ class ModelPackager:
                 return self._maybe_fp16(graphs)
             except Exception as e:
                 print(f"[yellow]ModelPackager: two-graph export failed ({e}); using single trunk[/yellow]")
+        # Field-wise/volume models ship their own self-contained beam->volume exporter; the per-voxel
+        # ModelExporter.onnx_export wrapper does not apply to them.
+        if hasattr(self.model, "export_onnx"):
+            return self._maybe_fp16({"trunk": self._export_bytes(lambda m, p: m.export_onnx(p))})
         return self._maybe_fp16({"trunk": self._export_bytes(ModelExporter.onnx_export)})
 
     def _maybe_fp16(self, graphs: dict) -> dict:

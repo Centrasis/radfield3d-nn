@@ -6,6 +6,18 @@ from torch.nn import functional as F
 from radfield3dnn.metrics.base import weight_field_by_statistical_error
 
 
+def reduce_per_sample(per_voxel: Tensor, valid_mask: Tensor | None = None) -> Tensor:
+    """Reduce a per-voxel loss to one value per sample (dim 0), masked-mean over all other dims.
+    A 1-D row-mode tensor is already per-sample. Shared so every loss reduces identically."""
+    if per_voxel.ndim <= 1:
+        return per_voxel
+    reduce_dims = tuple(range(1, per_voxel.ndim))
+    if valid_mask is not None and valid_mask.shape == per_voxel.shape:
+        vf = valid_mask.to(per_voxel.dtype)
+        return (per_voxel * vf).sum(dim=reduce_dims) / vf.sum(dim=reduce_dims).clamp(min=1.0)
+    return per_voxel.mean(dim=reduce_dims)
+
+
 class StdLossWeighted(Loss):
     def __init__(self, loss_fn: nn.Module, weight_with_error: bool = False, scale: float = 1.0):
         super().__init__()
@@ -41,14 +53,7 @@ class StdLossWeighted(Loss):
         if self.scale != 1.0:
             losses = losses * self.scale
 
-        if len(losses.shape) <= 1:
-            return losses
-        reduce_dims = [x for x in range(1, len(losses.shape))]
-        if not all_valid and valid_mask.shape == losses.shape:
-            valid_f = valid_mask.to(losses.dtype)
-            denom = valid_f.sum(dim=reduce_dims).clamp(min=1.0)
-            return (losses * valid_f).sum(dim=reduce_dims) / denom
-        return torch.mean(losses, dim=reduce_dims)
+        return reduce_per_sample(losses, valid_mask if not all_valid else None)
 
 
 class L1LossWeighted(StdLossWeighted):
@@ -84,13 +89,7 @@ class PlainL1Loss(Loss):
         per_voxel = torch.nan_to_num(per_voxel, nan=0.0, posinf=0.0, neginf=0.0)
         if self.weight_with_error:
             per_voxel = weight_field_by_statistical_error(per_voxel, input=input)
-        if per_voxel.ndim <= 1:
-            return per_voxel
-        reduce_dims = tuple(range(1, per_voxel.ndim))
-        if not all_valid and valid_mask.shape == per_voxel.shape:
-            vf = valid_mask.to(per_voxel.dtype)
-            return (per_voxel * vf).sum(dim=reduce_dims) / vf.sum(dim=reduce_dims).clamp(min=1.0)
-        return per_voxel.mean(dim=reduce_dims)
+        return reduce_per_sample(per_voxel, valid_mask if not all_valid else None)
 
 
 class RawNeRFLoss(Loss):
@@ -122,11 +121,7 @@ class RawNeRFLoss(Loss):
         w = 1.0 / (scale + self.eps)
         per_voxel = ((p - t) * w) ** 2
         per_voxel = torch.nan_to_num(per_voxel, nan=0.0, posinf=0.0, neginf=0.0)
-        if per_voxel.ndim <= 1:
-            return per_voxel
-        reduce_dims = tuple(range(1, per_voxel.ndim))
-        vf = valid.to(per_voxel.dtype)
-        return (per_voxel * vf).sum(dim=reduce_dims) / vf.sum(dim=reduce_dims).clamp(min=1.0)
+        return reduce_per_sample(per_voxel, valid)
 
 
 class WassersteinLossWeighted(StdLossWeighted):

@@ -236,7 +236,17 @@ PYBIND11_MODULE(rfnn_deploy, m) {
                         std::string s = data;
                         return ModelStore::load_from_memory(s.data(), s.size(), use_cuda);
                     },
-                    py::arg("data"), py::arg("use_cuda") = false);
+                    py::arg("data"), py::arg("use_cuda") = false)
+        .def_static("read_graphs",
+                    [](const std::string& path) {
+                        py::dict out;
+                        for (const auto& [name, g] : rfnn::io::V1::ModelStore::read_graphs(path))
+                            out[py::str(name)] = py::bytes(reinterpret_cast<const char*>(g.data()), g.size());
+                        return out;
+                    },
+                    py::arg("path"),
+                    "Read the raw named ONNX graphs (name -> protobuf bytes) from an RF3M package "
+                    "without building a predictor — the read counterpart to save_to_memory.");
 
     // ── SAVE side (the single source of the RF3M byte layout — used by the Python ModelPackager so
     //    the format is never re-implemented) ──────────────────────────────────────────────────────

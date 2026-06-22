@@ -113,6 +113,12 @@ public:
     // (Predictor *type* — voxel vs volume — is NOT here; it needs the trunk graph, i.e. a real load.)
     static PackageMetadata read_metadata_from_memory(const void* bytes, size_t n);
     static PackageMetadata read_metadata(const std::string& path);
+
+    // Read the raw named ONNX graphs (name -> protobuf bytes) WITHOUT building a predictor / touching
+    // ONNX Runtime. This is the read counterpart to save_to_memory, so tools that re-pack a package
+    // (e.g. fp16 conversion) never have to re-implement the RF3M byte layout in Python.
+    static NamedGraphs read_graphs_from_memory(const void* bytes, size_t n);
+    static NamedGraphs read_graphs(const std::string& path);
 };
 
 }  // namespace V1

@@ -164,20 +164,20 @@ class AirkermaSSIM(MetricBase):
         if isinstance(prediction, RadiationFieldChannel) and (prediction.spectrum is None or prediction.flux is None):
             return None
         
+        # sanitise non-finite voxels out-of-place; never mutate the caller's tensors.
         if isinstance(prediction, RadiationFieldChannel):
-            invalid_mask = ~torch.isfinite(prediction.flux)
-            if invalid_mask.any():
-                prediction.flux[invalid_mask] = 0.0
-                invalid_mask = invalid_mask.expand_as(prediction.spectrum)
-                prediction.spectrum[invalid_mask] = 1.0 / prediction.spectrum.size(1)  # set to uniform if invalid
+            flux, spectrum = prediction.flux, prediction.spectrum
+            invalid = ~torch.isfinite(flux)
+            if invalid.any():
+                flux = torch.where(invalid, torch.zeros_like(flux), flux)
+                inv_s = invalid.expand_as(spectrum)
+                spectrum = torch.where(inv_s, torch.full_like(spectrum, 1.0 / spectrum.size(1)), spectrum)
+            prediction_airkerma = self.airkerma.forward(spectrum, flux)
         elif isinstance(prediction, AirKermaField):
-            invalid_mask = ~torch.isfinite(prediction.air_kerma)
-            if invalid_mask.any():
-                prediction.air_kerma[invalid_mask] = 0.0
+            ak = prediction.air_kerma
+            prediction_airkerma = torch.where(~torch.isfinite(ak), torch.zeros_like(ak), ak)
         else:
-            invalid_mask = ~torch.isfinite(prediction)
-            if invalid_mask.any():
-                prediction[invalid_mask] = 0.0
+            prediction_airkerma = torch.where(~torch.isfinite(prediction), torch.zeros_like(prediction), prediction)
 
         if isinstance(target, RadiationFieldChannel):
             target_airkerma = self.airkerma.forward(target.spectrum, target.flux)
@@ -185,15 +185,6 @@ class AirkermaSSIM(MetricBase):
             target_airkerma = target.air_kerma
         else:
             target_airkerma = target
+        target_airkerma = torch.where(~torch.isfinite(target_airkerma), torch.zeros_like(target_airkerma), target_airkerma)
 
-        invalid_mask = ~torch.isfinite(target_airkerma)
-        if invalid_mask.any():
-            target_airkerma[invalid_mask] = 0.0
-
-        if isinstance(prediction, RadiationFieldChannel):
-            prediction_airkerma = self.airkerma.forward(prediction.spectrum, prediction.flux)
-        elif isinstance(prediction, AirKermaField):
-            prediction_airkerma = prediction.air_kerma
-        else:
-            prediction_airkerma = prediction
         return self.ssim.forward(target_airkerma, prediction_airkerma, input)

@@ -16,7 +16,7 @@ except ImportError:
         def __getattr__(self, name):
             raise ImportError(
                 "radfield3dnn.radfield3dnn (the tiny-cuda-nn native module) is not built — the "
-                "cpp-backed models (PBRFNetCPP, SPERFNetCPP, …) are deactivated. Reinstall with "
+                "cpp-backed models (PBRFNetTCNN, SPERFNetCPP, …) are deactivated. Reinstall with "
                 "`RFNN_WITH_TCNN=1 pip install -e .` to enable them.")
     rfnn = _TcnnUnavailable()
 from radfield3dnn.preprocessing.normalizations import NormalizerConstructor
@@ -78,7 +78,7 @@ class _TcnnModule(nn.Module):
         # steps until they cross a fp16 ULP boundary, then bump the fp16
         # weight by one ULP. Without this, a large fraction of Adam's small-magnitude
         # updates round to 0 in fp16 state. Memory cost: one extra fp32
-        # tensor of the same numel — for PBRFNetCPP that's +1.22 MB per
+        # tensor of the same numel — for PBRFNetTCNN that's +1.22 MB per
         # `_TcnnModule`, negligible vs the fused fwd_ctx / batch buffers.
         master = cpp.weights.detach().clone().to(torch.float32)
         # `register_buffer` with `persistent=True` puts it in state_dict so
@@ -88,11 +88,11 @@ class _TcnnModule(nn.Module):
         # `requires_grad=True` on a buffer is legal and required so torch.optim
         # accepts it as a trainable param — the buffer is NOT in `.parameters()`
         # (only the fp16 weights are), so the optimizer must be built by
-        # explicitly listing the masters (see `PBRFNetCPP.configure_optimizers`).
+        # explicitly listing the masters (see `PBRFNetTCNN.configure_optimizers`).
         self.fp32_master.requires_grad_(True)
         # Sync fp32 master → fp16 cpp.weights at the start of every forward,
         # done INLINE in `_TcnnModule.forward` below — not via a forward
-        # pre-hook. `PBRFNetCPP.forward` calls `self.model.forward(...)` and
+        # pre-hook. `PBRFNetTCNN.forward` calls `self.model.forward(...)` and
         # `self.encoder.forward(...)` directly (bypassing `__call__`), which
         # would skip pre-hooks entirely. The inline sync runs regardless of
         # how forward is invoked.
@@ -141,8 +141,8 @@ class _TcnnModule(nn.Module):
         return self._name
 
 
-class PBRFNetCPP(RFNetBase):
-    __model_name__ = "PBRFNetCPP"
+class PBRFNetTCNN(RFNetBase):
+    __model_name__ = "PBRFNetTCNN"
 
     @property
     def use_lr_finder(self) -> bool:
@@ -414,47 +414,8 @@ class PBRFNetCPP(RFNetBase):
                         )
         optimizer.register_step_post_hook(_sync_masters_to_fp16)
 
-        def get_accumulate_grad_batches(trainer) -> int:
-            try:
-                for cb in getattr(trainer, "callbacks", []):
-                    if cb.__class__.__name__ == "GradientAccumulationScheduler":
-                        sched = getattr(cb, "scheduling", None)
-                        if isinstance(sched, dict) and sched:
-                            keys = sorted(int(k) for k in sched.keys())
-                            return int(sched.get(0, sched[keys[0]]))
-            except Exception:
-                pass
-            return 1
-
-        total_opt_steps = int(self.trainer.estimated_stepping_batches)
-        acc_batches = max(1, get_accumulate_grad_batches(self.trainer))
-        if not torch.isfinite(torch.tensor(total_opt_steps)) or total_opt_steps <= 0:
-            total_opt_steps = 1000  # avoid zero division
-        total_opt_steps = int(max(1, total_opt_steps / acc_batches))
-
-        # Step-wise warmup (~1 epoch) followed by cosine decay — the same
-        # schedule the pure-Python RFNetBase uses, holding lr near the peak so
-        # flux learning climbs smoothly.
-        max_epochs = int(max(self.trainer.max_epochs, 1))
-        steps_per_epoch = int(math.ceil(total_opt_steps / max_epochs))
-        warmup_steps = int(min(max(steps_per_epoch, 1), max(1, total_opt_steps - 1)))
-        cosine_steps = int(max(1, total_opt_steps - warmup_steps))
-        warmup = torch.optim.lr_scheduler.LinearLR(
-            optimizer, start_factor=1e-5 / effective_lr, total_iters=warmup_steps
-        )
-        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=cosine_steps, eta_min=5e-6
-        )
-        schedule = torch.optim.lr_scheduler.SequentialLR(
-            optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps]
-        )
-
-        return [optimizer], [{
-            "scheduler": schedule,
-            "interval": "step",
-            "monitor": "train_loss",
-            "name": "warmup+cosine",
-        }]
+        from radfield3dnn.optim.cosine_warmup import build_warmup_cosine_schedule
+        return build_warmup_cosine_schedule(optimizer, self.trainer, effective_lr)
 
     def encode_additional_parameters(self, batch: PositionalInput) -> Tensor:
         B = batch.direction.size(0)
@@ -543,8 +504,8 @@ class PBRFNetCPP(RFNetBase):
         }
 
 
-class SPERFNetCPP(PBRFNetCPP):
-    """Distance-less variant of PBRFNetCPP, mirroring the pure-Python SPERFNet
+class SPERFNetCPP(PBRFNetTCNN):
+    """Distance-less variant of PBRFNetTCNN, mirroring the pure-Python SPERFNet
     (radfield3dnn/models/nerf.py): the beam encoder takes only direction and
     spectrum, no beam distance. For fixed-distance datasets where the beam
     distance is constant and would only add an uninformative input dimension.
@@ -597,12 +558,12 @@ class SPERFNetCPP(PBRFNetCPP):
             spectrum_dim=in_spectra_dim,
             d_model=d_model,
         ))
-        # See PBRFNetCPP.__init__: prevent AccumulateGrad from silently
+        # See PBRFNetTCNN.__init__: prevent AccumulateGrad from silently
         # overwriting the pre-allocated .grad on chunked-forward backwards.
         self.encoder.weights.grad = None
 
     def encode_additional_parameters(self, batch: PositionalInput) -> Tensor:
-        # Same batch-granularity padding as PBRFNetCPP, but the encoder takes
+        # Same batch-granularity padding as PBRFNetTCNN, but the encoder takes
         # only direction + spectrum — batch.origin (distance) is intentionally
         # ignored for fixed-distance datasets.
         B = batch.direction.size(0)

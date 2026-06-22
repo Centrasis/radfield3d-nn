@@ -107,6 +107,7 @@ class FieldScatterUNet(BaseNeuralRadFieldModel):
         learning_rate: float = 1e-3,
         max_lr: float = 1e-3,
         use_analytic_direct: bool = True,
+        voxel_size_m: float = None,
     ):
         if normalizer is None:
             normalizer = NormalizerConstructor.construct_by_name("linear0_1")
@@ -123,7 +124,9 @@ class FieldScatterUNet(BaseNeuralRadFieldModel):
         self._flux_clamp_min = float(flux_clamp_min)
         self._flux_clamp_max = float(flux_clamp_max)
         self.use_analytic_direct = bool(use_analytic_direct)
-        self.adb = AnalyticDirectBeam(voxel_size_m=0.02)
+        # box is 1.0 m, so an isotropic voxel is 1.0 / resolution unless given explicitly.
+        self.voxel_size_m = float(voxel_size_m) if voxel_size_m is not None else 1.0 / float(self.out_dims[0])
+        self.adb = AnalyticDirectBeam(voxel_size_m=self.voxel_size_m)
         self.flux_loss_name = flux_loss
         self.spectrum_loss_name = spectrum_loss
         self._flux_loss_fn = ModuleBuilder.ConstructLoss_fn(flux_loss)
@@ -163,8 +166,8 @@ class FieldScatterUNet(BaseNeuralRadFieldModel):
         """Pull the raw beam geometry from the batch and call the shared,
         ONNX-exportable AnalyticDirectBeam module."""
         inp = batch.input
-        return self.adb(inp.direction, inp.origin, inp.spectrum,
-                        inp.beam_shape_parameters, inp.geometry)
+        return self.adb(inp.direction, inp.origin, inp.spectrum, inp.beam_shape_parameters,
+                        density=inp.geometry, dims=self.out_dims, voxel_size=self.voxel_size_m)
 
 
     def _core(self, x: Tensor, cond: Tensor) -> Tensor:
@@ -185,6 +188,9 @@ class FieldScatterUNet(BaseNeuralRadFieldModel):
     def forward(self, batch: TrainingInputData) -> RadiationField:
         gt = batch.ground_truth
         direct = gt.direct_beam.flux if (isinstance(gt, RadiationField) and gt.direct_beam is not None) else gt.scatter_field.flux
+        return self._forward_from_direct(direct, batch.input.spectrum)
+
+    def _forward_from_direct(self, direct: Tensor, beam_spectrum: Tensor) -> RadiationField:
         dev = direct.device
         spatial = direct.shape[2:]
         pad = [self._next_pow2(d) for d in spatial]
@@ -196,7 +202,7 @@ class FieldScatterUNet(BaseNeuralRadFieldModel):
         vmap = (vmap * 2.0 - 1.0).unsqueeze(0).expand(direct.shape[0], -1, -1, -1, -1).permute(0, 4, 1, 2, 3)
         x = torch.cat([flux_in, vmap], dim=1)
 
-        cond = self.spectra_encoder(batch.input.spectrum)
+        cond = self.spectra_encoder(beam_spectrum)
         out = self._core(x, cond)
         out = out[:, :, pl[0]:pad[0] - pr[0], pl[1]:pad[1] - pr[1], pl[2]:pad[2] - pr[2]]
         flux = self.flux_activation(out[:, self.out_spectra_bins]).unsqueeze(1)
@@ -241,13 +247,12 @@ class FieldScatterUNet(BaseNeuralRadFieldModel):
         gt = batch.ground_truth
         pred = self.forward2volume_from_training_input(batch)   # scatter (normalised)
 
-        # joined prediction: pred-scatter + direct, joined in physical space
+        # joined prediction: pred-scatter + direct, joined via the shared base-class round-trip.
         pred_full = RadiationField(scatter_field=pred.scatter_field, direct_beam=gt.direct_beam)
-        pred_full = self._normalizer.inverse(pred_full)
-        pred_joined = self._normalizer.forward(self._channels_join(pred_full))
+        pred_joined = self._join_to_single_channel(pred_full)
 
-        # joined GT
-        gt_joined = self._normalizer.forward(self._channels_join(self._normalizer.inverse(gt)))
+        # joined GT (same shared helper)
+        gt_joined = self._join_to_single_channel(gt)
 
         pred_field = RadiationField(scatter_field=pred_joined, direct_beam=None)
         return self.calculate_metrics(pred_field, gt_joined, batch)
@@ -280,15 +285,21 @@ class FieldScatterUNet(BaseNeuralRadFieldModel):
         return [opt], [{"scheduler": sched, "interval": "step"}]
 
     def export_onnx(self, path: str):
+        # Self-contained VolumeFieldPredictor graph: beam parameters -> whole flux/spectrum volume in
+        # one run, with NO per-point "position" input (the deploy runtime keys voxel-vs-volume on that).
+        # Input names are the ones the C++ runtime binds (direction/origin/spectrum/beam_shape); the
+        # analytic direct beam + core run inside the graph, so nothing is re-implemented C++-side.
         self.eval()
         dev = next(self.parameters()).device
-        D = self._next_pow2(self.out_dims[0])
-        dummy = (torch.rand(1, 4, D, D, D, device=dev), torch.rand(1, self.cond_dim, device=dev))
-        # Dynamic batch axis so a stored model accepts any number of fields at inference.
+        args = (torch.rand(1, 3, device=dev), torch.rand(1, 3, device=dev),
+                torch.rand(1, self.in_spectra_dim, device=dev), torch.rand(1, 2, device=dev))
         batch = torch.export.Dim("batch")
-        torch.onnx.export(_CoreWrap(self).eval(), dummy,
-                          input_names=["volume", "cond"], output_names=["out"],
-                          dynamic_shapes=({0: batch}, {0: batch}), dynamo=True).save(path)
+        torch.onnx.export(
+            _VolumeExportWrap(self).eval(), args,
+            input_names=["direction", "origin", "spectrum", "beam_shape"],
+            output_names=["flux", "out_spectrum"],   # 'spectrum' is an input name; outputs are keyed by shape
+            dynamic_shapes=({0: batch}, {0: batch}, {0: batch}, {0: batch}),
+            dynamo=True).save(path)
         return path
 
     def get_custom_parameters(self) -> dict:
@@ -303,10 +314,15 @@ class FieldScatterUNet(BaseNeuralRadFieldModel):
         }
 
 
-class _CoreWrap(nn.Module):
+class _VolumeExportWrap(nn.Module):
+    """Beam parameters -> (flux, spectrum) volume: builds the analytic direct beam then runs the core,
+    so the exported graph is a self-contained whole-volume predictor."""
     def __init__(self, m: FieldScatterUNet):
         super().__init__()
         self.m = m
 
-    def forward(self, volume, cond):
-        return self.m._core(volume, cond)
+    def forward(self, direction, origin, spectrum, beam_shape):
+        direct = self.m.adb(direction, origin, spectrum, beam_shape,
+                            density=None, dims=self.m.out_dims, voxel_size=self.m.voxel_size_m)
+        field = self.m._forward_from_direct(direct, spectrum)
+        return field.scatter_field.flux, field.scatter_field.spectrum

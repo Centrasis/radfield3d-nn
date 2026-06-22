@@ -82,6 +82,12 @@ class WeightEMA(Callback):
     def on_test_epoch_end(self, trainer, pl_module):
         self._swap_out(pl_module)
 
+    def on_exception(self, trainer, pl_module, exception):
+        # try/finally semantics across the start/end hook pair: if validation/test raises between
+        # _swap_in and _swap_out, restore the live training weights so the run never silently
+        # continues from the EMA shadow. _swap_out is a no-op when nothing was swapped in.
+        self._swap_out(pl_module)
+
     # ── persist the shadow with the checkpoint ───────────────────────────────
     def state_dict(self):
         return {"decay": self.decay, "shadow": self._shadow}

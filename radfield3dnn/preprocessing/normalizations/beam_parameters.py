@@ -40,7 +40,7 @@ class BeamParametersNormalization(DataProcessing):
                 distance_range = torch.tensor(
                     [
                         0.0,
-                        torch.linalg.norm(torch.tensor(x.ground_truth.flux.shape[-3:], dtype=torch.float32, device=x.input.origin.device) * size_per_voxel, dim=-1, p=2)  # in meters
+                        torch.linalg.norm(torch.tensor(x.ground_truth.flux.shape[-3:], dtype=torch.float32, device=x.input.origin.device) * size_per_voxel, dim=-1, ord=2)  # in meters
                     ],
                     dtype=torch.float32,
                     device=x.input.origin.device
@@ -61,13 +61,13 @@ class BeamParametersNormalization(DataProcessing):
                     direction=x.input.direction,
                     spectrum=x.input.spectrum,
                     origin=origin_distance.unsqueeze(-1),
-                    beam_shape_parameters=x.input.beam_shape_parameters,
+                    beam_shape_parameters=x.input.beam_shape_parameters.clone(),
                     beam_shape_type=x.input.beam_shape_type
                 ) if isinstance(x.input, DirectionalInput) else PositionalInput(
                     position=x.input.position,
                     direction=x.input.direction,
                     origin=origin_distance.unsqueeze(-1),
-                    beam_shape_parameters=x.input.beam_shape_parameters,
+                    beam_shape_parameters=x.input.beam_shape_parameters.clone(),  # clone: the CONE block normalizes this in place; never mutate the shared/cached source
                     beam_shape_type=x.input.beam_shape_type,
                     spectrum=x.input.spectrum
                 ),
@@ -80,10 +80,10 @@ class BeamParametersNormalization(DataProcessing):
                 opening_angle_range = torch.tensor(self.opening_angle_range, dtype=torch.float32, device=x.input.beam_shape_parameters.device)
                 opening_angle_range = opening_angle_range.unsqueeze(0).expand(x.input.beam_shape_parameters.shape[0], -1)  # expand to batch size
                 assert len(x.input.beam_shape_parameters.shape) == 2 and x.input.beam_shape_parameters.shape[1] == 1, f"Expected beam_shape_parameters to have shape (N, 1) for CONE shape, but got {x.input.beam_shape_parameters.shape}"
-                if (opening_angle_range[:, 1] - opening_angle_range[:, 0]) > 1e-8:
-                    x.input.beam_shape_parameters[:, 0] = (torch.deg2rad(x.input.beam_shape_parameters[:, 0]) - opening_angle_range[:, 0]) / (opening_angle_range[:, 1] - opening_angle_range[:, 0])  # normalize to [0, 1]
-                else:
-                    x.input.beam_shape_parameters[:, 0] = 0.0  # if min and max are equal, set to 0.0
+                # batched-safe: per-sample range, zero out degenerate (min==max) samples.
+                denom = opening_angle_range[:, 1] - opening_angle_range[:, 0]   # (B,)
+                normed = (torch.deg2rad(x.input.beam_shape_parameters[:, 0]) - opening_angle_range[:, 0]) / denom.clamp_min(1e-8)
+                x.input.beam_shape_parameters[:, 0] = torch.where(denom > 1e-8, normed, torch.zeros_like(normed))  # normalize to [0, 1]
                 x.input.beam_shape_parameters[:, 0][(x.input.beam_shape_parameters[:, 0] > 1.0) & torch.isclose(x.input.beam_shape_parameters[:, 0], torch.tensor(1.0, device=x.input.beam_shape_parameters.device))] = 1.0  # ensure max value is exactly 1.0 avoiding floating point issues
                 x.input.beam_shape_parameters[:, 0][(x.input.beam_shape_parameters[:, 0] < 0.0) & torch.isclose(x.input.beam_shape_parameters[:, 0], torch.tensor(0.0, device=x.input.beam_shape_parameters.device))] = 0.0  # ensure min value is exactly 0.0 avoiding floating point issues
                 assert (x.input.beam_shape_parameters[:, 0] >= 0).all() and (x.input.beam_shape_parameters[:, 0] <= 1.0).all(), f"Expected beam opening angles to be in [0.0, 1.0], but got min {x.input.beam_shape_parameters[:, 0].min().item()} and max {x.input.beam_shape_parameters[:, 0].max().item()} after normalization."

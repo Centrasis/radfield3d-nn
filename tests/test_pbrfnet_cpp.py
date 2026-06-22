@@ -1,10 +1,10 @@
-"""Training-behavior tests for radfield3dnn.models.nerf_cpp.PBRFNetCPP.
+"""Training-behavior tests for radfield3dnn.models.nerf_cpp.PBRFNetTCNN.
 
 The C++ unit tests in `tests/cxx/` cover BaseRadiationPredictionModel and
 PBRFBeamEncoder in isolation; this file covers the Python wrapper that the
 training pipeline actually instantiates (`run_network_task.py` -> `tasks/train.py`).
 
-Goal: catch regressions where PBRFNetCPP produces all-zero or NaN fluxs
+Goal: catch regressions where PBRFNetTCNN produces all-zero or NaN fluxs
 after the first optimizer step, which is what is observed in the live pipeline.
 The architecture being checked here mirrors the working PBRFNet in nerf.py:
 sinusoidal/freq position encoding -> FiLM-conditioned MLP -> sigmoid flux
@@ -15,8 +15,8 @@ import os
 import math
 
 import pytest
-# PBRFNetCPP needs the tiny-cuda-nn native module; skip this whole module when tcnn is
-# deactivated/not built (its import succeeds via the stub, but constructing PBRFNetCPP would
+# PBRFNetTCNN needs the tiny-cuda-nn native module; skip this whole module when tcnn is
+# deactivated/not built (its import succeeds via the stub, but constructing PBRFNetTCNN would
 # raise ImportError).
 pytest.importorskip("radfield3dnn.radfield3dnn")
 
@@ -24,8 +24,11 @@ import torch
 from torch import optim, nn
 from torch.utils.data import Dataset, DataLoader
 
-from radfield3dnn.models.nerf_cpp import PBRFNetCPP
+from radfield3dnn.models.nerf_cpp import PBRFNetTCNN
 from radfield3dnn.preprocessing.normalizations import LinearNormalizer
+# LogScaleNormalizer was an undefined name (the log-scale normalizer lives in lognormalizer.py as
+# LogNormalizer). Import the existing source under the name the tests use.
+from radfield3dnn.preprocessing.normalizations.lognormalizer import LogNormalizer as LogScaleNormalizer
 from radfield3dnn.rftypes import PositionalInput, TrainingInputData
 from RadFiled3D.pytorch.types import RadiationFieldChannel
 import lightning.pytorch as pl
@@ -36,7 +39,7 @@ IN_SPECTRA_DIM = 32
 
 
 def _make_batch(B: int = BATCH) -> PositionalInput:
-    """A batch matching what the dataloader hands to PBRFNetCPP after normalization.
+    """A batch matching what the dataloader hands to PBRFNetTCNN after normalization.
 
     Voxel positions are in [-1, 1] (voxels_centered_around_origin=True), origin
     is a single normalized distance in [0, 1] (beam_parameters normalization).
@@ -52,8 +55,8 @@ def _make_batch(B: int = BATCH) -> PositionalInput:
     )
 
 
-def _build_model(d_model: int = 64) -> PBRFNetCPP:
-    m = PBRFNetCPP(
+def _build_model(d_model: int = 64) -> PBRFNetTCNN:
+    m = PBRFNetTCNN(
         location_encoding_dims=12,
         in_spectra_dim=IN_SPECTRA_DIM,
         d_model=d_model,
@@ -72,7 +75,7 @@ def _build_model(d_model: int = 64) -> PBRFNetCPP:
 
 # -----------------------------------------------------------------------------
 # 1) Initial-state sanity. PBRFNet produces finite, non-degenerate outputs at
-#    init; PBRFNetCPP must do the same.
+#    init; PBRFNetTCNN must do the same.
 # -----------------------------------------------------------------------------
 
 def test_pbrfnetcpp_forward_finite_at_init():
@@ -186,7 +189,7 @@ def test_pbrfnetcpp_gradients_reach_all_params():
 
 # -----------------------------------------------------------------------------
 # 4) Short training run. PBRFNet trains successfully on a smooth synthetic
-#    target; PBRFNetCPP, which mirrors its architecture in C++/tcnn, should
+#    target; PBRFNetTCNN, which mirrors its architecture in C++/tcnn, should
 #    behave equivalently and at minimum show a meaningful loss drop without
 #    going to NaN.
 # -----------------------------------------------------------------------------
@@ -331,7 +334,7 @@ def test_pbrfnetcpp_chunked_forward_accumulates_gradients():
 #    correct. None of them exercise the Lightning glue, which is exactly where
 #    the live failure lived:
 #
-#      * PBRFNetCPP inherited RFNetBase.configure_optimizers (AdamW eps=1e-8).
+#      * PBRFNetTCNN inherited RFNetBase.configure_optimizers (AdamW eps=1e-8).
 #        tcnn keeps params/grads in fp16, where 1e-8 underflows the Adam
 #        denominator -> the first optimizer.step() NaNs every weight and the
 #        loss goes non-finite after step 1.
@@ -343,7 +346,7 @@ def test_pbrfnetcpp_chunked_forward_accumulates_gradients():
 #    normalizer -> configured losses -> automatic optimization) through an
 #    actual pl.Trainer.fit, with the same Trainer settings run_network_task.py
 #    uses, and asserts the model trains finitely. It is the regression guard
-#    for PBRFNetCPP being a plug-and-play replacement for PBRFNet.
+#    for PBRFNetTCNN being a plug-and-play replacement for PBRFNet.
 # -----------------------------------------------------------------------------
 
 _SPEC_PHASE = torch.linspace(0.0, 2.0 * math.pi, IN_SPECTRA_DIM)
@@ -529,7 +532,7 @@ def test_pbrfnetcpp_survives_real_lr_find_and_checkpoint_roundtrip():
     ckpt = "/tmp/_pbrf_regression.ckpt"
     trainer.save_checkpoint(ckpt)
     try:
-        m2 = PBRFNetCPP.load_from_checkpoint(ckpt).cuda().eval()
+        m2 = PBRFNetTCNN.load_from_checkpoint(ckpt).cuda().eval()
         with torch.no_grad():
             o_dst = m2.forward(batch).scatter_field.flux.clone()
     finally:
@@ -555,7 +558,7 @@ def _train_decade_field(normalizer, steps: int = 500, seed: int = 0):
     """Fit a deterministic flux field spanning 1e-8 .. 1.0 (physical) through
     `normalizer`, FP16 weights, and report physical relative error by band."""
     torch.manual_seed(seed)
-    m = PBRFNetCPP(
+    m = PBRFNetTCNN(
         location_encoding_dims=12,
         in_spectra_dim=IN_SPECTRA_DIM,
         d_model=128,
@@ -716,8 +719,8 @@ def test_sperfnetcpp_gradients_reach_both_modules():
 #     log_scale stack at high lr_find LRs.)
 # -----------------------------------------------------------------------------
 
-def _build_log_scale_model(d_model: int = 128, flux_loss: str = "L1Loss") -> PBRFNetCPP:
-    return PBRFNetCPP(
+def _build_log_scale_model(d_model: int = 128, flux_loss: str = "L1Loss") -> PBRFNetTCNN:
+    return PBRFNetTCNN(
         location_encoding_dims=12,
         in_spectra_dim=IN_SPECTRA_DIM,
         d_model=d_model,
@@ -893,7 +896,7 @@ def test_pbrfnetcpp_log_scale_fluxloss_is_fp16_unsafe():
             num_training=250,
         )
     except Exception:
-        # The forward NaN-guard in PBRFNetCPP.forward raises mid-sweep; treat
+        # The forward NaN-guard in PBRFNetTCNN.forward raises mid-sweep; treat
         # that as the expected unsafe behavior.
         return
 
@@ -916,8 +919,8 @@ def test_pbrfnetcpp_log_scale_fluxloss_is_fp16_unsafe():
 #    hand-written gated backward actually runs numerically.
 # -----------------------------------------------------------------------------
 
-def _build_gated_hashgrid_model(d_model: int = 128) -> PBRFNetCPP:
-    return PBRFNetCPP(
+def _build_gated_hashgrid_model(d_model: int = 128) -> PBRFNetTCNN:
+    return PBRFNetTCNN(
         location_encoding_dims=12,
         in_spectra_dim=IN_SPECTRA_DIM,
         d_model=d_model,

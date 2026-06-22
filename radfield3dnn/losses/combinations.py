@@ -1,4 +1,4 @@
-from .std import WassersteinLossWeighted, L1LossWeighted
+from .std import WassersteinLossWeighted, L1LossWeighted, reduce_per_sample
 from .base import Loss
 from torch import Tensor
 from radfield3dnn.rftypes import TrainingInputData
@@ -162,8 +162,8 @@ class SMAPERegionBalancedLoss(Loss):
             smape = (2.0 * (p - t).abs()) / (p.abs() + t.abs() + self.eps)   # per-voxel metric core, [0,2]
         smape = torch.nan_to_num(smape, nan=0.0, posinf=0.0, neginf=0.0)
 
-        if smape.ndim <= 1:                      # row mode (no spatial structure): plain mean
-            return smape
+        if smape.ndim <= 1:                      # row mode (no spatial structure): no region balancing
+            return reduce_per_sample(smape, valid)
 
         reduce_dims = tuple(range(1, smape.ndim))
         tmax = t.amax(dim=reduce_dims, keepdim=True).clamp(min=1e-12)

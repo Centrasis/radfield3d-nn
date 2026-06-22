@@ -31,6 +31,7 @@ from callbacks.metrics_plotter import MetricsPlotter
 from radfield3dnn.metrics.airkerma_accuracy import AirkermaAccuracy, AirkermaSphereAccuracy, AirkermaScatterAccuracy, AirkermaAccuracyEnergyWeighted
 from radfield3dnn.metrics.ssim import AirkermaSSIM
 from radfield3dnn.metrics import HistogramOverlapAccuracy
+from radfield3dnn.metrics.factory import build_airkerma_metrics
 
 
 class HyperparameterTuningTask(Task):
@@ -164,87 +165,7 @@ class HyperparameterTuningTask(Task):
     def create_metrics_plotter_cb(model: BaseNeuralRadFieldModel, mu_tr_file: str, voxel_resolution: tuple[float, float, float], voxel_size_m: float) -> MetricsPlotter:
         return MetricsPlotter(
             spectra_bins=32,
-            metrics={
-                'global_airkerma_accuracy': AirkermaAccuracy(
-                    mu_tr_file=mu_tr_file,
-                    spectra_bins=32,
-                    max_energy_eV=1.5e+5
-                ),
-                'top90_airkerma_accuracy': AirkermaAccuracy(
-                    mu_tr_file=mu_tr_file,
-                    spectra_bins=32,
-                    max_energy_eV=1.5e+5,
-                    importance_threshold=0.1
-                ),
-                'airkerma_ssim': AirkermaSSIM(
-                    mu_tr_file=mu_tr_file,
-                    spectra_bins=32,
-                    max_energy_eV=1.5e+5,
-                    reduction='mean'
-                ),
-                'airkerma_ssim_gradient': AirkermaSSIM(
-                    mu_tr_file=mu_tr_file,
-                    spectra_bins=32,
-                    max_energy_eV=1.5e+5,
-                    reduction='mean',
-                    ssim_type='gradient'
-                ),
-                'airkerma_onsphere_accuracy_radius25cm': AirkermaSphereAccuracy(
-                    mu_tr_file=mu_tr_file,
-                    spectra_bins=32,
-                    max_energy_eV=1.5e+5,
-                    sphere_radius_m=0.25,
-                    voxel_size_m=voxel_size_m if voxel_size_m > 0.0 else 0.01
-                ),
-                'airkerma_accuracy_scatter': AirkermaScatterAccuracy(
-                    mu_tr_file=mu_tr_file,
-                    spectra_bins=32,
-                    max_energy_eV=1.5e+5
-                ),
-                'spectrum_accuracy': HistogramOverlapAccuracy(),
-                'top95_energy_weighted_airkerma_accuracy': AirkermaAccuracyEnergyWeighted(
-                    mu_tr_file=mu_tr_file,
-                    spectra_bins=32,
-                    max_energy_eV=1.5e+5,
-                    importance_threshold=0.05
-                ),
-                'global_airkerma_gamma_index_3percent_per_4cm': AirkermaAccuracy(
-                    mu_tr_file=mu_tr_file,
-                    spectra_bins=32,
-                    max_energy_eV=1.5e+5,
-                    metric_type='gpr',
-                    voxel_size_m=voxel_size_m if voxel_size_m > 0.0 else 0.01,
-                    rel_dose_diff=0.03,
-                    dist_crit_mm=40.0
-                ),
-                'global_airkerma_gamma_index_10percent_per_4cm': AirkermaAccuracy(
-                    mu_tr_file=mu_tr_file,
-                    spectra_bins=32,
-                    max_energy_eV=1.5e+5,
-                    metric_type='gpr',
-                    voxel_size_m=voxel_size_m if voxel_size_m > 0.0 else 0.01,
-                    rel_dose_diff=0.1,
-                    dist_crit_mm=40.0
-                ),
-                'global_airkerma_gamma_index_10percent_per_6cm': AirkermaAccuracy(
-                    mu_tr_file=mu_tr_file,
-                    spectra_bins=32,
-                    max_energy_eV=1.5e+5,
-                    metric_type='gpr',
-                    voxel_size_m=voxel_size_m if voxel_size_m > 0.0 else 0.01,
-                    rel_dose_diff=0.1,
-                    dist_crit_mm=60.0
-                ),
-                'global_airkerma_gamma_index_3percent_per_6cm': AirkermaAccuracy(
-                    mu_tr_file=mu_tr_file,
-                    spectra_bins=32,
-                    max_energy_eV=1.5e+5,
-                    metric_type='gpr',
-                    voxel_size_m=voxel_size_m if voxel_size_m > 0.0 else 0.01,
-                    rel_dose_diff=0.03,
-                    dist_crit_mm=60.0
-                )
-            },
+            metrics=build_airkerma_metrics(mu_tr_file, voxel_size_m),
             voxel_resolution=voxel_resolution if voxel_resolution is not None else (50, 50, 50)
         )
 

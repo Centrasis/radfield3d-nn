@@ -11,7 +11,7 @@ class CrossAttentionFusion(FusionBase):
 
     ``y = x + Wo · MHA(q=x, kv=tokens(cond))``  →  dim(y) == dim(x).
 
-    Content-adaptive conditioning (the XAttnSiren mechanism, but as a drop-in same-dim fusion). Heaviest
+    Content-adaptive conditioning as a drop-in same-dim fusion. Heaviest
     of the lightweight set: q/k/v/out projections (4·d²) + a cond→tokens projection (d·n_tokens·d). The
     fusion-influence benchmark and the 90-fps budget judge whether its extra authority pays for the cost.
 

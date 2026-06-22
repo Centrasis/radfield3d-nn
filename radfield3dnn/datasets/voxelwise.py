@@ -26,5 +26,8 @@ class AugmentedVoxelwiseDataset(RadField3DVoxelwiseDataset):
         raise NotImplementedError("This dataset does not support direct indexing. Use __getitems__ instead.")
 
     def __getitems__(self, indices: List[int]) -> TrainingInputData:
-        inputs = super().__getitems__(indices)
-        return inputs
+        # wrap indices from the inflated (dataset_multiplier) length back into the real range.
+        real_size = super().__len__()
+        if real_size > 0:
+            indices = [idx % real_size for idx in indices]
+        return super().__getitems__(indices)

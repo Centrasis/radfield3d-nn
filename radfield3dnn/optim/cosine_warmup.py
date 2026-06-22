@@ -12,6 +12,46 @@ import torch.nn as nn
 from .base import OptimizerBehaviour
 
 
+def _accumulate_grad_batches(trainer) -> int:
+    try:
+        for cb in getattr(trainer, "callbacks", []):
+            if cb.__class__.__name__ == "GradientAccumulationScheduler":
+                sched = getattr(cb, "scheduling", None)
+                if isinstance(sched, dict) and sched:
+                    keys = sorted(int(k) for k in sched.keys())
+                    return int(sched.get(0, sched[keys[0]]))
+    except Exception:
+        pass
+    return 1
+
+
+def build_warmup_cosine_schedule(optimizer, trainer, effective_lr, *, warmup_lr: float = 1e-5,
+                                 default_warmup_steps: int = 200, eta_min: float = 5e-6):
+    """Step-interval linear-warmup -> cosine-annealing schedule, in optimizer steps. Shared by
+    CosineWithWarmup and PBRFNetTCNN."""
+    total_opt_steps = int(trainer.estimated_stepping_batches)
+    max_epochs = int(max(trainer.max_epochs, 1))
+    acc_batches = max(1, _accumulate_grad_batches(trainer))
+    if not torch.isfinite(torch.tensor(total_opt_steps)) or total_opt_steps <= 0:
+        total_opt_steps = default_warmup_steps
+        max_epochs = 1
+    total_opt_steps /= acc_batches
+    warmup_budget = int(max(default_warmup_steps / acc_batches, 1))
+    steps_per_epoch = int(math.ceil(total_opt_steps / max_epochs))
+    warmup_epochs = int(max(warmup_budget / steps_per_epoch, 1))
+    warmup_steps = int(min(warmup_epochs * steps_per_epoch, max(1, total_opt_steps - 1)))
+    cosine_steps = int(max(1, total_opt_steps - warmup_steps))
+    warmup = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=warmup_lr / effective_lr, total_iters=warmup_steps)
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=cosine_steps, eta_min=eta_min)
+    schedule = torch.optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps])
+    return [optimizer], [{
+        "scheduler": schedule, "interval": "step", "monitor": "train_loss", "name": "warmup+cosine",
+    }]
+
+
 class CosineWithWarmup(OptimizerBehaviour):
     """Linear warmup → cosine-annealing schedule (step interval), AdamW with per-component groups."""
 
@@ -59,55 +99,4 @@ class CosineWithWarmup(OptimizerBehaviour):
             betas=(0.9, 0.99)
         )
 
-        # Effective batch = micro-batch × grad-accumulation; the schedule is in OPTIMIZER steps.
-        def get_accumulate_grad_batches(trainer) -> int:
-            try:
-                for cb in getattr(trainer, "callbacks", []):
-                    if cb.__class__.__name__ == "GradientAccumulationScheduler":
-                        sched = getattr(cb, "scheduling", None)
-                        if isinstance(sched, dict) and sched:
-                            keys = sorted(int(k) for k in sched.keys())
-                            return int(sched.get(0, sched[keys[0]]))
-            except Exception:
-                pass
-            return 1
-
-        # A short warmup (~200 steps) stabilises the FiLM/frequency-encoding start without eating
-        # into the budget before cosine decay begins.
-        default_warmup_steps = 200
-        warmup_lr = 1e-5
-        total_opt_steps = int(model.trainer.estimated_stepping_batches)
-        max_epochs = int(max(model.trainer.max_epochs, 1))
-        acc_batches = max(1, get_accumulate_grad_batches(model.trainer))
-        if not torch.isfinite(torch.tensor(total_opt_steps)) or total_opt_steps <= 0:
-            total_opt_steps = default_warmup_steps  # fallback to avoid zero division
-            max_epochs = 1
-
-        total_opt_steps /= acc_batches
-        default_warmup_steps /= acc_batches
-        default_warmup_steps = int(max(1, default_warmup_steps))
-        steps_per_epoch = int(math.ceil(total_opt_steps / max_epochs))
-        warmup_epochs = int(max(default_warmup_steps / steps_per_epoch, 1))
-        warmup_steps = int(min(warmup_epochs * steps_per_epoch, max(1, total_opt_steps - 1)))
-        cosine_steps = int(max(1, total_opt_steps - warmup_steps))
-
-        warmup = torch.optim.lr_scheduler.LinearLR(
-            optimizer, start_factor=warmup_lr / effective_lr, total_iters=warmup_steps
-        )
-        # eta_min reverted 5e-5 -> 5e-6: the 1024-field A/B showed the higher floor blocks fine
-        # convergence on shorter runs (0.230 vs 0.246) by keeping late steps too large to settle.
-        # Keep the shortened warmup (the unambiguous win); let cosine decay to a low floor so the
-        # loss can fine-tune late.
-        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=cosine_steps, eta_min=5e-6
-        )
-        schedule = torch.optim.lr_scheduler.SequentialLR(
-            optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps]
-        )
-
-        return [optimizer], [{
-            "scheduler": schedule,
-            "interval": "step",
-            "monitor": "train_loss",
-            "name": "warmup+cosine",
-        }]
+        return build_warmup_cosine_schedule(optimizer, model.trainer, effective_lr)

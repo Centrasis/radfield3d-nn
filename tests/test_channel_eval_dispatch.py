@@ -111,7 +111,7 @@ def test_join_gt_perfect_prediction_gives_zero_loss(model):
     (and re-normalised) target must score ~zero flux loss — i.e. the path joins the GT exactly the
     way the model's normalizer/ChannelsJoin pipeline defines the joined field."""
     batch = model._normalizer.forward(_batch(_gt_two()))     # mirror evaluate_forward's entry
-    joined_y = model._join_field(batch.ground_truth)         # joined single channel (the target)
+    joined_y = model._join_to_single_channel(batch.ground_truth)   # joined single channel (the target)
     joined_ch = joined_y.scatter_field if isinstance(joined_y, RadiationField) else joined_y
     pred = RadiationField(scatter_field=RadiationFieldChannel(
         flux=joined_ch.flux.clone(),

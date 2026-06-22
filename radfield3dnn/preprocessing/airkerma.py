@@ -23,10 +23,26 @@ class Airkerma(Module):
 
     @staticmethod
     def load_mu_tr_table(mu_tr_file: str, energy_unit: str = "eV") -> Tensor:
-        try:
-            mu_tr = np.loadtxt(mu_tr_file, skiprows=0)
-        except:
-            mu_tr = np.loadtxt(mu_tr_file, skiprows=1)
+        # Explicitly detect a header line — a non-numeric header ("energy mu_tr") OR a single-number
+        # count line whose column count differs from the data rows — instead of a bare try/except
+        # (which would also swallow KeyboardInterrupt/MemoryError and surface real parse errors only
+        # as the confusing second attempt).
+        def _numeric_cols(line: str) -> int:
+            parts = line.replace(",", " ").split()
+            if not parts:
+                return -1
+            try:
+                [float(p) for p in parts]
+                return len(parts)
+            except ValueError:
+                return -1   # non-numeric line
+
+        with open(mu_tr_file, "r") as f:
+            first, second = f.readline(), f.readline()
+        c0, c1 = _numeric_cols(first), _numeric_cols(second)
+        # First line is data only if it is numeric and its column count matches the data rows.
+        skiprows = 0 if (c0 >= 1 and (c1 < 1 or c0 == c1)) else 1
+        mu_tr = np.loadtxt(mu_tr_file, skiprows=skiprows)
         if energy_unit == "eV":
             # No need to convert as Geant4 outputs in 1.0 = 1MeV
             pass

@@ -10,6 +10,16 @@ from .log_rmse import LogRMSEAccuracy
 from .gpr import GammaPassingRate
 
 
+def _to_airkerma(airkerma, x):
+    """Convert a metric input (RadiationFieldChannel / AirKermaField / raw Tensor) to an air-kerma
+    tensor — the single source for the per-metric to-air-kerma boilerplate."""
+    if isinstance(x, RadiationFieldChannel):
+        return airkerma.forward(x.spectrum, x.flux)
+    if isinstance(x, AirKermaField):
+        return x.air_kerma
+    return x
+
+
 class AirkermaAccuracy(MetricBase):
     def __init__(self, mu_tr_file: str, spectra_bins: int, max_energy_eV: float, weight_with_error: bool = False, importance_threshold: float = 0.0, keep_dim: bool = False, metric_type: Union[Literal['smape'], Literal['log_rmse'], Literal['ncc'], Literal['gpr']] = 'smape', voxel_size_m: float = 0.01, rel_dose_diff: float = 0.03, dist_crit_mm: float = 3.0, dose_threshold: float = 0.1):
         super().__init__(layer_name=None, weight_with_error=weight_with_error)
@@ -37,19 +47,8 @@ class AirkermaAccuracy(MetricBase):
             return None
 
         # Compute air kerma without eps clamping; only enforce non-negativity on flux
-        if isinstance(target, RadiationFieldChannel):
-            target_airkerma = self.airkerma.forward(target.spectrum, target.flux)
-        elif isinstance(target, AirKermaField):
-            target_airkerma = target.air_kerma
-        else:
-            target_airkerma = target
-        
-        if isinstance(prediction, RadiationFieldChannel):
-            prediction_airkerma = self.airkerma.forward(prediction.spectrum, prediction.flux)
-        elif isinstance(prediction, AirKermaField):
-            prediction_airkerma = prediction.air_kerma
-        else:
-            prediction_airkerma = prediction
+        target_airkerma = _to_airkerma(self.airkerma, target)
+        prediction_airkerma = _to_airkerma(self.airkerma, prediction)
 
         return self.metric.forward(target_airkerma, prediction_airkerma, input)
     
@@ -64,19 +63,8 @@ class AirkermaAccuracyEnergyWeighted(EnergyWeightedSMAPEAccuracy):
             return None
 
         # Compute air kerma without eps clamping; only enforce non-negativity on flux
-        if isinstance(target, RadiationFieldChannel):
-            target_airkerma = self.airkerma.forward(target.spectrum, target.flux)
-        elif isinstance(target, AirKermaField):
-            target_airkerma = target.air_kerma
-        else:
-            target_airkerma = target
-        
-        if isinstance(prediction, RadiationFieldChannel):
-            prediction_airkerma = self.airkerma.forward(prediction.spectrum, prediction.flux)
-        elif isinstance(prediction, AirKermaField):
-            prediction_airkerma = prediction.air_kerma
-        else:
-            prediction_airkerma = prediction
+        target_airkerma = _to_airkerma(self.airkerma, target)
+        prediction_airkerma = _to_airkerma(self.airkerma, prediction)
 
         # Delegate to SMAPEAccuracy: will ignore trivial denominators via its eps and return accuracy in [0,1] (clamp=True)
         return super().forward(target_airkerma, prediction_airkerma, input)
@@ -108,19 +96,8 @@ class AirkermaRelDifferencesStdDev(MetricBase):
             return None
 
         # Compute air kerma without eps clamping (only clamp negatives to 0 for flux)
-        if isinstance(target, RadiationFieldChannel):
-            target_airkerma = self.airkerma.forward(target.spectrum, target.flux)
-        elif isinstance(target, AirKermaField):
-            target_airkerma = target.air_kerma
-        else:
-            target_airkerma = target
-        
-        if isinstance(prediction, RadiationFieldChannel):
-            prediction_airkerma = self.airkerma.forward(prediction.spectrum, prediction.flux)
-        elif isinstance(prediction, AirKermaField):
-            prediction_airkerma = prediction.air_kerma
-        else:
-            prediction_airkerma = prediction
+        target_airkerma = _to_airkerma(self.airkerma, target)
+        prediction_airkerma = _to_airkerma(self.airkerma, prediction)
 
         # True relative errors; clamp only denominator
         errors = self.metric._calc_metric(target_airkerma, prediction_airkerma)
@@ -161,19 +138,8 @@ class AirkermaSphereAccuracy(MetricBase):
             return None
 
         # Compute air kerma without eps clamping; only enforce non-negativity on flux
-        if isinstance(target, RadiationFieldChannel):
-            target_airkerma = self.airkerma.forward(target.spectrum, target.flux)
-        elif isinstance(target, AirKermaField):
-            target_airkerma = target.air_kerma
-        else:
-            target_airkerma = target
-        
-        if isinstance(prediction, RadiationFieldChannel):
-            prediction_airkerma = self.airkerma.forward(prediction.spectrum, prediction.flux)
-        elif isinstance(prediction, AirKermaField):
-            prediction_airkerma = prediction.air_kerma
-        else:
-            prediction_airkerma = prediction
+        target_airkerma = _to_airkerma(self.airkerma, target)
+        prediction_airkerma = _to_airkerma(self.airkerma, prediction)
 
         B, C, D, H, W = target_airkerma.shape
         device = target_airkerma.device

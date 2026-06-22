@@ -296,6 +296,51 @@ ModelStore::read_metadata_from_memory(const void* bytes, size_t n) {
     return md;
 }
 
+NamedGraphs
+ModelStore::read_graphs_from_memory(const void* bytes, size_t n) {
+    const std::string buf(static_cast<const char*>(bytes), n);
+    std::istringstream is(buf, std::ios::binary);
+
+    char magic[4]; is.read(magic, 4);
+    if (!is || std::memcmp(magic, kMagic, 4) != 0)
+        throw std::runtime_error("model_io: bad magic (not an RF3M package)");
+    const uint32_t version = get<uint32_t>(is);
+    if (version != kVersion)
+        throw std::runtime_error("model_io: unsupported RF3M version " + std::to_string(version));
+
+    // Skip the metadata header (same order as save_to_memory) to reach the graph payloads.
+    get_str(is);            // dataset_name
+    get_str(is);            // software_version
+    get_str(is);            // physics
+    get_domain(is);         // domain
+    const uint32_t n_metrics = get<uint32_t>(is);
+    for (uint32_t i = 0; i < n_metrics; ++i) { get_str(is); get<float>(is); }
+
+    NamedGraphs graphs;
+    const uint32_t n_graphs = get<uint32_t>(is);
+    for (uint32_t i = 0; i < n_graphs; ++i) {
+        std::string name = get_str(is);
+        const uint64_t len = get<uint64_t>(is);
+        std::vector<uint8_t> g(static_cast<size_t>(len));
+        is.read(reinterpret_cast<char*>(g.data()), static_cast<std::streamsize>(len));
+        if (!is) throw std::runtime_error("model_io: truncated graph payload");
+        graphs.emplace(std::move(name), std::move(g));
+    }
+    return graphs;
+}
+
+NamedGraphs
+ModelStore::read_graphs(const std::string& path) {
+    std::ifstream is(path, std::ios::binary | std::ios::ate);
+    if (!is) throw std::runtime_error("model_io: cannot open '" + path + "'");
+    const std::streamsize n = is.tellg();
+    is.seekg(0);
+    std::vector<char> buf(static_cast<size_t>(n));
+    is.read(buf.data(), n);
+    if (!is) throw std::runtime_error("model_io: failed reading '" + path + "'");
+    return read_graphs_from_memory(buf.data(), buf.size());
+}
+
 ModelStore::PackageMetadata
 ModelStore::read_metadata(const std::string& path) {
     std::ifstream is(path, std::ios::binary | std::ios::ate);
