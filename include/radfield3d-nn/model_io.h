@@ -55,6 +55,7 @@
 
 namespace radfield3dnn {
 class VolumeFieldPredictor;   // field_predictors.h (fwd-decl; base predictor, defined in the deploy lib)
+struct ExecutionOptions;      // field_predictors.h (fwd-decl; EP/fp16 selection for the load overloads)
 }  // namespace radfield3dnn
 
 namespace rfnn {
@@ -99,6 +100,15 @@ public:
         load_from_memory(const void* bytes, size_t n, bool use_cuda = true);
     static std::unique_ptr<radfield3dnn::VolumeFieldPredictor>
         load(const std::string& path, bool use_cuda = true);
+
+    // Same, with full execution-provider control (TensorRT/CUDA/CPU, fp16, engine cache). Use these to
+    // expose the TensorRT fp16 knob — fp16 kernels are faster but shift results a few % vs fp32, so it is a
+    // speed/accuracy trade the caller should make explicitly (the bool overloads above keep ExecutionOptions'
+    // defaults: GPU on, TensorRT on, fp16 on).
+    static std::unique_ptr<radfield3dnn::VolumeFieldPredictor>
+        load_from_memory(const void* bytes, size_t n, const radfield3dnn::ExecutionOptions& exec);
+    static std::unique_ptr<radfield3dnn::VolumeFieldPredictor>
+        load(const std::string& path, const radfield3dnn::ExecutionOptions& exec);
 
     // The package metadata that lives in the RF3M header, ahead of the ONNX graphs.
     struct PackageMetadata {

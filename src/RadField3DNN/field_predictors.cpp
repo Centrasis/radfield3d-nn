@@ -1,6 +1,9 @@
 #include "radfield3d-nn/field_predictors.h"
 
 #include "radfield3d-nn/device_radiation_field.h"
+#if RFNN_CUDA_VULKAN_INTEROP
+#include "radfield3d-nn/vk/cuda_vulkan_export.h"   // device_malloc/free/copy_d2d (assemble tiled output)
+#endif
 #include "radfield3d-nn/model_io.h"
 
 #include <onnxruntime_cxx_api.h>
@@ -38,6 +41,7 @@ struct VolumeFieldPredictor::Impl {
     Ort::MemoryInfo mem{Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)};
     std::vector<std::string> in_names, out_names;
     std::vector<std::vector<int64_t>> in_shapes;  // graph-declared shapes (dyn dims < 0)
+    std::string provider = "CPU";  // EP that actually registered (set by configure_options): TensorRT/CUDA/CPU
     // Metric [min,max] ranges per beam-parameter name (from the RF3M ModelDomain). Used to
     // clip+normalise the inputs the model trained on in normalised form (e.g. "distance").
     std::map<std::string, std::array<float, 2>> param_ranges;
@@ -74,6 +78,7 @@ static void append_tensorrt(VolumeFieldPredictor::Impl& im, const ExecutionOptio
     }
     try {
         im.opts.AppendExecutionProvider_TensorRT_V2(*trt);  // throws if EP not registrable
+        im.provider = "TensorRT";
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[radfield3dnn] TensorRT EP not registrable (%s); using CUDA/CPU.\n", e.what());
     }
@@ -91,9 +96,16 @@ static void configure_options(VolumeFieldPredictor::Impl& im, const ExecutionOpt
     if (exec.use_tensorrt) append_tensorrt(im, exec);
 
     // CUDA EP: claims any op TRT left behind, and is the GPU path when TRT is off/absent.
-    try { OrtCUDAProviderOptions cuda{}; cuda.device_id = exec.device_id; im.opts.AppendExecutionProvider_CUDA(cuda); }
-    catch (const std::exception&) { /* no CUDA EP -> CPU fallback */ }
+    try {
+        OrtCUDAProviderOptions cuda{}; cuda.device_id = exec.device_id;
+        im.opts.AppendExecutionProvider_CUDA(cuda);
+        if (im.provider != "TensorRT") im.provider = "CUDA";   // GPU (keep TensorRT if it registered first)
+    }
+    catch (const std::exception&) { /* no CUDA EP -> CPU fallback (im.provider stays "CPU") */ }
 }
+
+std::string VolumeFieldPredictor::execution_provider() const { return impl_->provider; }
+bool VolumeFieldPredictor::uses_gpu() const { return impl_->provider != "CPU"; }
 
 VolumeFieldPredictor::VolumeFieldPredictor(const std::string& onnx_path, bool use_cuda)
     : VolumeFieldPredictor(onnx_path, ExecutionOptions{.use_gpu = use_cuda}) {}
@@ -250,6 +262,10 @@ static bool make_beam_input(const std::string& n, int rows, const BeamParameters
 }
 
 static float source_distance(const BeamParameters& beam) {
+    // Source-to-isocentre distance. Voxel positions run [0,1], so the ISOCENTRE is the cube centre
+    // (0.5,0.5,0.5); `origin` is the source position in that same [0,1] field space (it may lie outside the
+    // cube — the source is usually outside the reconstructed region). Distance = |origin − 0.5|, then
+    // clipped+normalised to the model's metric range.
     return std::sqrt((beam.origin[0]-0.5f)*(beam.origin[0]-0.5f) +
                      (beam.origin[1]-0.5f)*(beam.origin[1]-0.5f) +
                      (beam.origin[2]-0.5f)*(beam.origin[2]-0.5f));
@@ -270,7 +286,9 @@ static std::vector<Ort::Value> run_graph(VolumeFieldPredictor::Impl& im, std::ve
 // `positions_xyz` buffer must stay alive until Run() returns.
 static std::vector<Ort::Value> run_positions(VolumeFieldPredictor::Impl& im,
                                       const float* positions_xyz, int rows,
-                                      const EncodedBeam& beam) {
+                                      const EncodedBeam& beam, int device_id = -1) {
+    const bool prof = std::getenv("RFNN_PROFILE") != nullptr;
+    const auto tp0 = std::chrono::high_resolution_clock::now();
     std::vector<std::vector<float>> buffers;  // own the (beam/latent) data until Run() returns
     std::vector<Ort::Value> inputs;
     buffers.reserve(im.in_names.size());
@@ -281,20 +299,54 @@ static std::vector<Ort::Value> run_positions(VolumeFieldPredictor::Impl& im,
             inputs.emplace_back(Ort::Value::CreateTensor<float>(
                 im.mem, const_cast<float*>(positions_xyz), static_cast<size_t>(rows) * 3, shape, 2));
         } else if (beam.is_encoded) {
-            // The trunk's non-position input is the latent: broadcast it over `rows`.
+            // The trunk's non-position input is the latent, broadcast over `rows`. Materialising this [rows,L]
+            // buffer dominated the per-inference cost (~85 MB at 48³): a fresh per-call allocation page-faults
+            // the whole region (the kernel zero-fills each page on first touch) — ~27 ms, independent of the EP.
+            // So REUSE one thread-local buffer across calls (pages stay resident -> no faults after warm-up) and
+            // fill by GEOMETRIC DOUBLING (~log2(rows) large memcpys, not `rows` tiny ones). The Ort::Value just
+            // views this buffer; it stays valid through Run() (serial use per predictor thread). NOTE: each
+            // calling thread retains this buffer at its high-water size (~rows*L*4 B); that is intentional reuse,
+            // not a leak — only inference threads ever allocate it, and they reuse it every frame.
             const int L = static_cast<int>(beam.latent.size());
-            std::vector<float> d(static_cast<size_t>(rows) * L);
-            for (int i = 0; i < rows; ++i)
-                std::memcpy(&d[static_cast<size_t>(i) * L], beam.latent.data(), L * sizeof(float));
-            buffers.emplace_back(std::move(d));
+            const size_t total = static_cast<size_t>(rows) * L;
+            static thread_local std::vector<float> bcast;
+            if (bcast.size() < total) bcast.resize(total);
+            float* d = bcast.data();
+            std::memcpy(d, beam.latent.data(), static_cast<size_t>(L) * sizeof(float));
+            for (size_t filled = 1; filled < static_cast<size_t>(rows); ) {
+                const size_t copy_rows = std::min(filled, static_cast<size_t>(rows) - filled);
+                std::memcpy(d + filled * L, d, copy_rows * static_cast<size_t>(L) * sizeof(float));
+                filled += copy_rows;
+            }
             const int64_t shape[2] = {rows, L};
-            inputs.emplace_back(Ort::Value::CreateTensor<float>(
-                im.mem, buffers.back().data(), buffers.back().size(), shape, 2));
+            inputs.emplace_back(Ort::Value::CreateTensor<float>(im.mem, d, total, shape, 2));
         } else {
             make_beam_input(n, rows, beam.beam, source_distance(beam.beam), im.param_ranges,
                             im.mem, buffers, inputs);
         }
     }
+#if RFNN_CUDA_VULKAN_INTEROP
+    if (device_id >= 0) {
+        // Device-only: bind the outputs to CUDA device memory so ORT writes the chunk on the GPU.
+        const auto tpb = std::chrono::high_resolution_clock::now();
+        Ort::MemoryInfo cuda_mem("Cuda", OrtDeviceAllocator, device_id, OrtMemTypeDefault);
+        Ort::IoBinding binding(*im.session);
+        for (size_t i = 0; i < im.in_names.size(); ++i) binding.BindInput(im.in_names[i].c_str(), inputs[i]);
+        for (const auto& on : im.out_names) binding.BindOutput(on.c_str(), cuda_mem);
+        const auto tp1 = std::chrono::high_resolution_clock::now();
+        im.session->Run(Ort::RunOptions{nullptr}, binding);
+        if (prof) {
+            const auto tp2 = std::chrono::high_resolution_clock::now();
+            std::fprintf(stderr, "[prof] run_positions rows=%d  build=%.3f ms  bind=%.3f ms  Run=%.3f ms\n", rows,
+                std::chrono::duration<double, std::milli>(tpb - tp0).count(),
+                std::chrono::duration<double, std::milli>(tp1 - tpb).count(),
+                std::chrono::duration<double, std::milli>(tp2 - tp1).count());
+        }
+        return binding.GetOutputValues();
+    }
+#else
+    (void)device_id;
+#endif
     return run_graph(im, inputs);
 }
 
@@ -529,6 +581,71 @@ void VolumeFieldPredictor::predict_into_field(const BeamParameters& beam,
     }
 }
 
+// ── Device-resident inference (zero-copy path; see field_predictors.h / cuda_vulkan_export.h) ─────────
+struct DeviceFieldOutputs {
+    std::vector<Ort::Value> values;   // volume path: the bound outputs own the CUDA device buffers
+    const void* flux     = nullptr;   // device ptr: N scalars
+    const void* spectrum = nullptr;   // device ptr: N*bins, or null
+    size_t      n    = 0;
+    bool        fp16 = false;
+    void*       owned_buffer = nullptr;   // voxel path: a cudaMalloc'd buffer we own (the assembled flux)
+    int         owned_device = -1;
+};
+
+void release_device_outputs(DeviceFieldOutputs* o) {
+#if RFNN_CUDA_VULKAN_INTEROP
+    if (o && o->owned_buffer) rfnn::cuda_vk::device_free(o->owned_device, o->owned_buffer);
+#endif
+    delete o;
+}
+const void* device_outputs_flux(const DeviceFieldOutputs* o)        { return o ? o->flux : nullptr; }
+const void* device_outputs_spectrum(const DeviceFieldOutputs* o)    { return o ? o->spectrum : nullptr; }
+size_t      device_outputs_voxel_count(const DeviceFieldOutputs* o) { return o ? o->n : 0; }
+bool        device_outputs_is_fp16(const DeviceFieldOutputs* o)     { return o ? o->fp16 : false; }
+
+DeviceFieldOutputs* VolumeFieldPredictor::predict_to_device(const BeamParameters& beam,
+                                                            std::array<int, 3> dims, int device_id) const {
+    // Beam-parameter inputs on CPU (the CUDA EP copies them to device). A per-voxel graph (position input)
+    // can't run field-wise, so there is no whole-field device path here — caller falls back to the host path.
+    const float dist = source_distance(beam);
+    std::vector<std::vector<float>> buffers;
+    std::vector<Ort::Value> inputs;
+    for (const auto& n : impl_->in_names) {
+        if (is_position_input(n)) return nullptr;
+        make_beam_input(n, /*rows=*/1, beam, dist, impl_->param_ranges, impl_->mem, buffers, inputs);
+    }
+
+    try {
+        // Bind every output to CUDA device memory: ORT allocates + writes the result on the GPU (no host
+        // copy). The bound Ort::Values (kept in DeviceFieldOutputs::values) own those device buffers.
+        Ort::MemoryInfo cuda_mem("Cuda", OrtDeviceAllocator, device_id, OrtMemTypeDefault);
+        Ort::IoBinding binding(*impl_->session);
+        for (size_t i = 0; i < impl_->in_names.size(); ++i)
+            binding.BindInput(impl_->in_names[i].c_str(), inputs[i]);
+        for (const auto& on : impl_->out_names)
+            binding.BindOutput(on.c_str(), cuda_mem);
+        impl_->session->Run(Ort::RunOptions{nullptr}, binding);
+
+        std::vector<Ort::Value> outs = binding.GetOutputValues();
+        auto out = std::make_unique<DeviceFieldOutputs>();
+        out->n    = static_cast<size_t>(dims[0]) * dims[1] * dims[2];
+        out->fp16 = out_fp16_;
+        bool got_flux = false;
+        for (auto& o : outs) {                                  // flux vs spectrum by trailing dim
+            const auto shp = o.GetTensorTypeAndShapeInfo().GetShape();
+            const bool is_spec = !shp.empty() && shp.back() == out_bins_;
+            if (is_spec)          out->spectrum = o.GetTensorMutableRawData();
+            else if (!got_flux) { out->flux     = o.GetTensorMutableRawData(); got_flux = true; }
+        }
+        out->values = std::move(outs);   // keep the device buffers alive past return
+        if (!out->flux) return nullptr;
+        return out.release();
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[radfield3dnn] predict_to_device failed: %s\n", e.what());
+        return nullptr;
+    }
+}
+
 void VoxelFieldPredictor::predict_into_field(const BeamParameters& beam,
                                              DeviceCartesianRadiationField& out,
                                              int max_inner_batch) const {
@@ -546,6 +663,101 @@ void VoxelFieldPredictor::predict_into_field(const BeamParameters& beam,
     } else {
         tile_into(encode_beam(beam), dims, max_inner_batch, channel->get_layer<float>(kFluxLayer), spec_dst);
     }
+}
+
+// Cap for the single-Run device path: above this voxel count the broadcast latent + activations would be a
+// large device/host allocation, so fall back to chunked tiling. 1<<20 keeps the [N,L] latent host buffer
+// under ~1 GB for typical latent widths; common field sizes (48³,64³,96³) stay single-Run.
+static constexpr size_t kDeviceSingleRunMaxVoxels = 1u << 20;
+
+DeviceFieldOutputs* VoxelFieldPredictor::predict_to_device(const BeamParameters& beam,
+                                                           std::array<int, 3> dims, int device_id) const {
+#if RFNN_CUDA_VULKAN_INTEROP
+    // A voxel model queried over a volume yields the SAME N-value flux output as a volume model. The fast path
+    // runs ALL N voxels in ONE Run with the outputs bound to CUDA device memory (IoBinding) — no host
+    // download, no per-chunk IoBinding/padding, and (unlike a tiled assembly) the bound Ort::Value's device
+    // buffer IS the result, so it's returned directly with no extra device_malloc/d2d copy. The bound values
+    // are kept alive in DeviceFieldOutputs::values. Very large volumes fall back to the chunked path below.
+    const bool prof = std::getenv("RFNN_PROFILE") != nullptr;
+    const int D = dims[0], H = dims[1], W = dims[2];
+    const size_t N = static_cast<size_t>(D) * H * W;
+    if (N == 0) return nullptr;
+    const auto te0 = std::chrono::high_resolution_clock::now();
+    const EncodedBeam enc = encode_beam(beam);
+    if (prof) std::fprintf(stderr, "[prof] encode_beam=%.3f ms\n",
+        std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - te0).count());
+
+    if (N <= kDeviceSingleRunMaxVoxels) {
+        std::vector<std::array<float, 3>> pts(N);
+        size_t idx = 0;
+        for (int i = 0; i < D; ++i)
+        for (int j = 0; j < H; ++j)
+        for (int k = 0; k < W; ++k)
+            pts[idx++] = { i / std::max(1.f, D - 1.f), j / std::max(1.f, H - 1.f), k / std::max(1.f, W - 1.f) };
+        try {
+            std::vector<Ort::Value> res = run_positions(*impl_, reinterpret_cast<const float*>(pts.data()),
+                                                        static_cast<int>(N), enc, device_id);
+            auto out = std::make_unique<DeviceFieldOutputs>();
+            out->n = N; out->fp16 = out_fp16_;
+            bool got_flux = false;
+            for (auto& o : res) {
+                const auto shp = o.GetTensorTypeAndShapeInfo().GetShape();
+                const bool is_spec = !shp.empty() && shp.back() == out_bins_;
+                if (is_spec)          out->spectrum = o.GetTensorMutableRawData();
+                else if (!got_flux) { out->flux     = o.GetTensorMutableRawData(); got_flux = true; }
+            }
+            out->values = std::move(res);   // keep the device buffers alive past return
+            if (!out->flux) return nullptr;
+            return out.release();
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[radfield3dnn] voxel predict_to_device (single-run) failed: %s\n", e.what());
+            return nullptr;
+        }
+    }
+
+    // Fallback for very large volumes: tile per-voxel queries (each chunk's ONNX output bound to CUDA device
+    // memory) into ONE device flux buffer at its voxel offset. Bounded device/host working set per chunk.
+    const size_t elem = out_fp16_ ? 2u : 4u;
+    void* bigbuf = rfnn::cuda_vk::device_malloc(device_id, N * elem);
+    if (!bigbuf) return nullptr;
+    const size_t CH = std::min(kDeviceSingleRunMaxVoxels, N);
+    std::vector<std::array<float, 3>> pts; pts.reserve(CH);
+    size_t done = 0; bool ok = true;
+    auto flush = [&]() {
+        if (!ok) { pts.clear(); return; }
+        const size_t valid = pts.size();
+        while (pts.size() < CH) pts.push_back(pts.back());   // pad to CH (one static shape for TRT); drop padding
+        std::vector<Ort::Value> res = run_positions(*impl_, reinterpret_cast<const float*>(pts.data()),
+                                                     static_cast<int>(pts.size()), enc, device_id);
+        const void* flux_dev = nullptr;
+        for (auto& o : res) {
+            const auto shp = o.GetTensorTypeAndShapeInfo().GetShape();
+            const bool is_spec = !shp.empty() && shp.back() == out_bins_;
+            if (!is_spec) { flux_dev = o.GetTensorMutableRawData(); break; }   // device ptr: this chunk's flux
+        }
+        if (!flux_dev ||
+            !rfnn::cuda_vk::device_copy_d2d(static_cast<char*>(bigbuf) + done * elem, flux_dev, valid * elem)) {
+            ok = false;
+        }
+        done += valid; pts.clear();
+    };
+    for (int i = 0; i < D; ++i)
+    for (int j = 0; j < H; ++j)
+    for (int k = 0; k < W; ++k) {
+        pts.push_back({ i / std::max(1.f, D - 1.f), j / std::max(1.f, H - 1.f), k / std::max(1.f, W - 1.f) });
+        if (pts.size() == CH) flush();
+    }
+    if (!pts.empty()) flush();
+
+    if (!ok) { rfnn::cuda_vk::device_free(device_id, bigbuf); return nullptr; }
+    auto out = std::make_unique<DeviceFieldOutputs>();
+    out->flux = bigbuf; out->owned_buffer = bigbuf; out->owned_device = device_id;
+    out->n = N; out->fp16 = out_fp16_;
+    return out.release();
+#else
+    (void)beam; (void)dims; (void)device_id;
+    return nullptr;
+#endif
 }
 
 // ── VoxelFieldPredictor ────────────────────────────────────────────────────────────────────────

@@ -10,6 +10,10 @@ project(RadField3DNN LANGUAGES CXX)
 
 option(RFNN_WITH_TCNN      "Build the tiny-cuda-nn CUDA models + torch python bindings" OFF)
 option(RFNN_BACKEND_VULKAN "Build the Vulkan GPU export backend for the deployment runtime" ON)
+# Zero-copy CUDA<->Vulkan export: ONNX (CUDA EP) writes inference results straight into a caller-provided
+# (UE-owned) external Vulkan image, synchronised by an imported timeline semaphore — no host download.
+# NVIDIA only; needs the CUDA toolkit. OFF keeps the deploy runtime CUDA-free (host-copy fallback path).
+option(RFNN_CUDA_VULKAN_INTEROP "Build the CUDA<->Vulkan zero-copy export path (NVIDIA only)" OFF)
 option(BUILD_RADFIELDNN_TESTS "Build the radfield3d-nn tests" ON)
 option(BUILD_EXAMPLES "Build the examples" OFF)
 # Python bindings live in the tcnn half; only meaningful when that half is enabled.
@@ -174,12 +178,24 @@ if(RFNN_BACKEND_VULKAN)
   add_custom_target(rfnn_shaders DEPENDS ${_SPV_HEADERS})
 endif()
 
+# CUDA<->Vulkan interop is HOST-ONLY CUDA runtime (cudaMemcpy3D + external memory/semaphore — no
+# __global__ kernels, no nvcc, no CUDA language). It imports Vulkan-exported FDs via CUDA APIs and does
+# NOT include <vulkan/vulkan.h>, so it is independent of RFNN_BACKEND_VULKAN (which needs the Vulkan SDK +
+# glslang) — it only needs libcudart. The .cpp builds with the deploy lib's own C++ toolchain (ABI-matched
+# to UE). The default (CUDA-free) deploy configure is unaffected when OFF.
+if(RFNN_CUDA_VULKAN_INTEROP)
+  find_package(CUDAToolkit REQUIRED)   # provides the CUDA::cudart imported target (headers + lib)
+endif()
+
 set(DEPLOY_SOURCES
   src/RadField3DNN/field_predictors.cpp
   src/RadField3DNN/device_radiation_field.cpp
   src/RadField3DNN/model_io.cpp)
 if(RFNN_BACKEND_VULKAN)
   list(APPEND DEPLOY_SOURCES src/RadField3DNN/vk/vulkan_field.cpp)
+endif()
+if(RFNN_CUDA_VULKAN_INTEROP)
+  list(APPEND DEPLOY_SOURCES src/RadField3DNN/vk/cuda_vulkan_export.cpp)
 endif()
 
 add_library(libRadField3DNNDeploy STATIC ${DEPLOY_SOURCES})
@@ -191,6 +207,10 @@ if(RFNN_BACKEND_VULKAN)
   add_dependencies(libRadField3DNNDeploy rfnn_shaders)
   target_compile_definitions(libRadField3DNNDeploy PUBLIC RFNN_BACKEND_VULKAN)
   target_link_libraries(libRadField3DNNDeploy PUBLIC Vulkan::Vulkan)
+endif()
+if(RFNN_CUDA_VULKAN_INTEROP)
+  target_compile_definitions(libRadField3DNNDeploy PUBLIC RFNN_CUDA_VULKAN_INTEROP)
+  target_link_libraries(libRadField3DNNDeploy PUBLIC CUDA::cudart)
 endif()
 set_target_properties(libRadField3DNNDeploy PROPERTIES
   ARCHIVE_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/lib"

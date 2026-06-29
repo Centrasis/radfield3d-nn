@@ -100,14 +100,14 @@ public:
 
     std::shared_ptr<RadFiled3D::IRadiationField> copy() const override;
 
-    // Download to a plain host-resident CartesianRadiationField: copies geometry + every
+    // Download to a plain host-resident CartesianRadiationField: copies every
     // channel/layer's host data (any voxel type). GPU mirrors are not transferred — the device
     // field's host data is the source of truth, so sync a GPU-only result back via the backend
     // helper (e.g. download_floats) before calling this.
     std::shared_ptr<RadFiled3D::CartesianRadiationField> to_host_field() const;
 
     // Upload: build a DeviceCartesianRadiationField mirroring a host CartesianRadiationField
-    // (copies geometry + channel/layer data). GPU mirrors are attached later by an export helper.
+    // (copies channel/layer data). GPU mirrors are attached later by an export helper.
     static std::shared_ptr<DeviceCartesianRadiationField> from_host_field(
         const RadFiled3D::CartesianRadiationField& src,
         DeviceBackend backend = DeviceBackend::Host);

@@ -62,7 +62,6 @@ class FeedforwardPointwiseModel(BaseNeuralRadFieldModel):
         return self._base_voxel_map
 
     def prepare_linear_input_batches(self, x: DirectionalInput, voxel_counts: Tensor, mask: Tensor | None = None):
-        # Generate base voxel map once increase voxel_counts by 1 in each dimension to account for randomization
         batched_input = len(x.direction.shape) == 2
         
         if not batched_input:
@@ -80,17 +79,19 @@ class FeedforwardPointwiseModel(BaseNeuralRadFieldModel):
         total_voxels_per_batch = int(voxel_counts.prod().item())
 
         # Create voxel map for all batch items efficiently
-        if self.randomize_voxel_location_in_training and self.training:
-            # Add noise to each batch item separately
-            voxel_map = self.base_voxel_map.unsqueeze(0).expand(batch_size, -1, -1, -1, -1).clone()
+        voxel_map = self.base_voxel_map.unsqueeze(0).expand(batch_size, -1, -1, -1, -1)
+        if self.randomize_voxel_location_in_training:
+            # Rescale the i/(N-1) node grid to voxel lower corners i/N so the always-positive
+            # in-voxel jitter fills cell i = [i/N, (i+1)/N) without overflowing the box. Eval
+            # (no jitter) queries the cell's lower corner, the lower edge of that trained range.
             voxel_extent = 1.0 / voxel_counts.float().view(1, 1, 1, 1, -1)
-            noise = torch.rand_like(voxel_map[..., :3]) * voxel_extent
-            voxel_map[..., :3] = voxel_map[..., :3] + noise
-        else:
-            voxel_map = self.base_voxel_map.unsqueeze(0).expand(batch_size, -1, -1, -1, -1)
+            voxel_map = voxel_map.clone()
+            voxel_map[..., :3] = voxel_map[..., :3] * (1.0 - voxel_extent)
+            if self.training:
+                voxel_map[..., :3] = voxel_map[..., :3] + torch.rand_like(voxel_map[..., :3]) * voxel_extent
 
         # allocate memory for the full voxel map an make it contiguous
-        voxel_map = voxel_map.clone().contiguous()
+        voxel_map = voxel_map.contiguous()
 
         if self.voxels_centered_around_origin:
             # map xyz from [0,1] to [-1,1] for the model
@@ -135,7 +136,6 @@ class FeedforwardPointwiseModel(BaseNeuralRadFieldModel):
         if self.max_inner_batch_size is None:
             self.on_fit_start()
 
-        # Generate base voxel map once increase voxel_counts by 1 in each dimension to account for randomization
         batched_input = len(x.direction.shape) == 2
         batch_size = x.direction.shape[0] if batched_input else 1
         # Calculate total voxels per batch item

@@ -75,6 +75,18 @@ struct EncodedBeam {
 // Which predictor a model loads as (each instance reports its own).
 enum class PredictorType { VolumeField, VoxelField };
 
+// Device-resident inference outputs: the ONNX flux/spectrum tensors left in CUDA DEVICE memory (no host
+// download), produced by VolumeFieldPredictor::predict_to_device. Opaque (defined in the .cpp; it owns the
+// bound Ort::Values that back the device buffers — keep it alive until a consumer has copied the data, e.g.
+// rfnn::cuda_vk has cudaMemcpy3D'd flux into a Vulkan image). The accessors return raw CUDA device pointers
+// (do NOT dereference on the host). This is the zero-copy path; the CPU/fallback path is predict_into_field.
+struct DeviceFieldOutputs;
+void         release_device_outputs(DeviceFieldOutputs* outputs);
+const void*  device_outputs_flux(const DeviceFieldOutputs* outputs);       // device ptr: N scalars
+const void*  device_outputs_spectrum(const DeviceFieldOutputs* outputs);   // device ptr: N*bins (or null)
+size_t       device_outputs_voxel_count(const DeviceFieldOutputs* outputs);
+bool         device_outputs_is_fp16(const DeviceFieldOutputs* outputs);    // flux element type
+
 // The model's INPUT tube-spectrum histogram layout, in eV — everything needed to reconstruct the
 // energy binning the model expects: `bins` values spanning [min_energy_ev, max_energy_ev], each
 // `bin_width_ev` wide (bin i covers [min + i*width, min + (i+1)*width)). Sourced from the RF3M
@@ -124,6 +136,13 @@ public:
     // layer as fp16 (RadFiled3D float16) instead of float32.
     bool predicts_fp16() const { return out_fp16_; }
 
+    // The execution provider this session actually runs on, decided at load time from which EP successfully
+    // registered (GPU EPs are best-effort and fall back): "TensorRT" or "CUDA" => GPU, "CPU" => CPU-only.
+    // Use this to report whether inference is hardware-accelerated (a use_gpu request can still land on CPU
+    // when the CUDA/TensorRT runtime libraries are missing).
+    std::string execution_provider() const;
+    bool uses_gpu() const;   // true unless the session fell back to the CPU provider
+
     // Register the [min,max] metric range of a beam parameter (taken from the RF3M ModelDomain).
     // Parameters the model trained on in NORMALIZED form — i.e. a metric input it does not normalise
     // itself (e.g. "distance" in metres, "opening_angle" in degrees) — are clipped to this range and
@@ -155,8 +174,17 @@ public:
     // Predict straight into `out`'s prediction channel (creating the "flux"/"spectrum" layers if
     // absent), writing the ONNX outputs directly into the field's buffers with no intermediate
     // copy. `out`'s voxel counts set the resolution. VoxelFieldPredictor overrides this to tile.
+    // This is the HOST / CPU-fallback path (outputs land in the field's host layer buffers).
     virtual void predict_into_field(const BeamParameters& beam, DeviceCartesianRadiationField& out,
                                     int max_inner_batch = 65536) const;
+
+    // Device-resident whole-field inference: run the graph with the ONNX outputs bound to CUDA DEVICE
+    // memory (IoBinding) — nothing is downloaded to the host. Returns an opaque DeviceFieldOutputs holding
+    // the flux/spectrum device pointers (and keeping the device buffers alive), or NULLPTR when there is no
+    // GPU support. A field-wise (volume) model runs in one Run; VoxelFieldPredictor overrides this to tile
+    // per-voxel queries into ONE device buffer (same N-value output). Caller release_device_outputs() it.
+    virtual DeviceFieldOutputs* predict_to_device(const BeamParameters& beam, std::array<int, 3> dims,
+                                                  int device_id = 0) const;
 
     // Run this graph on beam parameters (one row) and return its first output flat. Used when this
     // predictor is the beam-encoder of a VoxelFieldPredictor (beam parameters -> latent vector).
@@ -235,6 +263,12 @@ public:
     // Whole-field: tile per-voxel queries straight into `out`'s buffers (zero intermediate copy).
     void predict_into_field(const BeamParameters& beam, DeviceCartesianRadiationField& out,
                             int max_inner_batch = 65536) const override;
+
+    // Device-resident whole-field: tile per-voxel queries with each chunk's ONNX output bound to CUDA
+    // device memory, copied into ONE device flux buffer (the same N-value output a volume model yields).
+    // Returns null without the CUDA interop. Caller release_device_outputs() it.
+    DeviceFieldOutputs* predict_to_device(const BeamParameters& beam, std::array<int, 3> dims,
+                                          int device_id = 0) const override;
     // Predict ONLY `voxel_locations` (integer (i,j,k) voxel indices): the written field holds the
     // predicted values at those voxels and -inf (flux and every spectrum bin) at all others.
     void predict_into_field(const BeamParameters& beam, DeviceCartesianRadiationField& out,

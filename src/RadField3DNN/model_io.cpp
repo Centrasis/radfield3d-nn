@@ -173,7 +173,7 @@ void ModelStore::save(const std::string& path,
 }
 
 std::unique_ptr<radfield3dnn::VolumeFieldPredictor>
-ModelStore::load_from_memory(const void* bytes, size_t n, bool use_cuda) {
+ModelStore::load_from_memory(const void* bytes, size_t n, const radfield3dnn::ExecutionOptions& exec) {
     const std::string buf(static_cast<const char*>(bytes), n);
     std::istringstream is(buf, std::ios::binary);
 
@@ -234,7 +234,7 @@ ModelStore::load_from_memory(const void* bytes, size_t n, bool use_cuda) {
     // VolumeFieldPredictor; a per-voxel trunk is move-adopted (no re-load) into a
     // VoxelFieldPredictor, wired with the "beam_encoder" graph if the package carries one.
     auto trunk_pred = std::make_unique<radfield3dnn::VolumeFieldPredictor>(
-        trunk.data(), trunk.size(), use_cuda);
+        trunk.data(), trunk.size(), exec);
     apply_ranges(*trunk_pred);  // single-graph models bind the beam params on the trunk
 
     std::unique_ptr<radfield3dnn::VolumeFieldPredictor> predictor;
@@ -245,7 +245,7 @@ ModelStore::load_from_memory(const void* bytes, size_t n, bool use_cuda) {
         auto eit = graphs.find(kBeamEncoderGraph);
         if (eit != graphs.end()) {
             encoder = std::make_shared<radfield3dnn::VolumeFieldPredictor>(
-                eit->second.data(), eit->second.size(), use_cuda);
+                eit->second.data(), eit->second.size(), exec);
             apply_ranges(*encoder);  // two-graph models bind the beam params on the encoder
         }
         predictor = std::make_unique<radfield3dnn::VoxelFieldPredictor>(
@@ -258,7 +258,7 @@ ModelStore::load_from_memory(const void* bytes, size_t n, bool use_cuda) {
 }
 
 std::unique_ptr<radfield3dnn::VolumeFieldPredictor>
-ModelStore::load(const std::string& path, bool use_cuda) {
+ModelStore::load(const std::string& path, const radfield3dnn::ExecutionOptions& exec) {
     std::ifstream is(path, std::ios::binary | std::ios::ate);
     if (!is) throw std::runtime_error("model_io: cannot open '" + path + "'");
     const std::streamsize n = is.tellg();
@@ -266,7 +266,18 @@ ModelStore::load(const std::string& path, bool use_cuda) {
     std::vector<char> buf(static_cast<size_t>(n));
     is.read(buf.data(), n);
     if (!is) throw std::runtime_error("model_io: failed reading '" + path + "'");
-    return load_from_memory(buf.data(), buf.size(), use_cuda);
+    return load_from_memory(buf.data(), buf.size(), exec);
+}
+
+// Convenience bool overloads: keep the historic (… , use_cuda) API, mapping to ExecutionOptions defaults
+// (TensorRT→CUDA→CPU, fp16 on). Callers wanting the fp16/EP knobs use the ExecutionOptions overloads above.
+std::unique_ptr<radfield3dnn::VolumeFieldPredictor>
+ModelStore::load_from_memory(const void* bytes, size_t n, bool use_cuda) {
+    return load_from_memory(bytes, n, radfield3dnn::ExecutionOptions{.use_gpu = use_cuda});
+}
+std::unique_ptr<radfield3dnn::VolumeFieldPredictor>
+ModelStore::load(const std::string& path, bool use_cuda) {
+    return load(path, radfield3dnn::ExecutionOptions{.use_gpu = use_cuda});
 }
 
 ModelStore::PackageMetadata
