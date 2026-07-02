@@ -81,6 +81,16 @@ class ModelPackager:
     def _statistics(self) -> dict:
         p = os.path.join(self.dataset_path, "statistics.json")
         if os.path.exists(p):
+            # These ranges become the DEPLOYED model's validity domain. A statistics.json older
+            # than the newest field file means the dataset changed after the stats were computed
+            # (e.g. densification) and the shipped envelope would be wrong.
+            fields_dir = os.path.join(self.dataset_path, "fields")
+            if os.path.isdir(fields_dir):
+                newest_field = max((e.stat().st_mtime for e in os.scandir(fields_dir) if e.is_file()),
+                                   default=0.0)
+                if os.path.getmtime(p) < newest_field:
+                    print(f"[red]{p} is OLDER than the newest field file — the packaged domain "
+                          f"metadata is stale. Re-run scripts/compute_dataset_statistics.py.[/red]")
             with open(p, "r") as f:
                 return json.load(f)
         return {}

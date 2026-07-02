@@ -64,7 +64,9 @@ class LinearNormalizer(Normalizer):
         with torch.no_grad():
             valid_mask = torch.isfinite(x)
             if not valid_mask.all():
-                orig_values = x
+                # Clone like apply_transformation does — writing into `x` directly would mutate the
+                # caller's tensor in place (metrics evaluated after the inverse would see corrupted values).
+                orig_values = x.clone()
                 x = x[valid_mask]
             x = (x - self.range[0]) / (self.range[1] - self.range[0])
             max = torch.amax(respect_to, dim=tuple(range(1, respect_to.ndim)), keepdim=True) if respect_to is not None else 1.0

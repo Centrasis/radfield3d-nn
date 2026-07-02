@@ -113,7 +113,7 @@ class MultiTaskLossBalancer(nn.Module):
         self.last_gradnorms = {}
         self.last_overflowed = {n: False for n in logs}
 
-        # Step 1 only: loss-scale balancing (black-box safe / single task / eval).
+        # Step 1 only: loss-scale balancing.
         if balance_parameters is None or len(logs) == 1 or not torch.is_grad_enabled():
             return torch.stack(list(logs.values())).sum()
 
@@ -122,8 +122,7 @@ class MultiTaskLossBalancer(nn.Module):
         # smoothed), so recompute them only every `update_every` steps and reuse the
         # cache otherwise → one backward on the ~(N-1)/N of steps that reuse it.
         self._calls += 1
-        if self._cached_weights is not None and (self._calls % self.update_every != 0) \
-                and all(n in self._cached_weights for n in logs):
+        if self._cached_weights is not None and (self._calls % self.update_every != 0):
             self.last_weights = dict(self._cached_weights)
             total = torch.zeros((), device=next(iter(logs.values())).device)
             for n, lg in logs.items():

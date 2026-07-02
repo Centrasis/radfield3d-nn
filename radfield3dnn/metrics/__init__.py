@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from .smape import SMAPEAccuracy
-from .histogram_accuracy import HistogramOverlapAccuracy
+from .histogram_accuracy import HistogramOverlapAccuracy, SpectrumROIAccuracy
 from .base import MetricBase
 
 

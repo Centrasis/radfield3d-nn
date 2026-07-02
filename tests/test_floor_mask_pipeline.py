@@ -94,16 +94,18 @@ def test_roi_sampler_floor_as_zero():
     samp = ROIbasedSampler(scatter_ratio=2.0, floor_ratio=1.0, floor_as_zero=True); samp.train()
     out = samp.forward(_make_input(direct, scatter, joined, D))
     flux = out.ground_truth.scatter_field.flux
-    is_zero = (flux == 0.0)
+    is_floor_val = (flux == samp.floor_value)
     is_inf = torch.isinf(flux)
-    # the re-injected floor voxels are EXACT zeros, and every zero lives in the floor ROI
-    assert bool(is_zero.any()) and not bool((is_zero & ~floor).any())
+    # the re-injected floor voxels carry the constant floor_value (~0 but positive — never an
+    # exact 0), and every such voxel lives in the floor ROI
+    assert samp.floor_value > 0.0 and not bool((flux == 0.0).any())
+    assert bool(is_floor_val.any()) and not bool((is_floor_val & ~floor).any())
     # beam is kept at its real (nonzero, finite) value
     assert torch.isfinite(flux[beam]).all() and bool((flux[beam] != 0).all())
     # there are still masked (-inf) voxels (the non-sampled floor + non-sampled scatter)
     assert bool(is_inf.any())
-    # zero count is capped by ~beam count (floor_ratio=1)
-    assert int(is_zero.sum()) <= int(beam.sum()) + 1
+    # floor-injected count is capped by ~beam count (floor_ratio=1)
+    assert int(is_floor_val.sum()) <= int(beam.sum()) + 1
 
 
 def test_roi_sampler_floor_as_value_keeps_original():

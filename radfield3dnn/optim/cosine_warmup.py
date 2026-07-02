@@ -85,7 +85,7 @@ class CosineWithWarmup(OptimizerBehaviour):
             else:
                 mlp_params.append(target)
 
-        assert len(encoding_params) + len(mlp_params) + len(no_decay) == len(list(model.parameters())), "Parameter separation error"
+        assert len(encoding_params) + len(mlp_params) + len(no_decay) == len([p for p in model.parameters() if p.requires_grad]), "Parameter separation error"
 
         # eps: InstantNGP uses 1e-15 (far below the 1e-8 default) so the Adam preconditioner stays
         # aggressive on the tiny HDR-flux-tail gradients. Usable in both precisions because Adam state

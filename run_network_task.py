@@ -227,7 +227,8 @@ if __name__ == "__main__":
         is_end_epoch = is_cfg.get("end_epoch", epochs // 2)
         # `method`: "error" (default) = ErrorbasedImportanceSampler (drop high-MC-error voxels);
         #           "roi" = ROIbasedSampler (keep all beam, sample scatter relative to beam count,
-        #                   sample a capped floor — matches the air-kerma scatter ROI + TwoROIGammaLoss).
+        #                   sample a capped floor — matches the air-kerma scatter ROI + TwoROIGammaLoss);
+        #           "roi_full" = FullScatterROISampler (keep ALL beam + ALL scatter, sip a few % of floor).
         method = str(is_cfg.get("method", "error")).lower()
         if method == "roi":
             from radfield3dnn.preprocessing.augmentations.roi_sampling import ROIbasedSampler
@@ -251,6 +252,25 @@ if __name__ == "__main__":
                   f"{is_cfg.get('scatter_ratio',2.0)}×beam scatter + {is_cfg.get('floor_ratio',1.0)}×beam floor"
                   f"{' (floor→0)' if is_cfg.get('floor_as_zero', True) else ''}{_sched}; "
                   f"field ×{is_cfg.get('field_multiplier',3.0)}.")
+        elif method == "roi_full":
+            from radfield3dnn.preprocessing.augmentations.roi_sampling import FullScatterROISampler
+            from radfield3dnn.roi import BEAM_REL_DEFAULT
+            # coerce: YAML parses "1e-4" (no decimal point) as a string, so float() it here.
+            _scatter_lo = float(is_cfg.get("scatter_lo", 1e-4))
+            _floor_keep = float(is_cfg.get("floor_keep_ratio", 0.03))
+            _field_mult = float(is_cfg.get("field_multiplier", 2.0))
+            _floor_val = float(is_cfg.get("floor_value", 1e-8))
+            sampler = FullScatterROISampler(
+                beam_rel=float(is_cfg.get("beam_rel", BEAM_REL_DEFAULT)),
+                scatter_lo=_scatter_lo,
+                floor_keep_ratio=_floor_keep,
+                field_multiplier=_field_mult,
+                floor_as_zero=is_cfg.get("floor_as_zero", True),
+                floor_value=_floor_val,
+            )
+            print(f"[green]ROI-full voxel sampling: keep ALL beam + ALL scatter "
+                  f"(>= {_scatter_lo:.0e}·joined_max) + {_floor_keep*100:.0f}% of the floor"
+                  f"{f' (floor→{_floor_val:.0e})' if is_cfg.get('floor_as_zero', True) else ''}; field ×{_field_mult}.")
         else:
             # ErrorbasedImportanceSampler: drop unreliable high-MC-error voxels as a WARMUP, then
             # switch off for fine-tuning (the background is a real target). `max_drop_chance` anneals

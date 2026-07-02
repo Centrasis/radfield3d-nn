@@ -15,14 +15,19 @@ from lightning.pytorch.tuner import Tuner
 
 class TrainTask(Task):
     def get_trainer_callbacks(self, model_name: str, logs_path: str, logger: LoggerBase, mu_tr_file: str, voxel_resolution: tuple[int, int, int], voxel_size_m: float, epochs: int, dataset_path: str) -> list[pl.Callback]:
+        # Early stop + checkpoint selection monitor the AIR-KERMA SCATTER ACCURACY, not the raw
+        # loss: the SMAPEBalanced loss decouples from the physical metric (the loss plateaus/rises
+        # while accuracy keeps climbing), so a val_raw_loss monitor stops runs early and picks
+        # non-best checkpoints (e.g. the roi_full run was cut at epoch 54 = warmup + patience).
         return [
-            WarmupEarlyStopping(monitor="val_raw_loss", patience=max(epochs // 5, 3), mode="min", warmup_epochs=epochs // 3),
+            WarmupEarlyStopping(monitor="val_airkerma_accuracy_scatter", patience=max(epochs // 5, 3), mode="max", warmup_epochs=epochs // 3),
             ModelCheckpoint(
                 dirpath=os.path.join(logs_path, "models"),
-                filename=f"{model_name}-" + '{epoch}-{val_raw_loss:.2f}',
+                filename=f"{model_name}-" + '{epoch}-{val_airkerma_accuracy_scatter:.3f}',
                 save_last=True,
                 save_top_k=1,
-                monitor="val_raw_loss",
+                monitor="val_airkerma_accuracy_scatter",
+                mode="max",
             ),
             ValidationPlotter(
                 logger,
@@ -98,4 +103,6 @@ class TrainTask(Task):
             print(f"[green]Resuming from checkpoint: {resume_ckpt}")
         trainer.fit(model, datamodule=datamodule, ckpt_path=resume_ckpt)
         print("[green]Final test!")
-        trainer.test(model, datamodule=datamodule)
+        # Test (and the on_test_end RF3M export) on the BEST checkpoint, not the last-epoch
+        # weights — otherwise the shipped model is whatever epoch training happened to end on.
+        trainer.test(model, datamodule=datamodule, ckpt_path="best")

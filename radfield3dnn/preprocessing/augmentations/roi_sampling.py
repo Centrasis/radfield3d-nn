@@ -26,7 +26,7 @@ from radfield3dnn.roi import compute_roi_masks, BEAM_REL_DEFAULT, SCATTER_LO_DEF
 class ROIbasedSampler(DataProcessing):
     def __init__(self, beam_rel: float = BEAM_REL_DEFAULT, scatter_lo: float = SCATTER_LO_DEFAULT,
                  beam_keep_ratio: float = 1.0, scatter_ratio: float = 2.0, floor_ratio: float = 1.0,
-                 field_multiplier: float = 3.0, floor_as_zero: bool = True,
+                 field_multiplier: float = 3.0, floor_as_zero: bool = True, floor_value: float = 1e-8,
                  scatter_ratio_end: float = None, schedule_switch: float = 0.8):
         """
         :param beam_rel:       beam = direct >= beam_rel * direct_max (matches the metric/loss).
@@ -37,11 +37,14 @@ class ROIbasedSampler(DataProcessing):
                                number of floor voxels that exist (may be 0), default 1.0.
         :param field_multiplier: how many times each field is repeated per epoch (>1). Each repeat
                                re-keeps the beam but draws a fresh random scatter/floor subset.
-        :param floor_as_zero:  if True (default), the sampled FLOOR voxels are set to a genuine 0
-                               (not their noisy MC value), so the network is shown "a bit of zero"
+        :param floor_as_zero:  if True (default), the sampled FLOOR voxels are set to ``floor_value``
+                               (not their noisy MC value), so the network is shown "a bit of ~zero"
                                and does not hallucinate signal in the background; the rest of the
                                floor (and non-sampled scatter) stays -inf/masked. If False the
                                sampled floor keeps its original (noisy) target value.
+        :param floor_value:    the constant target written into the sampled floor voxels when
+                               ``floor_as_zero`` (default 1e-8 = slightly above zero radiation, kept
+                               positive to stay clear of 0/0 in normalization / log / relative-error).
         :param scatter_ratio_end: if set, the scatter_ratio is SCHEDULED — ``scatter_ratio`` for the
                                first ``schedule_switch`` fraction of training, then this value for
                                the rest (e.g. start 2.5 → end 1.0 over the last 20% for fine-tuning).
@@ -59,6 +62,7 @@ class ROIbasedSampler(DataProcessing):
         self.floor_ratio = float(floor_ratio)
         self.field_multiplier = float(field_multiplier)
         self.floor_as_zero = bool(floor_as_zero)
+        self.floor_value = float(floor_value)
         self.scatter_ratio_end = float(scatter_ratio_end) if scatter_ratio_end is not None else None
         self.schedule_switch = float(schedule_switch)
         self._progress = 0.0   # 0→1 over the active training window (set by LimitedAugmentation)
@@ -142,8 +146,8 @@ class ROIbasedSampler(DataProcessing):
             return x
 
         def _apply(t: torch.Tensor, dm: torch.Tensor, zm: torch.Tensor) -> torch.Tensor:
-            # zero-inject first (floor → 0), then mask the dropped voxels to -inf.
-            out = torch.where(zm, torch.zeros_like(t), t)
+            # floor-inject first (floor → floor_value ~0), then mask the dropped voxels to -inf.
+            out = torch.where(zm, torch.full_like(t, self.floor_value), t)
             out = torch.where(dm, torch.full_like(t, -torch.inf), out)
             return out.contiguous()
 
@@ -182,6 +186,48 @@ class ROIbasedSampler(DataProcessing):
             "floor_ratio": self.floor_ratio,
             "field_multiplier": self.field_multiplier,
             "floor_as_zero": self.floor_as_zero,
+            "floor_value": self.floor_value,
             "scatter_ratio_end": self.scatter_ratio_end if self.scatter_ratio_end is not None else self.scatter_ratio,
             "schedule_switch": self.schedule_switch,
+        }
+
+
+class FullScatterROISampler(ROIbasedSampler):
+    """ROI sampler that trains the WHOLE signal and only sips the floor.
+
+    Per field (training only):
+      * KEEP every beam voxel (direct >= beam_rel * direct_max);
+      * KEEP every scatter voxel (NOT beam AND joined >= scatter_lo * joined_max) — the full
+        scatter ROI every step, no beam-relative subsampling;
+      * inject only ``floor_keep_ratio`` (a few percent) of the floor (joined < scatter_lo *
+        joined_max), as genuine 0 when ``floor_as_zero`` (else at its real value);
+      * mask everything else to -inf.
+
+    ``scatter_lo`` defaults to 1e-4: scatter = the >=1e-4 signal (kept whole, so the [5e-5,1e-4]
+    decade is trained rather than dumped into the floor), floor = the noisy <1e-4 background that
+    is mostly dropped. Reuses ROIbasedSampler's masking/forward; only the keep masks differ.
+    """
+
+    def __init__(self, beam_rel: float = BEAM_REL_DEFAULT, scatter_lo: float = 1e-4,
+                 floor_keep_ratio: float = 0.03, field_multiplier: float = 2.0,
+                 floor_as_zero: bool = True, floor_value: float = 1e-8):
+        super().__init__(beam_rel=beam_rel, scatter_lo=scatter_lo, beam_keep_ratio=1.0,
+                         scatter_ratio=0.0, floor_ratio=0.0, field_multiplier=field_multiplier,
+                         floor_as_zero=floor_as_zero, floor_value=floor_value)
+        assert 0.0 <= floor_keep_ratio <= 1.0, "floor_keep_ratio must be in [0, 1]"
+        self.floor_keep_ratio = float(floor_keep_ratio)
+
+    def _keep_masks(self, direct: torch.Tensor, joined: torch.Tensor):
+        beam, scatter, floor = compute_roi_masks(direct, joined, self.beam_rel, self.scatter_lo)
+        keep_floor = self._subsample(floor, int(round(self.floor_keep_ratio * int(floor.sum()))))
+        return beam | scatter, keep_floor
+
+    def get_parameters(self) -> dict[str, float]:
+        return {
+            "beam_rel": self.beam_rel,
+            "scatter_lo": self.scatter_lo,
+            "floor_keep_ratio": self.floor_keep_ratio,
+            "field_multiplier": self.field_multiplier,
+            "floor_as_zero": self.floor_as_zero,
+            "floor_value": self.floor_value,
         }
