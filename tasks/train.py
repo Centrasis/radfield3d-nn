@@ -19,14 +19,25 @@ class TrainTask(Task):
         # loss: the SMAPEBalanced loss decouples from the physical metric (the loss plateaus/rises
         # while accuracy keeps climbing), so a val_raw_loss monitor stops runs early and picks
         # non-best checkpoints (e.g. the roi_full run was cut at epoch 54 = warmup + patience).
+        # On a JOINED dataset the scatter-isolation metric does not exist; monitor the whole-field
+        # GLOBAL air-kerma accuracy. NOT top90: top90 is beam-core-biased and decouples from the
+        # SMAPEBalanced loss (peaks in the first epochs, then decays while global accuracy and
+        # spectrum accuracy keep improving — ds04-analytical run wrm56i5b: top90 best 0.711@ep10
+        # but global 0.42@ep10 vs 0.69@ep47).
+        import glob as _glob
+        from RadFiled3D.utils import FieldStore as _FieldStore
+        _probe = sorted(_glob.glob(os.path.join(dataset_path, "fields", "*.rf3")))
+        _joined = bool(_probe) and not all(
+            c in _FieldStore.load(_probe[0]).get_channel_names() for c in ("scatter_field", "direct_beam"))
+        monitor = "val_global_airkerma_accuracy" if _joined else "val_airkerma_accuracy_scatter"
         return [
-            WarmupEarlyStopping(monitor="val_airkerma_accuracy_scatter", patience=max(epochs // 5, 3), mode="max", warmup_epochs=epochs // 3),
+            WarmupEarlyStopping(monitor=monitor, patience=max(epochs // 5, 3), mode="max", warmup_epochs=epochs // 3),
             ModelCheckpoint(
                 dirpath=os.path.join(logs_path, "models"),
-                filename=f"{model_name}-" + '{epoch}-{val_airkerma_accuracy_scatter:.3f}',
+                filename=f"{model_name}-{{epoch}}-{{{monitor}:.3f}}",
                 save_last=True,
                 save_top_k=1,
-                monitor="val_airkerma_accuracy_scatter",
+                monitor=monitor,
                 mode="max",
             ),
             ValidationPlotter(

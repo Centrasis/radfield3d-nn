@@ -8,10 +8,10 @@ from radfield3dnn.preprocessing.normalizations import NormalizerConstructor
 from .base import BaseNeuralRadFieldModel
 from .nerf import *
 from .nerf_cpp import *
+from .nerf_translation import *
 from .feedforward import *
 from .field_unet import *
 from radfield3dnn.rftypes import PositionalInput
-from enum import Enum
 
 
 class ModelConstructor:
@@ -108,29 +108,7 @@ class ModelConstructor:
         return model
 
 
-class ModelFormat(Enum):
-    ONNX = 0
-    TORCH_SCRIPT = 1
-    TENSOR_RT = 2
-
-
 class ModelExporter:
-    @staticmethod
-    def export(model: BaseNeuralRadFieldModel, path: str, format: ModelFormat = ModelFormat.ONNX):
-        {
-            ModelFormat.ONNX: ModelExporter.onnx_export,
-            ModelFormat.TORCH_SCRIPT: ModelExporter.ts_export,
-            ModelFormat.TENSOR_RT: ModelExporter.rt_export,
-        }[format](model, path)
-
-    @staticmethod
-    def rt_export(model, path):
-        raise NotImplementedError()
-
-    @staticmethod
-    def ts_export(model, path):
-        torch.jit.script(model.get_core_model()).save(path)
-
     @staticmethod
     def onnx_export(model: BaseNeuralRadFieldModel, path: str):
         class _OnnxWrapper(BaseNeuralRadFieldModel):
@@ -206,27 +184,67 @@ class ModelExporter:
                           dynamic_shapes=dyn, dynamo=True).save(path)
 
     @staticmethod
+    def onnx_export_encoding_config(model: BaseNeuralRadFieldModel, path: str):
+        """Export the region-configuration graph: (region_width) -> region_state.
+
+        Only meaningful for grid-resolution-aware location encoders (region_state_dims > 0). The
+        deploy-side runs this ONCE whenever the queried grid resolution changes (LOD) and feeds the
+        cached vector to every trunk call for that grid, so the resolution can change per inference
+        without re-exporting and without the consumer knowing the encoder's maths. ``region_width``
+        is one voxel of the queried grid in the model's coordinate frame (see
+        ``FeedforwardPointwiseModel.voxel_width_in_encoder_frame``).
+        """
+        enc = model.get_core_model().positional_location_encoding
+
+        class _RegionConfig(BaseNeuralRadFieldModel):
+            def __init__(self, e):
+                super().__init__()
+                self._e = e
+            def forward(self, region_width):
+                return self._e.compute_region_state(region_width)
+
+        example = torch.tensor(2.0 / 64, device=model.device, dtype=torch.float32)
+        torch.onnx.export(model=_RegionConfig(enc), args=(example,),
+                          input_names=["region_width"], output_names=["region_state"],
+                          dynamo=True).save(path)
+
+    @staticmethod
     def onnx_export_trunk(model: BaseNeuralRadFieldModel, path: str):
-        """Export the trunk: (position, latent) -> flux + spectrum (beam encoder bypassed)."""
+        """Export the trunk: (position, latent [, region_state]) -> flux + spectrum.
+
+        ``region_state`` is present only for grid-resolution-aware location encoders; it comes from
+        the encoding-config graph and stays constant for as long as the queried grid does.
+        """
         core = model.get_core_model()
         inp = model._generate_random_input(model.device)
         inp = getattr(inp, "input", inp)
         with torch.no_grad():
             latent = core.encode_additional_parameters(inp)  # example [B, d_model]
+        state_dims = model.deploy_interface().region_state_dims
 
         class _Trunk(BaseNeuralRadFieldModel):
             def __init__(self, d):
                 super().__init__()
                 self._d = d
-            def forward(self, position, latent):
+            def forward(self, position, latent, region_state=None):
                 return self._d.forward(PositionalInput(
                     direction=torch.zeros_like(position), origin=position[..., :1] * 0,
                     spectrum=position[..., :1] * 0, position=position),
-                    global_parameters=latent)
+                    global_parameters=latent, region_state=region_state)
 
-        # Dynamic batch on BOTH inputs: position rows vary per inner batch at deploy time, and the
-        # latent is broadcast to the same row count by the caller.
+        # Dynamic batch on the per-voxel inputs: position rows vary per inner batch at deploy time,
+        # and the latent is broadcast to the same row count by the caller. region_state is per-GRID
+        # (not per-row), so it carries no batch axis.
         batch = torch.export.Dim("batch")
-        torch.onnx.export(model=_Trunk(core), args=(inp.position, latent),
-                          input_names=["position", "latent"],
-                          dynamic_shapes=({0: batch}, {0: batch}), dynamo=True).save(path)
+        args = (inp.position, latent)
+        names = ["position", "latent"]
+        dyn = ({0: batch}, {0: batch})
+        if state_dims > 0:
+            with torch.no_grad():
+                state = core.positional_location_encoding.compute_region_state(
+                    torch.tensor(2.0 / 64, device=model.device, dtype=torch.float32))
+            args = args + (state,)
+            names = names + ["region_state"]
+            dyn = dyn + (None,)
+        torch.onnx.export(model=_Trunk(core), args=args, input_names=names,
+                          dynamic_shapes=dyn, dynamo=True).save(path)

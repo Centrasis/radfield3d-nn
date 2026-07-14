@@ -21,6 +21,24 @@ namespace io {
 // self-describing and forward-compatible: a reader reads the type + the entry's byte length and
 // either deserialises the payload it understands or skips those bytes — so existing metadata can
 // gain new range kinds without breaking older readers (they just iterate the names).
+// Which collimation the model's beam is described by. Fixes what BeamCollimation's parameter
+// tensor means and how wide it is (Rectangle -> (w,h); Cone -> (angle); Ellipsoid -> (a,b)).
+enum class CollimationType : uint8_t {
+    None      = 0,
+    Rectangle = 1,   // 2 params: field size (w, h) at the isocentre, metres
+    Cone      = 2,   // 1 param : opening angle, degrees
+    Ellipsoid = 3,   // 2 params: opening angles (a, b), degrees
+};
+
+inline int collimation_dims(CollimationType t) {
+    switch (t) {
+        case CollimationType::Rectangle: return 2;
+        case CollimationType::Cone:      return 1;
+        case CollimationType::Ellipsoid: return 2;
+        default:                         return 0;
+    }
+}
+
 enum class ParameterRangeType : uint8_t {
     MinMax   = 0,   // a [min, max] interval (+ unit): direction, distance, opening angle, …
     Spectrum = 1,   // a histogram range [min, max] with a fixed bin_width (+ unit): the tube spectrum
@@ -56,6 +74,9 @@ struct BeamParameter {
 struct ModelDomain {
     int                        spectrum_bins = 0;            // output spectrum histogram bins …
     float                      spectrum_max_energy_ev = 0.f; // … bin i spans [i, i+1)·max/bins eV
+    int                        angular_phi_segments = 0;     // AngularFlux resolution; 0 = no angular
+    int                        angular_theta_segments = 0;   //   output (phi x theta segments/voxel)
+    CollimationType            collimation = CollimationType::None;  // kind of BeamCollimation input
     std::array<float, 3>       field_dimensions_m{ {0.f, 0.f, 0.f} }; // metric field box (m); 0 = unknown
     std::vector<BeamParameter> beam_parameters;              // ordered model input-vector layout
 };

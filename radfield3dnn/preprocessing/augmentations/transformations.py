@@ -94,19 +94,14 @@ class UniformRotation(DataProcessing):
                 input = input_data.input
             else:
                 dir = input_data.input.direction.unsqueeze(0)
-                input = DirectionalInput(
+                input = input_data.input._replace(
                     direction=F.normalize(
                         torch.matmul(
                             dir,
                             R[:, :3, :3]  # Use only the 3x3 rotation part
                         ),
                         p=2, dim=-1
-                    ).squeeze(0),
-                    spectrum=input_data.input.spectrum if input_data.input.spectrum is not None else None,
-                    origin=input_data.input.origin if input_data.input.origin is not None else None,
-                    geometry=input_data.input.geometry if input_data.input.geometry is not None else None,
-                    beam_shape_parameters=input_data.input.beam_shape_parameters if input_data.input.beam_shape_parameters is not None else None,
-                    beam_shape_type=input_data.input.beam_shape_type if input_data.input.beam_shape_type is not None else None
+                    ).squeeze(0)
                 )
 
             input_data = TrainingInputData(

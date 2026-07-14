@@ -49,33 +49,34 @@ class AsinhTonemapNormalizer(Normalizer):
                 f"Minimum: {xf.min().item()}."
             )
 
+    # No torch.no_grad(): the transform also runs on predictions (two-head join path); a no_grad
+    # wrapper would detach them from the loss. GT tensors carry no grad either way.
     def apply_transformation(self, x: Tensor, respect_to: Union[Tensor, None]) -> Tensor:
         if respect_to is not None and not isinstance(respect_to, Tensor):
             raise TypeError("respect_to must be a Tensor when normalizing a Tensor.")
-        with torch.no_grad():
-            in_dtype = x.dtype
-            finite = torch.isfinite(x)
-            if not finite.all():
-                out = x.clone()
-                xv = x[finite]
-            else:
-                out = None
-                xv = x
-            self.validate_range(xv)
-            # Promote to fp32 for the asinh — fp16 asinh of tiny inputs
-            # underflows. The final cast back to in_dtype is bounded in
-            # [0, 1] and always representable in fp16.
-            xv32 = xv.to(torch.float32)
-            y = torch.asinh(xv32 / self.sigma) / self._scale
-            # Guarantee the [0, 1] codomain: asinh(x/σ)/asinh(1/σ) == 1 at x == 1 and exceeds 1 for
-            # x > 1, so clamp the upper end (the lower end is >= 0 since validate_range rejects x < 0).
-            y = torch.clamp(y, min=0.0, max=1.0)
-            assert torch.isfinite(y).all(), "Normalization resulted in non-finite values."
-            y = y.to(in_dtype)
-            if out is None:
-                return y
-            out[finite] = y
-            return out
+        in_dtype = x.dtype
+        finite = torch.isfinite(x)
+        if not finite.all():
+            out = x.clone()
+            xv = x[finite]
+        else:
+            out = None
+            xv = x
+        self.validate_range(xv)
+        # Promote to fp32 for the asinh — fp16 asinh of tiny inputs
+        # underflows. The final cast back to in_dtype is bounded in
+        # [0, 1] and always representable in fp16.
+        xv32 = xv.to(torch.float32)
+        y = torch.asinh(xv32 / self.sigma) / self._scale
+        # Guarantee the [0, 1] codomain: asinh(x/σ)/asinh(1/σ) == 1 at x == 1 and exceeds 1 for
+        # x > 1, so clamp the upper end (the lower end is >= 0 since validate_range rejects x < 0).
+        y = torch.clamp(y, min=0.0, max=1.0)
+        assert torch.isfinite(y).all(), "Normalization resulted in non-finite values."
+        y = y.to(in_dtype)
+        if out is None:
+            return y
+        out[finite] = y
+        return out
 
     def apply_inverse_transformation(self, x: Tensor, respect_to: Union[Tensor, None]) -> Tensor:
         if respect_to is not None and not isinstance(respect_to, Tensor):

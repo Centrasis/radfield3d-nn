@@ -80,14 +80,7 @@ class CropDataset(DataProcessing):
     
     def crop_input_data(self, input_data: DirectionalInput) -> DirectionalInput:
         if input_data.geometry is not None:
-            return DirectionalInput(
-                direction=input_data.direction,
-                spectrum=input_data.spectrum,
-                geometry=self.crop_tensor(input_data.geometry) if input_data.geometry is not None else None,
-                origin=input_data.origin if input_data.origin is not None else None,
-                beam_shape_parameters=input_data.beam_shape_parameters if input_data.beam_shape_parameters is not None else None,
-                beam_shape_type=input_data.beam_shape_type if input_data.beam_shape_type is not None else None
-            )
+            return input_data._replace(geometry=self.crop_tensor(input_data.geometry))
         return input_data
     
     def forward(self, x: Union[TrainingInputData, RadiationField]) -> Union[TrainingInputData, RadiationFieldChannel]:

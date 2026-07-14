@@ -33,8 +33,9 @@ class SinusoidalFrequencyEncoding(EncodingBase):
     def calc_encoded_dim(self) -> int:
         return 2 * self.pos_enc_dim * self.d_input + (self.d_input if self.append_input else 0)
 
-    def forward(self, x: Tensor) -> Tensor:
-        # x: (..., d_input)
+    def forward(self, x: Tensor, region_state: Tensor | None = None) -> Tensor:
+        # x: (..., d_input); region_state is unused by a point encoding
+
         assert x.shape[-1] == self.d_input, f"Input tensor last dim should be {self.d_input}, got {x.shape[-1]}"
         if self._use_tcnn:
             enc = self.encoding(x.contiguous()).to(x.dtype).contiguous()

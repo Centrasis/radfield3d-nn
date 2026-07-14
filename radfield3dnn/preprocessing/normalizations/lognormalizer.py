@@ -41,24 +41,25 @@ class LogNormalizer(LinearNormalizer):
         ref_norm = ref_log / log_max
         return log_max, ref_norm
 
+    # No torch.no_grad(): the transform also runs on predictions (two-head join path); a no_grad
+    # wrapper would detach them from the loss. GT tensors carry no grad either way.
     def apply_transformation(self, x: Tensor, respect_to: Union[Tensor, None]) -> Tensor:
-        with torch.no_grad():
-            if self.epsilon.device != x.device:
-                self.epsilon = self.epsilon.to(x.device)
-            if respect_to is not None and not isinstance(respect_to, Tensor):
-                raise TypeError("respect_to must be a Tensor when normalizing a Tensor.")
-            self.validate_range(x)
-            if respect_to is not None:
-                log_max, ref_for_linear = self._prepare_log_reference(
-                    respect_to, dtype=x.dtype, device=x.device
-                )
-            else:
-                log_max = self._default_log_max(dtype=x.dtype, device=x.device)
-                ref_for_linear = None
-            x = self.log(x)
-            x = x / log_max
-            assert torch.isfinite(x).all(), "Normalization resulted in non-finite values."
-            return super().apply_transformation(x, respect_to=ref_for_linear)
+        if self.epsilon.device != x.device:
+            self.epsilon = self.epsilon.to(x.device)
+        if respect_to is not None and not isinstance(respect_to, Tensor):
+            raise TypeError("respect_to must be a Tensor when normalizing a Tensor.")
+        self.validate_range(x)
+        if respect_to is not None:
+            log_max, ref_for_linear = self._prepare_log_reference(
+                respect_to, dtype=x.dtype, device=x.device
+            )
+        else:
+            log_max = self._default_log_max(dtype=x.dtype, device=x.device)
+            ref_for_linear = None
+        x = self.log(x)
+        x = x / log_max
+        assert torch.isfinite(x).all(), "Normalization resulted in non-finite values."
+        return super().apply_transformation(x, respect_to=ref_for_linear)
         
     def log(self, x: Tensor) -> Tensor:
         x = x * self.input_scale

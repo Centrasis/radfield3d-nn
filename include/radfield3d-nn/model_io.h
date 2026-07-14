@@ -21,7 +21,13 @@
 //
 // ── RF3M deployment container (little-endian) ────────────────────────────────
 //   [4]   magic "RF3M"
-//   [u32] version (== 2)
+//   [u32] backend  (ModelBackend; == 2 ONNX. 1 was tiny-cuda-nn, never shipped, rejected on load)
+//   [u32] version  (schema version WITHIN that backend; == 1)
+//   --- ModelInterface: WHAT the model consumes/produces (model_interface.h). Declared here when
+//       the model is STORED and used at LOAD to pick the executable predictor class and to check
+//       the domain below actually describes every resolution the flags promise. ---
+//   [u64] interface id ((inputs << 32) | outputs)
+//   [u8]  resolution_aware   [i32] region_state_dims   [f32] region_width_frame
 //   [u32 dataset_name_len][dataset_name bytes]
 //   [u32 software_version_len][software_version bytes]
 //   [u32 physics_len][physics bytes]
@@ -30,8 +36,11 @@
 //       across a dataset, so it is not a property of the model. ---
 //   [i32]     spectrum_bins              # output spectrum histogram bins
 //   [f32]     spectrum_max_energy_ev     # bin i spans [i, i+1)·max/bins eV
+//   [f32 x3]  field_dimensions_m         # the metric box [0,1]^3 positions map into
+//   [i32]     angular_phi_segments   [i32] angular_theta_segments   # AngularFlux resolution
+//   [u8]      collimation                # CollimationType; fixes the BeamCollimation input width
 //   [u32 n_beam_params]   then n_beam_params × a beam-parameter descriptor:
-//             [u32 name_len][name][i32 count][f32 range_min][f32 range_max][u32 unit_len][unit]
+//             [u32 name_len][name][u8 range_type][u32 payload_len][payload]
 //   --- metrics ---
 //   [u32 n_metrics]   then n_metrics × ([u32 key_len][key bytes][f32 value])
 //   --- payload (named ONNX graphs that compose the model) ---
@@ -40,8 +49,9 @@
 //             beam parameters): e.g. "beam_encoder", later "geometry_encoder". A monolithic
 //             model is a single graph (conventionally "trunk").
 //
-// The Python producer (radfield3dnn/deploy/model_packager.py) writes the *same* layout; this
-// header / model_io.cpp is the authoritative format definition.
+// There is exactly ONE writer: model_io.cpp. The Python producer
+// (radfield3dnn/deploy/model_packager.py) gathers the metadata and calls straight into it through
+// the `rfnn_deploy` bindings — it does not serialise anything itself.
 //
 #include <array>
 #include <cstddef>
@@ -51,7 +61,9 @@
 #include <string>
 #include <vector>
 
-#include <radfield3d-nn/model_domain.h>   // rfnn::io::{ParameterRange,BeamParameter,ModelDomain,ModelProvenance}
+#include <radfield3d-nn/model_domain.h>
+#include <radfield3d-nn/model_binding.h>   // radfield3dnn::Backend — the EP a caller asks for
+#include <radfield3d-nn/model_interface.h>   // rfnn::io::{ParameterRange,BeamParameter,ModelDomain,ModelProvenance}
 
 namespace radfield3dnn {
 class VolumeFieldPredictor;   // field_predictors.h (fwd-decl; base predictor, defined in the deploy lib)
@@ -70,14 +82,22 @@ inline constexpr const char* kTrunkGraph           = "trunk";             // con
 inline constexpr const char* kBeamEncoderGraph     = "beam_encoder";      // beam vector → latent
 inline constexpr const char* kGeometryEncoderGraph = "geometry_encoder";  // (future) geometry → latent
 
+// Which runtime the payload targets. The first header word has always discriminated this; it is
+// now named for what it does. TCNN was never shipped and is rejected on load.
+enum class ModelBackend : uint32_t { TCNN = 1, ONNX = 2 };
+
 class ModelStore {
 public:
     static constexpr char     kMagic[4] = {'R', 'F', '3', 'M'};
-    static constexpr uint32_t kVersion  = 2;
+    static constexpr ModelBackend kBackend = ModelBackend::ONNX;
+    static constexpr uint32_t     kVersion = 1;   // schema version within the ONNX backend
 
     // Build the RF3M container in memory (the single source of the byte layout). `graphs` is the
     // named set of ONNX graphs composing the model (at least a "trunk").
+    // `interface` is the model's DECLARATION of what it consumes/produces. It is validated against
+    // `domain` here, so a package can never promise an output whose resolution nobody recorded.
     static std::vector<uint8_t> save_to_memory(const NamedGraphs& graphs,
+                                               const radfield3dnn::ModelInterface& interface,
                                                const ModelDomain& domain,
                                                const ModelProvenance& provenance,
                                                const std::map<std::string, float>& metrics);
@@ -85,14 +105,15 @@ public:
     // Same, written straight to `path`.
     static void save(const std::string& path,
                      const NamedGraphs& graphs,
+                     const radfield3dnn::ModelInterface& interface,
                      const ModelDomain& domain,
                      const ModelProvenance& provenance,
                      const std::map<std::string, float>& metrics);
 
     // Parse a package AND build its runnable predictor in one step (no intermediate handle, never
-    // touching disk for the graphs). The "trunk" graph type decides the predictor: a per-voxel
-    // trunk -> VoxelFieldPredictor (wired with the "beam_encoder" graph if present); a field-wise
-    // trunk -> VolumeFieldPredictor (trunk only). The package's domain (parameter ranges applied),
+    // touching disk for the graphs). The DECLARED interface decides the predictor: ModelInput::Position
+    // set -> VoxelFieldPredictor (wired with the "beam_encoder" graph if present); clear ->
+    // VolumeFieldPredictor (trunk only). The trunk graph is cross-checked against the declaration. The package's domain (parameter ranges applied),
     // provenance, metrics and graph names are carried ON the returned predictor (see its
     // domain()/provenance()/metrics()/graph_names()). Dynamic type is VoxelFieldPredictor for
     // per-voxel models; the static return type is the base.
@@ -110,14 +131,23 @@ public:
     static std::unique_ptr<radfield3dnn::VolumeFieldPredictor>
         load(const std::string& path, const radfield3dnn::ExecutionOptions& exec);
 
+    // Request an execution provider by name/enum — the same vocabulary Python's
+    // load_rf3m(backend=...) uses, because it IS this function. A backend fixes which memory the
+    // model can bind with no copy, so ask for the one your buffers already live on.
+    static std::unique_ptr<radfield3dnn::VolumeFieldPredictor>
+        load(const std::string& path, radfield3dnn::Backend backend);
+    static std::unique_ptr<radfield3dnn::VolumeFieldPredictor>
+        load_from_memory(const void* bytes, size_t n, radfield3dnn::Backend backend);
+
     // The package metadata that lives in the RF3M header, ahead of the ONNX graphs.
     struct PackageMetadata {
         ModelProvenance              provenance;
         ModelDomain                  domain;
         std::map<std::string, float> metrics;
+        radfield3dnn::ModelInterface interface;   // what the model consumes/produces
     };
 
-    // Read ONLY the metadata header (provenance + domain + metrics) — WITHOUT loading the ONNX graphs
+    // Read ONLY the metadata header (interface + provenance + domain + metrics) — WITHOUT loading the ONNX graphs
     // or building a runnable predictor (no ONNX Runtime session). The graphs are serialised last, so
     // this stops before them. Use this for UI / metadata display; it is cheap and must never touch ORT.
     // (Predictor *type* — voxel vs volume — is NOT here; it needs the trunk graph, i.e. a real load.)

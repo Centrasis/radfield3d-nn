@@ -30,48 +30,49 @@ class LinearNormalizer(Normalizer):
         if min_2nd < self.min_input:
             raise ValueError(f"Input to LinearNormalizer has too small values. Minimum: {x_min.item()}, 2nd minimum: {min_2nd.item()}. Consider using a different normalization range or a different normalizer.")
 
+    # No torch.no_grad() here: the transforms also run on PREDICTIONS (two-head models join their
+    # prediction via inverse -> ChannelsJoin -> forward), so a no_grad wrapper would detach the flux
+    # from the loss. Ground-truth tensors carry no grad, so nothing is built for them either way.
     def apply_transformation(self, x: Tensor, respect_to: Union[Tensor, None]) -> Tensor:
-        with torch.no_grad():
-            valid_mask = torch.isfinite(x)
-            if not valid_mask.all():
-                # Masked fields are scaled by the batch-GLOBAL max over finite voxels: the model
-                # predicts in [0,1] and is inverted with respect_to=None (identity), so the [0,1]
-                # target must keep absolute magnitude consistent across the batch. Per-sample scaling
-                # stretches every field to [0,1] and destroys the cross-field magnitude the air-kerma
-                # metric needs. Do NOT replace with per-sample reductions.
-                orig_values = x.clone()
-                x = x[valid_mask]
-                if x.numel() == 0:
-                    return torch.full_like(orig_values, self.range[0])
-            if self.always_normalize:
-                x = x - torch.amin(x, dim=tuple(range(1, x.ndim)), keepdim=True)
+        valid_mask = torch.isfinite(x)
+        if not valid_mask.all():
+            # Masked fields are scaled by the batch-GLOBAL max over finite voxels: the model
+            # predicts in [0,1] and is inverted with respect_to=None (identity), so the [0,1]
+            # target must keep absolute magnitude consistent across the batch. Per-sample scaling
+            # stretches every field to [0,1] and destroys the cross-field magnitude the air-kerma
+            # metric needs. Do NOT replace with per-sample reductions.
+            orig_values = x.clone()
+            x = x[valid_mask]
+            if x.numel() == 0:
+                return torch.full_like(orig_values, self.range[0])
+        if self.always_normalize:
+            x = x - torch.amin(x, dim=tuple(range(1, x.ndim)), keepdim=True)
 
-            x_min = 0.0 if respect_to is None else torch.amin(respect_to, dim=tuple(range(1, respect_to.ndim)), keepdim=True)
-            assert x.min() >= x_min, f"Input to LinearNormalizer must be >= {x_min}, but minimum value is {x.min().item()}."
-            max = torch.amax(respect_to, dim=tuple(range(1, respect_to.ndim)), keepdim=True).clamp_min(1e-12) if respect_to is not None else torch.amax(x, dim=tuple(range(1, x.ndim)), keepdim=True).clamp_min(1e-12)
-            if respect_to is None:
-                x = x - x_min
-                max = max - x_min
-            normalized = x / max
-            normalized = normalized * (self.range[1] - self.range[0]) + self.range[0]
-            assert torch.isfinite(normalized).all(), "Normalization resulted in non-finite values."
-            if not valid_mask.all():
-                orig_values[valid_mask] = normalized
-                normalized = orig_values
-            return normalized
+        x_min = 0.0 if respect_to is None else torch.amin(respect_to, dim=tuple(range(1, respect_to.ndim)), keepdim=True)
+        assert x.min() >= x_min, f"Input to LinearNormalizer must be >= {x_min}, but minimum value is {x.min().item()}."
+        max = torch.amax(respect_to, dim=tuple(range(1, respect_to.ndim)), keepdim=True).clamp_min(1e-12) if respect_to is not None else torch.amax(x, dim=tuple(range(1, x.ndim)), keepdim=True).clamp_min(1e-12)
+        if respect_to is None:
+            x = x - x_min
+            max = max - x_min
+        normalized = x / max
+        normalized = normalized * (self.range[1] - self.range[0]) + self.range[0]
+        assert torch.isfinite(normalized).all(), "Normalization resulted in non-finite values."
+        if not valid_mask.all():
+            orig_values[valid_mask] = normalized
+            normalized = orig_values
+        return normalized
 
     def apply_inverse_transformation(self, x: Tensor, respect_to: Union[Tensor, None]) -> Tensor:
-        with torch.no_grad():
-            valid_mask = torch.isfinite(x)
-            if not valid_mask.all():
-                # Clone like apply_transformation does — writing into `x` directly would mutate the
-                # caller's tensor in place (metrics evaluated after the inverse would see corrupted values).
-                orig_values = x.clone()
-                x = x[valid_mask]
-            x = (x - self.range[0]) / (self.range[1] - self.range[0])
-            max = torch.amax(respect_to, dim=tuple(range(1, respect_to.ndim)), keepdim=True) if respect_to is not None else 1.0
-            x = x * max
-            if not valid_mask.all():
-                orig_values[valid_mask] = x
-                x = orig_values
-            return x
+        valid_mask = torch.isfinite(x)
+        if not valid_mask.all():
+            # Clone like apply_transformation does — writing into `x` directly would mutate the
+            # caller's tensor in place (metrics evaluated after the inverse would see corrupted values).
+            orig_values = x.clone()
+            x = x[valid_mask]
+        x = (x - self.range[0]) / (self.range[1] - self.range[0])
+        max = torch.amax(respect_to, dim=tuple(range(1, respect_to.ndim)), keepdim=True) if respect_to is not None else 1.0
+        x = x * max
+        if not valid_mask.all():
+            orig_values[valid_mask] = x
+            x = orig_values
+        return x

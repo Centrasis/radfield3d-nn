@@ -243,7 +243,9 @@ class Beam2ScatterUNet(DeConvBase):
             nn.Identity() for _ in range(len(self.up_sampler) - 1)
         ])
 
-        self.spectra_activation = HistogramNormalize(dim=-1)
+        # Volumetric output is (B, bins, X, Y, Z): the histogram-bin axis is dim 1, matching the GT
+        # convention and HistogramLoss(bin_dim=1). dim=-1 would normalize each line along Z instead.
+        self.spectra_activation = HistogramNormalize(dim=1)
         if issubclass(self._normalizer.__class__, LinearNormalizer):
             if self._normalizer.range[0] == -1.0 and self._normalizer.range[1] == 1.0:
                 self.flux_activation = GradientConservingClamping(-1.0, 1.0) #SmoothedTanh() # nn.Softplus()  # to allow for high dynamic range
@@ -317,7 +319,12 @@ class Beam2ScatterUNet(DeConvBase):
         padding_l = padding_difference // 2
         padding_r = padding_difference - padding_l
 
-        padded_xray_flux = nn.functional.pad(batch.ground_truth.direct_beam.flux, (
+        # The samplers mark non-sampled voxels with -inf; as network INPUT that would NaN-poison the
+        # whole volume through the conv stack, so zero them here (the -inf convention only applies
+        # to the training TARGET, which forward2volume_from_training_input re-masks on the output).
+        xray_flux = batch.ground_truth.direct_beam.flux
+        xray_flux = torch.where(torch.isfinite(xray_flux), xray_flux, torch.zeros_like(xray_flux))
+        padded_xray_flux = nn.functional.pad(xray_flux, (
             padding_l[2], padding_r[2], padding_l[1], padding_r[1], padding_l[0], padding_r[0]
         ), mode='constant', value=0.0)
         voxel_map = self.generate_voxelmap3d(padding_target_dims, None, batch.input.direction.device)

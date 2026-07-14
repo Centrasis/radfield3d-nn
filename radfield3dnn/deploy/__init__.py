@@ -7,12 +7,13 @@ from radfield3dnn.deploy.model_packager import ModelPackager
 # compiled `rfnn_deploy` bindings to be built.
 
 
-def load_rf3m(path: str, use_cuda: bool = False):
-    """Load an RF3M package via the C++ ONNX deployment bindings (rfnn_deploy) straight to the
-    runnable predictor. Imported lazily so importing :mod:`radfield3dnn.deploy` never requires the
-    compiled deploy module to be built."""
+def load_rf3m(path: str, backend: str = "cpu"):
+    """Load an RF3M package via the C++ deployment bindings (rfnn_deploy) straight to the runnable
+    predictor. ``backend`` ("cpu" | "cuda" | "tensorrt") picks the execution provider, and therefore
+    which memory the model can bind without a copy. Imported lazily, so importing
+    :mod:`radfield3dnn.deploy` never requires the compiled module to be built."""
     from radfield3dnn.deploy.onnx_runtime import load_rf3m as _load
-    return _load(path, use_cuda=use_cuda)
+    return _load(path, backend=backend)
 
 
 def __getattr__(name: str):

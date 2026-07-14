@@ -1,13 +1,16 @@
 name: Release (PyPI)
 
-#  NOT ARMED. Packaging is prepared but publishing is intentionally disabled.
-
-
+# Tag x.y.z -> validate the tag -> run the FULL deploy test suite (C++ ctest + Python pytest, both
+# OSes, all three Pythons) -> only then build wheels/sdist -> publish to PyPI.
+#
+# Nothing is packaged, and nothing is published, unless every test job passed: build-wheels and
+# build-sdist both `needs: test`, and a failed `needs` job skips its dependents, so a red test
+# cannot reach PyPI. workflow_dispatch runs the same path as a dry run (no tag -> dev version).
 on:
   workflow_dispatch:
-  # push:
-  #   tags:
-  #     - '[0-9]+.[0-9]+.[0-9]+'
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
 
 concurrency:
   group: release-${{ github.ref }}
@@ -32,12 +35,18 @@ jobs:
           fi
           echo "Release tag '${GITHUB_REF_NAME}' OK."
 
+  # THE GATE. Runs tests.yml as-is (C++ ctest + Python pytest across Linux/Windows x py3.12-3.14).
+  # Reused, not restated, so a release can never test something different from what CI tests.
+  test:
+    needs: validate-tag
+    uses: ./.github/workflows/tests.yml
+
   # One self-contained wheel per OS × Python: the deploy extension is a compiled,
   # platform-specific module, and ONNX Runtime (CPU build) is vendored into the wheel by
   # auditwheel (Linux) / delvewheel (Windows) — each renames the bundled lib with a unique
   # hash so it can never clash with a separately-installed `onnxruntime` in the same process.
   build-wheels:
-    needs: validate-tag
+    needs: [validate-tag, test]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -115,7 +124,7 @@ jobs:
           if-no-files-found: error
 
   build-sdist:
-    needs: validate-tag
+    needs: [validate-tag, test]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

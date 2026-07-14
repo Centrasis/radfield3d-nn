@@ -26,6 +26,11 @@ namespace cuda_vk {
 // VkPhysicalDevice UUID, 16 bytes) exists. Lets the caller pick this exporter or fall back to host-copy.
 bool is_available(const uint8_t device_uuid[16]);
 
+// The CUDA device ordinal matching a Vulkan physical-device UUID, -1 if none. Pass it as
+// ExecutionOptions::device_id so the inference session executes on the device the Vulkan
+// resources live on (VulkanBufferTarget / import_target both resolve through this).
+int cuda_device_for_uuid(const uint8_t device_uuid[16]);
+
 // One imported export target: an external Vulkan image (R32F or R16F, dims voxels) + a timeline semaphore,
 // both imported into CUDA on the device matching `device_uuid`. Opaque; created by import_target().
 struct ImportedTarget;

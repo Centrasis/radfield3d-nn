@@ -19,7 +19,7 @@ DIFFERENT parts of the scatter ROI each repeat while always re-seeing the beam.
 import torch
 from RadFiled3D.pytorch.datasets.processing import DataProcessing
 
-from radfield3dnn.rftypes import AirKermaField, TrainingInputData, RadiationFieldChannel, RadiationField
+from radfield3dnn.rftypes import AirKermaField, TrainingInputData, RadiationFieldChannel, RadiationField, rf3RadiationField
 from radfield3dnn.roi import compute_roi_masks, BEAM_REL_DEFAULT, SCATTER_LO_DEFAULT
 
 
@@ -120,7 +120,7 @@ class ROIbasedSampler(DataProcessing):
         # so deriving from it would compute the beam ROI from joined flux (no direct channel) and shrink
         # the scatter region — under-sampling the low-flux scatter.
         gt = x.original_ground_truth if x.original_ground_truth is not None else x.ground_truth
-        if isinstance(gt, RadiationField):
+        if isinstance(gt, (RadiationField, rf3RadiationField)):
             scatter_flux = gt.scatter_field.flux if gt.scatter_field is not None else None
             direct_flux = gt.direct_beam.flux if gt.direct_beam is not None else None
             if direct_flux is None and scatter_flux is None:
@@ -162,7 +162,7 @@ class ROIbasedSampler(DataProcessing):
             return ch._replace(flux=_apply(ch.flux, drop_mask, zero_mask), spectrum=spec)
 
         tgt = x.ground_truth
-        if isinstance(tgt, RadiationField):
+        if isinstance(tgt, (RadiationField, rf3RadiationField)):
             new_gt = tgt._replace(scatter_field=_mask_channel(tgt.scatter_field),
                                   direct_beam=_mask_channel(tgt.direct_beam))
         elif isinstance(tgt, RadiationFieldChannel):

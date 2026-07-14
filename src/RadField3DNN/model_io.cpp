@@ -101,6 +101,10 @@ void put_domain(std::ostream& os, const ModelDomain& d) {
     put<float>(os, d.field_dimensions_m[0]);
     put<float>(os, d.field_dimensions_m[1]);
     put<float>(os, d.field_dimensions_m[2]);
+    // Resolutions the interface flags depend on (AngularFlux; the BeamCollimation tensor width).
+    put<int32_t>(os, d.angular_phi_segments);
+    put<int32_t>(os, d.angular_theta_segments);
+    put<uint8_t>(os, static_cast<uint8_t>(d.collimation));
     // Beam parameters: a name -> typed-range map. Each entry is self-describing (type + byte length
     // + payload) so a reader can deserialise by type or skip the payload and just read the names.
     put<uint32_t>(os, static_cast<uint32_t>(d.beam_parameters.size()));
@@ -119,6 +123,9 @@ ModelDomain get_domain(std::istream& is) {
     d.field_dimensions_m[0] = get<float>(is);
     d.field_dimensions_m[1] = get<float>(is);
     d.field_dimensions_m[2] = get<float>(is);
+    d.angular_phi_segments = get<int32_t>(is);
+    d.angular_theta_segments = get<int32_t>(is);
+    d.collimation = static_cast<CollimationType>(get<uint8_t>(is));
     const uint32_t n = get<uint32_t>(is);
     d.beam_parameters.reserve(n);
     for (uint32_t i = 0; i < n; ++i) {
@@ -135,15 +142,62 @@ ModelDomain get_domain(std::istream& is) {
     return d;
 }
 
+void put_interface(std::ostream& os, const radfield3dnn::ModelInterface& i) {
+    put<uint64_t>(os, i.id());                       // (inputs << 32) | outputs
+    put<uint8_t>(os, i.resolution_aware ? 1u : 0u);
+    put<int32_t>(os, i.region_state_dims);
+    put<float>(os, i.region_width_frame);
+}
+radfield3dnn::ModelInterface get_interface(std::istream& is) {
+    radfield3dnn::ModelInterface i;
+    const uint64_t id = get<uint64_t>(is);
+    i.inputs  = static_cast<radfield3dnn::ModelInput>(static_cast<uint32_t>(id >> 32));
+    i.outputs = static_cast<radfield3dnn::ModelOutput>(static_cast<uint32_t>(id & 0xffffffffull));
+    i.resolution_aware  = get<uint8_t>(is) != 0u;
+    i.region_state_dims = get<int32_t>(is);
+    i.region_width_frame = get<float>(is);
+    return i;
+}
+
+// Read + check the two header words. A pre-migration package has no `version` word, so its
+// dataset-name length lands where the version belongs and will not read as kVersion — say so
+// instead of failing later with a garbled parse.
+void check_header(std::istream& is) {
+    char magic[4]; is.read(magic, 4);
+    if (!is || std::memcmp(magic, ModelStore::kMagic, 4) != 0)
+        throw std::runtime_error("model_io: bad magic (not an RF3M package)");
+    const auto backend = static_cast<ModelBackend>(get<uint32_t>(is));
+    if (backend == ModelBackend::TCNN)
+        throw std::runtime_error("model_io: package targets the tiny-cuda-nn backend, which is not "
+                                 "supported (deployment is ONNX only)");
+    if (backend != ModelStore::kBackend)
+        throw std::runtime_error("model_io: unknown RF3M backend "
+                                 + std::to_string(static_cast<uint32_t>(backend)));
+    const uint32_t version = get<uint32_t>(is);
+    if (version != ModelStore::kVersion)
+        throw std::runtime_error(
+            "model_io: unsupported RF3M schema version " + std::to_string(version)
+            + " (expected " + std::to_string(ModelStore::kVersion) + "). A package written before "
+              "the interface was added to the header reads like this — migrate it with "
+              "scripts/convert_rf3m.py");
+}
+
 }  // namespace
 
 std::vector<uint8_t> ModelStore::save_to_memory(const NamedGraphs& graphs,
+                                                  const radfield3dnn::ModelInterface& interface,
                                                   const ModelDomain& domain,
                                                   const ModelProvenance& provenance,
                                                   const std::map<std::string, float>& metrics) {
+    // The declaration must describe something the domain can actually shape. Checked HERE so a
+    // broken package is never written, not discovered by a consumer months later.
+    interface.validate(domain);
+
     std::ostringstream os(std::ios::binary);
     os.write(kMagic, 4);
+    put<uint32_t>(os, static_cast<uint32_t>(kBackend));
     put<uint32_t>(os, kVersion);
+    put_interface(os, interface);
     put_str(os, provenance.dataset_name);
     put_str(os, provenance.software_version);
     put_str(os, provenance.physics);
@@ -162,10 +216,11 @@ std::vector<uint8_t> ModelStore::save_to_memory(const NamedGraphs& graphs,
 
 void ModelStore::save(const std::string& path,
                         const NamedGraphs& graphs,
+                        const radfield3dnn::ModelInterface& interface,
                         const ModelDomain& domain,
                         const ModelProvenance& provenance,
                         const std::map<std::string, float>& metrics) {
-    const std::vector<uint8_t> bytes = save_to_memory(graphs, domain, provenance, metrics);
+    const std::vector<uint8_t> bytes = save_to_memory(graphs, interface, domain, provenance, metrics);
     std::ofstream os(path, std::ios::binary | std::ios::trunc);
     if (!os) throw std::runtime_error("model_io: cannot open '" + path + "' for writing");
     os.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
@@ -177,12 +232,8 @@ ModelStore::load_from_memory(const void* bytes, size_t n, const radfield3dnn::Ex
     const std::string buf(static_cast<const char*>(bytes), n);
     std::istringstream is(buf, std::ios::binary);
 
-    char magic[4]; is.read(magic, 4);
-    if (!is || std::memcmp(magic, kMagic, 4) != 0)
-        throw std::runtime_error("model_io: bad magic (not an RF3M package)");
-    const uint32_t version = get<uint32_t>(is);
-    if (version != kVersion)
-        throw std::runtime_error("model_io: unsupported RF3M version " + std::to_string(version));
+    check_header(is);
+    const radfield3dnn::ModelInterface interface = get_interface(is);
 
     // ── parse the container ──────────────────────────────────────────────────────────────────
     rfnn::io::ModelProvenance provenance;
@@ -190,6 +241,8 @@ ModelStore::load_from_memory(const void* bytes, size_t n, const radfield3dnn::Ex
     provenance.software_version = get_str(is);
     provenance.physics          = get_str(is);
     const rfnn::io::ModelDomain domain = get_domain(is);
+    interface.validate(domain);   // the same gate as save(): reject reserved bits / a domain that
+                                  // cannot shape what the declaration promises
 
     std::map<std::string, float> metrics;
     const uint32_t n_metrics = get<uint32_t>(is);
@@ -237,8 +290,31 @@ ModelStore::load_from_memory(const void* bytes, size_t n, const radfield3dnn::Ex
         trunk.data(), trunk.size(), exec);
     apply_ranges(*trunk_pred);  // single-graph models bind the beam params on the trunk
 
+    // A resolution-aware model's trunk takes a third input (`region_state`) whose value depends on
+    // the grid the consumer chooses. run_positions() binds position + the broadcast latent and
+    // nothing else, so it would bind the latent onto region_state and fail inside Run() with a shape
+    // error that says nothing. Refuse here, where the reason is knowable.
+    if (interface.resolution_aware)
+        throw std::runtime_error(
+            "model_io: this package declares a resolution-aware location encoder (region_state_dims="
+            + std::to_string(interface.region_state_dims) + "). Its trunk needs a `region_state` "
+            "input that this runtime does not bind yet, so it cannot be executed. Export the model "
+            "with a region-agnostic location encoder (e.g. 'sinusoidal', or 'ipe' without "
+            "auto_region_width) until the runtime supports it.");
+
+    // The declared ModelInput::Position bit — not a guess from the graph's input names — decides
+    // which executable class this package becomes. The graph is cross-checked against it, so a
+    // mislabelled package fails loudly at load instead of silently running the wrong predictor.
+    if (interface.is_voxelwise() != trunk_pred->is_voxelwise())
+        throw std::runtime_error(
+            std::string("model_io: the package declares a ") 
+            + (interface.is_voxelwise() ? "per-voxel" : "whole-volume")
+            + " model, but its trunk graph is a "
+            + (trunk_pred->is_voxelwise() ? "per-voxel" : "whole-volume")
+            + " graph (ModelInput::Position disagrees with the trunk's inputs)");
+
     std::unique_ptr<radfield3dnn::VolumeFieldPredictor> predictor;
-    if (!trunk_pred->is_voxelwise()) {
+    if (!interface.is_voxelwise()) {
         predictor = std::move(trunk_pred);
     } else {
         std::shared_ptr<radfield3dnn::VolumeFieldPredictor> encoder;
@@ -253,7 +329,7 @@ ModelStore::load_from_memory(const void* bytes, size_t n, const radfield3dnn::Ex
     }
 
     predictor->set_package_metadata(domain, std::move(provenance), std::move(metrics),
-                                    std::move(graph_names));
+                                    std::move(graph_names), interface);
     return predictor;
 }
 
@@ -280,20 +356,35 @@ ModelStore::load(const std::string& path, bool use_cuda) {
     return load(path, radfield3dnn::ExecutionOptions{.use_gpu = use_cuda});
 }
 
+// The single definition of what each backend means. Python's load_rf3m(backend=...) calls straight
+// into this, so the two languages cannot drift on what "cuda" selects.
+static radfield3dnn::ExecutionOptions options_for(radfield3dnn::Backend b) {
+    radfield3dnn::ExecutionOptions e;
+    e.use_gpu      = (b != radfield3dnn::Backend::Cpu);
+    e.use_tensorrt = (b == radfield3dnn::Backend::TensorRT);
+    return e;
+}
+
+std::unique_ptr<radfield3dnn::VolumeFieldPredictor>
+ModelStore::load(const std::string& path, radfield3dnn::Backend backend) {
+    return load(path, options_for(backend));
+}
+
+std::unique_ptr<radfield3dnn::VolumeFieldPredictor>
+ModelStore::load_from_memory(const void* bytes, size_t n, radfield3dnn::Backend backend) {
+    return load_from_memory(bytes, n, options_for(backend));
+}
+
 ModelStore::PackageMetadata
 ModelStore::read_metadata_from_memory(const void* bytes, size_t n) {
     const std::string buf(static_cast<const char*>(bytes), n);
     std::istringstream is(buf, std::ios::binary);
 
-    char magic[4]; is.read(magic, 4);
-    if (!is || std::memcmp(magic, kMagic, 4) != 0)
-        throw std::runtime_error("model_io: bad magic (not an RF3M package)");
-    const uint32_t version = get<uint32_t>(is);
-    if (version != kVersion)
-        throw std::runtime_error("model_io: unsupported RF3M version " + std::to_string(version));
+    check_header(is);
 
     // Same header order as save_to_memory; we stop before the (heavy) ONNX graph payloads — no ORT.
     PackageMetadata md;
+    md.interface                   = get_interface(is);
     md.provenance.dataset_name     = get_str(is);
     md.provenance.software_version = get_str(is);
     md.provenance.physics          = get_str(is);
@@ -312,14 +403,10 @@ ModelStore::read_graphs_from_memory(const void* bytes, size_t n) {
     const std::string buf(static_cast<const char*>(bytes), n);
     std::istringstream is(buf, std::ios::binary);
 
-    char magic[4]; is.read(magic, 4);
-    if (!is || std::memcmp(magic, kMagic, 4) != 0)
-        throw std::runtime_error("model_io: bad magic (not an RF3M package)");
-    const uint32_t version = get<uint32_t>(is);
-    if (version != kVersion)
-        throw std::runtime_error("model_io: unsupported RF3M version " + std::to_string(version));
+    check_header(is);
 
     // Skip the metadata header (same order as save_to_memory) to reach the graph payloads.
+    get_interface(is);      // interface
     get_str(is);            // dataset_name
     get_str(is);            // software_version
     get_str(is);            // physics

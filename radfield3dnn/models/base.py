@@ -408,6 +408,36 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
             geometry=torch.empty(flux_field_shape, dtype=field.geometry.dtype, device=field.geometry.device) if field.geometry is not None else None
         )
 
+    def deploy_interface(self):
+        """Declare what this model CONSUMES and PRODUCES for deployment.
+
+        Written when the model is stored and read when it is loaded, to instantiate the executable
+        predictor that implements it. It describes data, never the network: two architectures with
+        the same I/O are interchangeable to a consumer, and changing a model's I/O yields a
+        different interface id instead of silently breaking existing consumers. Subclasses that add
+        an input override this and contribute only their delta.
+
+        Takes no arguments: everything it declares, the model already knows. Only the BEAM
+        parameters are declared here — a whole-volume model emits the field in one shot, so the base
+        does NOT claim ModelInput.POSITION. The per-voxel family adds that bit itself
+        (FeedforwardPointwiseModel), which is what makes a CNN load as a VolumeFieldPredictor and a
+        NeRF as a VoxelFieldPredictor.
+
+        The flag vocabulary is defined in C++ (include/radfield3d-nn/model_interface.h) and used
+        here through the bindings — it is not redeclared in Python.
+        """
+        from radfield3dnn.deploy import ModelInput, ModelInterface, ModelOutput
+        core = self.get_core_model()
+        # The collimation KIND is not a flag — it lives in the domain, so BEAM_COLLIMATION only
+        # records THAT the model consumes one.
+        inputs = ModelInput.BEAM_DIRECTION | ModelInput.SOURCE_DISTANCE | ModelInput.TUBE_SPECTRUM
+        if bool(getattr(core, "use_beam_shape", False)):
+            inputs |= ModelInput.BEAM_COLLIMATION
+        iface = ModelInterface()
+        iface.inputs = inputs
+        iface.outputs = ModelOutput.FLUX | ModelOutput.SPECTRUM
+        return iface
+
     def forward2volume_from_training_input(self, batch: TrainingInputData, voxel_counts: Tensor = None, spectra_bins: int = 32) -> RadiationField:
         sample_field = batch.ground_truth.scatter_field.flux if isinstance(batch.ground_truth, RadiationField) else (batch.ground_truth.flux if isinstance(batch.ground_truth, RadiationFieldChannel) else batch.ground_truth.air_kerma)
         is_complete_volume = (sample_field is not None) and (len(sample_field.shape) == 4 or (len(sample_field.shape) == 5 and sample_field.shape[1] == 1))
@@ -452,15 +482,9 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
         Returns:
             DirectionalInput: A new DirectionalInput instance containing the specified batch.
         """
-        assert isinstance(input, DirectionalInput), "Input must be of type DirectionalInput."
-        return DirectionalInput(
-            direction=input.direction[batch_idx],
-            spectrum=input.spectrum[batch_idx],
-            geometry=input.geometry[batch_idx] if input.geometry is not None else None,
-            origin=input.origin[batch_idx] if input.origin is not None else None,
-            beam_shape_parameters=input.beam_shape_parameters[batch_idx] if input.beam_shape_parameters is not None else None,
-            beam_shape_type=input.beam_shape_type[batch_idx] if input.beam_shape_type is not None else None
-        )
+        assert hasattr(input, "direction") and hasattr(input, "spectrum"), "Input must be a DirectionalInput-like tuple."
+        # index every tensor field; _replace keeps the concrete input type (e.g. TranslationalInput)
+        return input._replace(**{f: v[batch_idx] for f, v in zip(input._fields, input) if isinstance(v, Tensor)})
 
     def forward2volume(self, x: DirectionalInput, voxel_counts: Tensor, spectra_bins: int = 32, mask: Tensor | None = None) -> RadiationField:
         raise NotImplementedError("This method must be implemented by the subclass.")

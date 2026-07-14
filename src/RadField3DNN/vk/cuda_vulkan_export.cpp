@@ -56,6 +56,11 @@ struct ImportedTarget
     size_t elem_bytes = 4;
 };
 
+int cuda_device_for_uuid(const uint8_t device_uuid[16])
+{
+    return find_device_by_uuid(device_uuid);
+}
+
 bool is_available(const uint8_t device_uuid[16])
 {
     return find_device_by_uuid(device_uuid) >= 0;

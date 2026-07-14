@@ -1,6 +1,6 @@
 from radfield3dnn.rftypes import AirKermaField, RadiationFieldChannel, TrainingInputData, RadiationField
 from radfield3dnn.preprocessing.airkerma import Airkerma
-from .smape import SMAPEAccuracy, EnergyWeightedSMAPEAccuracy
+from .smape import SMAPEAccuracy, EnergyWeightedSMAPEAccuracy, per_field_max as _per_field_max
 from .base import MetricBase
 from .ncc import NCCAccuracy
 from typing import Union, Literal
@@ -18,7 +18,6 @@ def _to_airkerma(airkerma, x):
     if isinstance(x, AirKermaField):
         return x.air_kerma
     return x
-
 
 class AirkermaAccuracy(MetricBase):
     def __init__(self, mu_tr_file: str, spectra_bins: int, max_energy_eV: float, weight_with_error: bool = False, importance_threshold: float = 0.0, keep_dim: bool = False, metric_type: Union[Literal['smape'], Literal['log_rmse'], Literal['ncc'], Literal['gpr']] = 'smape', voxel_size_m: float = 0.01, rel_dose_diff: float = 0.03, dist_crit_mm: float = 3.0, dose_threshold: float = 0.1):
@@ -205,7 +204,7 @@ class AirkermaSupervoxelScatterAccuracy(AirkermaAccuracy):
                 xgt = src.direct_beam.flux
         if xgt is not None:
             x_sv = self._pool(xgt)
-            beam_sv = x_sv > x_sv.max() * self.max_relative_flux
+            beam_sv = x_sv > _per_field_max(x_sv) * self.max_relative_flux
             t_sv = t_sv.masked_fill(beam_sv, -torch.inf)
             p_sv = p_sv.masked_fill(beam_sv, -torch.inf)
 
@@ -230,7 +229,7 @@ class AirkermaBeamAccuracy(AirkermaAccuracy):
         assert (isinstance(input.ground_truth, RadiationField) and input.ground_truth.direct_beam is not None) or (input.original_ground_truth is not None and input.original_ground_truth.direct_beam is not None), "Input TrainingInputData must contain direct_beam for beam accuracy."
         xgt_ch = input.original_ground_truth.direct_beam if input.original_ground_truth is not None and input.original_ground_truth.direct_beam is not None else input.ground_truth.direct_beam
         xgt = xgt_ch.flux if isinstance(xgt_ch, RadiationFieldChannel) else xgt_ch
-        non_beam = ~(xgt > xgt.max() * self.beam_rel)   # exclude everything OUTSIDE the beam
+        non_beam = ~(xgt > _per_field_max(xgt) * self.beam_rel)   # exclude everything OUTSIDE the beam
 
         def _masked(x):
             if isinstance(x, RadiationFieldChannel):
@@ -281,13 +280,13 @@ class AirkermaScatterAccuracy(AirkermaAccuracy):
         sgt = sgt_ch.flux if isinstance(sgt_ch, RadiationFieldChannel) else sgt_ch
         fgt = sgt + xgt
 
-        beam_mask = xgt > xgt.max() * self.max_relative_flux  # ignore areas with > max_relative_flux of max primary flux
+        beam_mask = xgt > _per_field_max(xgt) * self.max_relative_flux  # ignore areas with > max_relative_flux of max primary flux
 
         scatter_error = sgt_ch.error if isinstance(sgt_ch, RadiationFieldChannel) else None
         if self.use_roi:
             # Shared ROI scatter mask: exclude beam ∪ floor -> scored = NOT beam AND joined >=
             # scatter_lo*max. Same regions as radfield3dnn.roi / TwoROIGammaLoss / the ROI sampler.
-            floor_mask = fgt < fgt.max() * self.scatter_lo
+            floor_mask = fgt < _per_field_max(fgt) * self.scatter_lo
             beam_mask = beam_mask | floor_mask
         elif self.use_error and scatter_error is not None:
             # Noise-aware mode: exclude voxels where the MC statistical error marks the GT itself
@@ -299,13 +298,13 @@ class AirkermaScatterAccuracy(AirkermaAccuracy):
         else:
             if self.use_error:
                 print("[yellow]AirkermaScatterAccuracy(use_error=True) but no scatter error layer present — falling back to the flux-threshold mask.[/yellow]")
-            low_flux_mask_gt = fgt < fgt.max() * self.min_relative_flux  # ignore areas with < min_relative_flux of max total flux
+            low_flux_mask_gt = fgt < _per_field_max(fgt) * self.min_relative_flux  # ignore areas with < min_relative_flux of max total flux
             if isinstance(prediction, RadiationFieldChannel):
-                low_flux_mask = prediction.flux < prediction.flux.max() * self.min_relative_flux  # ignore areas with < min_relative_flux of max predicted flux
+                low_flux_mask = prediction.flux < _per_field_max(prediction.flux) * self.min_relative_flux  # ignore areas with < min_relative_flux of max predicted flux
             elif isinstance(prediction, AirKermaField):
-                low_flux_mask = prediction.air_kerma < prediction.air_kerma.max() * self.min_relative_flux  # ignore areas with < min_relative_flux of max predicted air kerma
+                low_flux_mask = prediction.air_kerma < _per_field_max(prediction.air_kerma) * self.min_relative_flux  # ignore areas with < min_relative_flux of max predicted air kerma
             else:
-                low_flux_mask = prediction < prediction.max() * self.min_relative_flux  # ignore areas with < min_relative_flux of max predicted value
+                low_flux_mask = prediction < _per_field_max(prediction) * self.min_relative_flux  # ignore areas with < min_relative_flux of max predicted value
             beam_mask = beam_mask | (low_flux_mask & low_flux_mask_gt)  # combine masks
 
         # Mask on CLONES — never mutate the caller's tensors. The previous in-place

@@ -167,7 +167,7 @@ class PBRFNetTCNN(RFNetBase):
         """
         return True
 
-    def __init__(self, location_encoding_dims=10, in_spectra_dim=32, d_model=256, flux_loss="L1Loss", spectrum_loss="HistogramLoss", learning_rate: float=1e-3, randomize_voxel_location_in_training: bool = True, voxels_centered_around_origin: bool = True, normalizer=None, seed: int = 1337, max_lr: float = 1e-3, flux_offset: float = 0.5, flux_activation: str = "clamp", location_encoding_kind: str = "frequency", flux_clamp_min: float = 0.0, flux_clamp_max: float = 1.0, trunk_hidden_layers: int = 1, beam_fusion: str = "film"):
+    def __init__(self, location_encoding_dims=10, in_spectra_dim=32, d_model=256, flux_loss="L1Loss", spectrum_loss="HistogramLoss", learning_rate: float=1e-3, voxel_supersampling: int = 1, voxels_centered_around_origin: bool = True, normalizer=None, seed: int = 1337, max_lr: float = 1e-3, flux_offset: float = 0.5, flux_activation: str = "clamp", location_encoding_kind: str = "frequency", flux_clamp_min: float = 0.0, flux_clamp_max: float = 1.0, trunk_hidden_layers: int = 1, beam_fusion: str = "film"):
         # Single-head model: one joined flux head + a joined spectrum head.
         # flux_clamp_min/max: codomain of the hard-clamp flux activation; the (0, 1) defaults match
         # the linear0_1 normalizer below. Lightning's save_hyperparameters(ignore=[... "normalizer"])
@@ -180,7 +180,7 @@ class PBRFNetTCNN(RFNetBase):
             normalizer = NormalizerConstructor.construct_by_name(normalizer)
         super().__init__(
             learning_rate=learning_rate,
-            randomize_voxel_location_in_training=randomize_voxel_location_in_training,
+            voxel_supersampling=voxel_supersampling,
             voxels_centered_around_origin=voxels_centered_around_origin,
             normalizer=normalizer
         )
@@ -489,7 +489,7 @@ class PBRFNetTCNN(RFNetBase):
             "in_spectra_dim": self.in_spectra_dim,
             "flux_loss": self.flux_loss_name,
             "spectrum_loss": self.spectrum_loss_name,
-            "randomize_voxel_location_in_training": self.randomize_voxel_location_in_training,
+            "voxel_supersampling": self.voxel_supersampling,
             "voxels_centered_around_origin": self.voxels_centered_around_origin,
             "normalizer": self._normalizer.get_type() if self._normalizer is not None else None,
             "seed": self.seed,
@@ -521,7 +521,7 @@ class SPERFNetCPP(PBRFNetTCNN):
     def __init__(self, location_encoding_dims=10, in_spectra_dim=32, d_model=256,
                  flux_loss="L1Loss", spectrum_loss="HistogramLoss",
                  learning_rate: float = 1e-3,
-                 randomize_voxel_location_in_training: bool = True,
+                 voxel_supersampling: int = 1,
                  voxels_centered_around_origin: bool = True,
                  normalizer=None, seed: int = 1337, max_lr: float = 1e-4,
                  flux_offset: float = 0.5, flux_activation: str = "clamp",
@@ -535,7 +535,7 @@ class SPERFNetCPP(PBRFNetTCNN):
             flux_loss=flux_loss,
             spectrum_loss=spectrum_loss,
             learning_rate=learning_rate,
-            randomize_voxel_location_in_training=randomize_voxel_location_in_training,
+            voxel_supersampling=voxel_supersampling,
             voxels_centered_around_origin=voxels_centered_around_origin,
             normalizer=normalizer,
             seed=seed,

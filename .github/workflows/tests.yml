@@ -1,15 +1,26 @@
 name: Tests
 
-# Build the deployment extension and run the simplified, CPU-only deploy test — the pure
-# ONNX-Runtime RF3M round-trip, which needs no torch / CUDA / tiny-cuda-nn. Runs across
-# Linux + Windows and Python 3.12 / 3.13 / 3.14. The rest of the suite (GPU / deep-learning
-# tests under tests/) is kept in the repo but not exercised here.
+# The deployment test suite — CPU-only, no torch / CUDA / tiny-cuda-nn. Runs on every commit AND is
+# the gate a release must pass before any wheel is built (release.yml calls this workflow).
+#
+# Two halves, both required:
+#   * C++  (ctest): the RF3M round-trip, and the deployment-interface / binding-diagnostic contract.
+#   * Python (pytest): the SAME contract through the pybind bindings, plus the RF3M metadata test.
+# The enums are DEFINED in C++ and reach Python only through the bindings, so passing one half
+# proves nothing about the other — a rename on either side has to fail here.
+#
+# Runs across Linux + Windows and Python 3.12 / 3.13 / 3.14. The rest of the repo's suite (GPU /
+# deep-learning tests under tests/) needs a training stack and is not exercised here.
 on:
   push:
   pull_request:
+  workflow_call:      # release.yml gates wheel-building on this workflow passing
 
 concurrency:
-  group: tests-${{ github.ref }}
+  # github.workflow is the CALLER's name for a reusable workflow, so the release's gate run lands in
+  # a different group from the plain push run of the same tag. Without this they collide and
+  # cancel-in-progress kills the release's own gate.
+  group: tests-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -23,20 +34,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build deploy extension
+      - name: Build deploy extension + C++ tests
         uses: ./.github/actions/build-deploy
         with:
           python-version: ${{ matrix.python }}
+          tests: 'ON'
+
+      - name: Run C++ tests (ctest)
+        shell: bash
+        env:
+          # The test executables link ONNX Runtime's shared library, which the build fetched into
+          # build_deploy/_deps. --no-tests=error: an empty suite is a wiring bug, not a pass.
+          LD_LIBRARY_PATH: ${{ github.workspace }}/build_deploy/_deps/fetch_onnxruntime-src/lib
+        run: |
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            export PATH="${GITHUB_WORKSPACE}/build_deploy/_deps/fetch_onnxruntime-src/lib:${PATH}"
+          fi
+          ctest --test-dir build_deploy --output-on-failure --no-tests=error
 
       - name: Install test dependencies
         run: python -m pip install pytest numpy onnx
 
-      - name: Run CPU deploy test (no deep-learning stack)
+      - name: Run Python tests (bindings + RF3M round-trip)
         shell: bash
         env:
-          # The deploy test falls back to `import rfnn_deploy` from <repo>/lib, where the build
-          # staged ONNX Runtime's shared lib. On Windows the module's own dir is searched; on
-          # Linux LD_LIBRARY_PATH resolves it.
+          # The deploy tests `import rfnn_deploy` from <repo>/lib, where the build staged the module
+          # next to ONNX Runtime's shared lib. On Windows the module's own dir is searched; on Linux
+          # LD_LIBRARY_PATH resolves it. Deliberately NO torch: this is a wheel consumer's
+          # environment, so the training-stack tests skip themselves.
           PYTHONPATH: ${{ github.workspace }}/lib
           LD_LIBRARY_PATH: ${{ github.workspace }}/lib
-        run: pytest tests/deploy/test_rf3m_metadata_roundtrip.py -v
+        run: pytest tests/test_deploy_bindings.py tests/deploy/test_rf3m_metadata_roundtrip.py -v

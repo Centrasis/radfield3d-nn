@@ -81,9 +81,18 @@ def _beam(spectrum):
                              spectrum=list(spectrum), rect=[0.0, 0.0])
 
 
+def _interface():
+    # The trunk takes a position and emits flux + spectrum, so this is a per-voxel model: the
+    # POSITION bit is what makes load() hand back a VoxelFieldPredictor.
+    iface = rd.ModelInterface()
+    iface.inputs = rd.ModelInput.POSITION | rd.ModelInput.TUBE_SPECTRUM
+    iface.outputs = rd.ModelOutput.FLUX | rd.ModelOutput.SPECTRUM
+    return iface
+
+
 def _load_roundtrip():
     data = rd.save_to_memory(
-        {"trunk": _make_trunk_onnx()}, _domain(),
+        {"trunk": _make_trunk_onnx()}, _interface(), _domain(),
         rd.ModelProvenance(dataset_name="unit-test", software_version="", physics=""), {})
     assert isinstance(data, (bytes, bytearray)) and len(data) > 0
     return rd.ModelStore.load_from_memory(data)

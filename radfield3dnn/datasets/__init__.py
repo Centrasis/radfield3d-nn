@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 import torch
-from RadFiled3D.pytorch.datasets.radfield3d import RadField3DDataset, RadField3DDatasetWithGeometry
+from RadFiled3D.pytorch.datasets.radfield3d import RadField3DDataset, RadField3DDatasetWithGeometry, RadField3DTranslationDataset
 from RadFiled3D.utils import FieldStore
 from RadFiled3D.RadFiled3D import CartesianRadiationField
 from enum import Enum
@@ -49,18 +49,29 @@ class OriginalGroundTruthPreservation(DataProcessing):
         else:
             raise ValueError("Input must be of type RadiationField, RadiationFieldChannel, AirKermaField, or torch.Tensor")
 
+    @staticmethod
+    def canonicalize(gt):
+        """Map RadFiled3D's native field types onto the repo's rftypes.
+
+        ANTI-CORRUPTION BOUNDARY. RadFiled3D yields its own RadiationField (scatter_field,
+        direct_beam) while the repo's RadiationField adds `geometry`; they are distinct
+        NamedTuple classes, so every downstream `isinstance(gt, RadiationField)` in the losses,
+        metrics, samplers and channel transforms silently evaluates False for a foreign instance
+        and falls through to a wrong branch. Converting once, here at the dataset edge, is what
+        keeps the rest of the pipeline single-typed.
+        """
+        if isinstance(gt, rf3RadiationField) and not isinstance(gt, RadiationField):
+            return RadiationField(scatter_field=gt.scatter_field, direct_beam=gt.direct_beam,
+                                  geometry=None)
+        return gt
+
     def forward(self, x: TrainingInputData | RadiationField | RadiationFieldChannel | AirKermaField | torch.Tensor) -> TrainingInputData:
-        if isinstance(x, rf3TrainingInputData):
+        if isinstance(x, (rf3TrainingInputData, TrainingInputData)):
+            gt = self.canonicalize(x.ground_truth)
             return TrainingInputData(
                 input=x.input,
-                ground_truth=x.ground_truth,
-                original_ground_truth=self.clone(x.ground_truth)
-            )
-        elif isinstance(x, TrainingInputData):
-            return TrainingInputData(
-                input=x.input,
-                ground_truth=x.ground_truth,
-                original_ground_truth=self.clone(x.ground_truth)
+                ground_truth=gt,
+                original_ground_truth=self.clone(gt)
             )
         else:
             raise ValueError("Input must be of type TrainingInputData")
@@ -99,11 +110,15 @@ def get_dataset_dimensions_and_voxel_size(dataset: str | RadiationFieldDataModul
     return (field_dim.x, field_dim.y, field_dim.z), vx_size_x
 
 
-def construct_datamodule(dataset_path: str, batch_size: int, num_workers: int, use_geometry: bool, use_beam_parameters: bool, dataprocessings: list[DataProcessing] = None, voxel_resolution: tuple[int, int, int] = None, prefetch_to_device: bool = True, max_fields: int = None, cache_to_ram: bool = False, cache_ram_gb: float = None) -> RadiationFieldDataModule:
+def construct_datamodule(dataset_path: str, batch_size: int, num_workers: int, use_geometry: bool, use_beam_parameters: bool, dataprocessings: list[DataProcessing] = None, voxel_resolution: tuple[int, int, int] = None, prefetch_to_device: bool = True, max_fields: int = None, cache_to_ram: bool = False, cache_ram_gb: float = None, use_translation: bool = False) -> RadiationFieldDataModule:
     if dataprocessings is None:
         dataprocessings = []
     dataset_cls = RadField3DDataset
-    if use_geometry:
+    if use_translation:
+        assert not use_geometry, "use_translation and use_geometry are not combinable yet."
+        print("[yellow]Using translation dataset (patient translation read from field metadata)!")
+        dataset_cls = RadField3DTranslationDataset
+    elif use_geometry:
         print("[yellow]Using geometry dataset with voxelized geometries!")
         def create_geom_ds(file_paths: list[str] = None, zip_file: str = None, data_processings: list["DataProcessing"] = None):
             return RadField3DDatasetWithGeometry(file_paths=file_paths, zip_file=zip_file, data_processings=data_processings, create_binary_geometry_mask=True)

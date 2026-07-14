@@ -190,12 +190,16 @@ endif()
 set(DEPLOY_SOURCES
   src/RadField3DNN/field_predictors.cpp
   src/RadField3DNN/device_radiation_field.cpp
-  src/RadField3DNN/model_io.cpp)
+  src/RadField3DNN/model_io.cpp
+  src/RadField3DNN/model_binding.cpp)
 if(RFNN_BACKEND_VULKAN)
   list(APPEND DEPLOY_SOURCES src/RadField3DNN/vk/vulkan_field.cpp)
 endif()
 if(RFNN_CUDA_VULKAN_INTEROP)
-  list(APPEND DEPLOY_SOURCES src/RadField3DNN/vk/cuda_vulkan_export.cpp)
+  list(APPEND DEPLOY_SOURCES
+    src/RadField3DNN/vk/cuda_vulkan_export.cpp
+    src/RadField3DNN/vk/vulkan_buffer_target.cpp
+    src/RadField3DNN/vk/vulkan_image_target.cpp)
 endif()
 
 add_library(libRadField3DNNDeploy STATIC ${DEPLOY_SOURCES})
@@ -343,6 +347,21 @@ if(BUILD_RADFIELDNN_TESTS)
     RFNN_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/cxx/data")
   target_link_libraries(test_model_io libRadField3DNNDeploy GTest::gtest_main)
   gtest_discover_tests(test_model_io)
+
+  # The deployment interface + binding diagnostics. Pure header/ABI contract — no ONNX, no GPU.
+  add_executable(test_model_interface tests/cxx/test_model_interface.cpp)
+  set_target_properties(test_model_interface PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON FOLDER "Tests")
+  target_link_libraries(test_model_interface libRadField3DNNDeploy GTest::gtest_main)
+  gtest_discover_tests(test_model_interface)
+
+  # VulkanBufferTarget: registering an external allocation as a direct prediction output. Needs the
+  # interop (cudart) + the CUDA driver lib to fabricate the opaque FD; skips itself without a GPU.
+  if(RFNN_CUDA_VULKAN_INTEROP)
+    add_executable(test_vulkan_buffer_target tests/cxx/test_vulkan_buffer_target.cpp)
+    set_target_properties(test_vulkan_buffer_target PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON FOLDER "Tests")
+    target_link_libraries(test_vulkan_buffer_target libRadField3DNNDeploy CUDA::cudart CUDA::cuda_driver GTest::gtest_main)
+    gtest_discover_tests(test_vulkan_buffer_target)
+  endif()
 
   # tcnn CUDA tests (gated).
   if(RFNN_WITH_TCNN)

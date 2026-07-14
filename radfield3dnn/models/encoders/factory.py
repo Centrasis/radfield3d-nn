@@ -15,6 +15,7 @@ import inspect
 from typing import Any
 
 from .sinusoidal_encoding import SinusoidalFrequencyEncoding
+from .ipe_encoding import IntegratedSinusoidalEncoding
 from .hash_encoding import HashGridEncoding
 from .rff_encoding import RandomFourierFeatures
 from .spherical_hamonics import SphericalHarmonics
@@ -22,6 +23,7 @@ from .spherical_hamonics import SphericalHarmonics
 # type -> encoder class. Each class keeps its own constructor signature (its "real attributes").
 ENCODER_REGISTRY = {
     "sinusoidal": SinusoidalFrequencyEncoding,
+    "ipe": IntegratedSinusoidalEncoding,
     "hash": HashGridEncoding,
     "rff": RandomFourierFeatures,
     "spherical_harmonics": SphericalHarmonics,

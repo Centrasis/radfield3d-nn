@@ -5,6 +5,15 @@ from radfield3dnn.rftypes import TrainingInputData, RadiationField, RadiationFie
 from typing import Union, Literal
 
 
+def per_field_max(x: Tensor) -> Tensor:
+    """Per-field max over a batched tensor (dim 0 = fields, keepdim for broadcasting) — the
+    per-field ROI contract of radfield3dnn.roi. A global .max() would gate every threshold on
+    the batch-brightest field, so weak-beam fields in the same batch lose their masks."""
+    if x.ndim <= 3:
+        return x.max()
+    return x.amax(dim=tuple(range(1, x.ndim)), keepdim=True)
+
+
 class SMAPEAccuracy(MetricBase):
     def __init__(self, layer_name: Union[Literal['flux'], Literal['spectrum'], Literal['error'], None] = None, clamp: bool = False, zero_eps: float = 1e-8, weight_with_error: bool = False, importance_threshold: float = 0.0, keep_dim: bool = False):
         """
@@ -38,9 +47,15 @@ class SMAPEAccuracy(MetricBase):
         # Build mask: valid numbers only
         valid_mask = torch.isfinite(target) & torch.isfinite(prediction)
 
-        # gate on the target only (fixed GT region; prediction-independent).
-        max_val = self.importance_threshold * target[valid_mask].max() if valid_mask.any() else torch.tensor(0.0, device=target.device, dtype=target.dtype)
-        importance_mask = valid_mask & (target >= max_val)
+        # gate on the target only (fixed GT region; prediction-independent). The threshold is
+        # relative to the PER-FIELD max (batch dim 0) — the per-field ROI contract of
+        # radfield3dnn.roi; a global max would gate every field on the batch-brightest one.
+        if float(self.importance_threshold) > 0.0 and valid_mask.any():
+            field_max = target.masked_fill(~valid_mask, -torch.inf)
+            field_max = field_max.amax(dim=tuple(range(1, target.ndim)), keepdim=True) if target.ndim > 3 else field_max.max()
+            importance_mask = valid_mask & (target >= self.importance_threshold * field_max)
+        else:
+            importance_mask = valid_mask & (target >= 0.0)
 
         if self.keep_dim:
             acc_field = torch.full_like(target, -torch.inf)
@@ -89,7 +104,7 @@ class SMAPEAccuracy(MetricBase):
 
         if self.weight_with_error:
             if self.importance_threshold > 0.0:
-                max_val = self.importance_threshold * target.max()
+                max_val = self.importance_threshold * per_field_max(target if isinstance(target, Tensor) else self.extract_tensor_from(target))
                 target_data = self.extract_tensor_from(target)
                 input = TrainingInputData(
                     input=input.input,

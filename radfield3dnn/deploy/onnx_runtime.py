@@ -111,7 +111,11 @@ def _ensure_loaded():
 _LAZY_EXPORTS = frozenset({
     "rfnn_deploy", "BeamParameters", "ExecutionOptions", "EncodedBeam", "PredictorType",
     "VolumeFieldPredictor", "VoxelFieldPredictor", "ModelStore", "ModelDomain", "ModelProvenance",
-    "BeamParameterSpec", "ParameterRange",
+    "BeamParameterSpec", "ParameterRange", "ParameterRangeType", "CollimationType",
+    "SpectrumInputLayout", "PackageMetadata", "read_metadata",
+    "ModelInput", "ModelOutput", "ModelInterface",
+    "DeviceKind", "ElementType", "Unit", "SessionMemory", "ParameterNormalizer",
+    "BindingError", "IncompleteSetupError",
 })
 
 
@@ -123,15 +127,33 @@ def __getattr__(name: str):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-def load_rf3m(path: str, use_cuda: bool = False) -> "VoxelFieldPredictor | VolumeFieldPredictor":
+def load_rf3m(path: str, backend: str = "cpu") -> "VoxelFieldPredictor | VolumeFieldPredictor":
     """Load an RF3M package STRAIGHT to the runnable predictor (:class:`VoxelFieldPredictor` for
     per-voxel models, :class:`VolumeFieldPredictor` for field-wise ones). The package metadata is
-    attached to the predictor: ``.domain``, ``.provenance``, ``.metrics``, ``.graph_names``."""
-    return _ensure_loaded().ModelStore.load(path, use_cuda=use_cuda)
+    attached to the predictor: ``.interface``, ``.domain``, ``.provenance``, ``.metrics``.
+
+    ``backend`` picks the execution provider, and therefore which memory the model can bind without
+    a copy — bind CUDA buffers to a ``"cuda"`` session, host buffers to a ``"cpu"`` one:
+
+      ``"cpu"``       CPU execution provider.
+      ``"cuda"``      CUDA EP (falls back to CPU if the CUDA runtime is missing — check
+                      ``pred.session_memory.provider``, or just print the predictor).
+      ``"tensorrt"``  TensorRT EP, CUDA then CPU as fallbacks. Slow first run (engine build), cached.
+
+    There is no ``"vulkan"`` backend: ONNX Runtime has no Vulkan execution provider. Run on CUDA and
+    share the result with Vulkan through the CUDA->Vulkan export path (no host round-trip).
+    """
+    # The backend vocabulary and what each name selects are defined in C++ (model_binding.cpp /
+    # model_io.cpp). This forwards the name; it does not re-decide anything.
+    return _ensure_loaded().ModelStore.load(path, backend)
 
 
 __all__ = [
-    "load_rf3m", "ModelStore", "BeamParameters", "ExecutionOptions", "EncodedBeam",
+    "load_rf3m", "read_metadata", "ModelStore", "BeamParameters", "ExecutionOptions", "EncodedBeam",
     "PredictorType", "VolumeFieldPredictor", "VoxelFieldPredictor", "ModelDomain",
-    "ModelProvenance", "BeamParameterSpec", "ParameterRange", "rfnn_deploy",
+    "ModelProvenance", "BeamParameterSpec", "ParameterRange", "ParameterRangeType",
+    "CollimationType", "SpectrumInputLayout", "PackageMetadata", "rfnn_deploy",
+    "ModelInput", "ModelOutput", "ModelInterface",
+    "DeviceKind", "ElementType", "Unit", "SessionMemory", "ParameterNormalizer",
+    "BindingError", "IncompleteSetupError",
 ]

@@ -57,19 +57,11 @@ class BeamParametersNormalization(DataProcessing):
             assert (origin_distance >= 0).all() and (origin_distance <= 1.0).all(), f"Expected origin distances to be in [{distance_range[0].item()}, {distance_range[1].item()}] meters, but got min { (origin_distance).min().item()} and max {(origin_distance).max().item()} meters."
 
             x = TrainingInputData(
-                input=DirectionalInput(
-                    direction=x.input.direction,
-                    spectrum=x.input.spectrum,
-                    origin=origin_distance.unsqueeze(-1),
-                    beam_shape_parameters=x.input.beam_shape_parameters.clone(),
-                    beam_shape_type=x.input.beam_shape_type
-                ) if isinstance(x.input, DirectionalInput) else PositionalInput(
-                    position=x.input.position,
-                    direction=x.input.direction,
+                # _replace keeps the concrete input type (Directional/Positional/TranslationalInput)
+                # and every field this normalizer does not touch.
+                input=x.input._replace(
                     origin=origin_distance.unsqueeze(-1),
                     beam_shape_parameters=x.input.beam_shape_parameters.clone(),  # clone: the CONE block normalizes this in place; never mutate the shared/cached source
-                    beam_shape_type=x.input.beam_shape_type,
-                    spectrum=x.input.spectrum
                 ),
                 ground_truth=x.ground_truth,
                 original_ground_truth=x.original_ground_truth if hasattr(x, 'original_ground_truth') else None
@@ -87,6 +79,17 @@ class BeamParametersNormalization(DataProcessing):
                 x.input.beam_shape_parameters[:, 0][(x.input.beam_shape_parameters[:, 0] > 1.0) & torch.isclose(x.input.beam_shape_parameters[:, 0], torch.tensor(1.0, device=x.input.beam_shape_parameters.device))] = 1.0  # ensure max value is exactly 1.0 avoiding floating point issues
                 x.input.beam_shape_parameters[:, 0][(x.input.beam_shape_parameters[:, 0] < 0.0) & torch.isclose(x.input.beam_shape_parameters[:, 0], torch.tensor(0.0, device=x.input.beam_shape_parameters.device))] = 0.0  # ensure min value is exactly 0.0 avoiding floating point issues
                 assert (x.input.beam_shape_parameters[:, 0] >= 0).all() and (x.input.beam_shape_parameters[:, 0] <= 1.0).all(), f"Expected beam opening angles to be in [0.0, 1.0], but got min {x.input.beam_shape_parameters[:, 0].min().item()} and max {x.input.beam_shape_parameters[:, 0].max().item()} after normalization."
+            elif (x.input.beam_shape_type[:, 0] == float(int(FieldShape.RECTANGLE))).all():
+                # RECTANGLE collimation: beam_shape_parameters is the field rectangle (x, y) in
+                # metres. Normalize both dimensions by the full field extent so the collimation
+                # size reaches the network in [0, 1], the same scale as the other beam parameters.
+                assert x.input.beam_shape_parameters.shape[1] == 2, f"Expected beam_shape_parameters to have shape (N, 2) for RECTANGLE shape, but got {x.input.beam_shape_parameters.shape}"
+                if self.half_field_size is not None:
+                    field_extent = float(max(2.0 * s for s in self.half_field_size))
+                else:
+                    field_extent = float(torch.linalg.norm(torch.tensor(x.ground_truth.flux.shape[-3:], dtype=torch.float32, device=x.input.beam_shape_parameters.device) * self.size_per_voxel))
+                x.input.beam_shape_parameters[:, :2] = (x.input.beam_shape_parameters[:, :2] / field_extent).clamp(0.0, 1.0)
+                assert (x.input.beam_shape_parameters[:, :2] >= 0).all() and (x.input.beam_shape_parameters[:, :2] <= 1.0).all(), f"Expected rectangle dimensions to be in [0.0, 1.0], but got min {x.input.beam_shape_parameters[:, :2].min().item()} and max {x.input.beam_shape_parameters[:, :2].max().item()} after normalization."
             else:
                 pass
             return x

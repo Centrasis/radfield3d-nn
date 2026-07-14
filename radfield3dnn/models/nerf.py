@@ -268,9 +268,12 @@ class RFBackboneModel(nn.Module):
             direct_beam=None
         )
 
-    def forward(self, batch: PositionalInput, global_parameters: Union[Tensor, None, list] = None):
+    def forward(self, batch: PositionalInput, global_parameters: Union[Tensor, None, list] = None,
+                region_state: Union[Tensor, None] = None):
+        # region_state describes the spatial extent each queried point represents (from the
+        # location encoder's compute_region_state); point encoders ignore it.
         position = batch.position.to(self._compute_dtype)
-        xyz_enc = self.positional_location_encoding(position)
+        xyz_enc = self.positional_location_encoding(position, region_state)
         params_enc = self.encode_additional_parameters(batch) if global_parameters is None else global_parameters.to(self._compute_dtype)
 
         x0 = xyz_enc if self.use_conditioning else torch.cat((xyz_enc, params_enc), dim=-1)
@@ -336,14 +339,8 @@ class SRBFNet(RFNetBase):
     def forward2volume(self, x: DirectionalInput, voxel_counts, spectra_bins = 32, mask: Union[Tensor, None] = None):
         assert spectra_bins == self.out_spectra_dim, f"Output spectra bins must match the model's output dimension. Given: {spectra_bins}, expected: {self.out_spectra_dim}"
         # drop geometry if present to speed up training, as this network is learning only implicit geometry
-        x = DirectionalInput(
-            direction=x.direction,
-            spectrum=x.spectrum,
-            geometry=None,
-            origin=x.origin,
-            beam_shape_parameters=x.beam_shape_parameters,
-            beam_shape_type=x.beam_shape_type
-        )
+        # (_replace keeps the concrete input type, e.g. TranslationalInput)
+        x = x._replace(geometry=None)
         global_parameters = self.backbone_model.encode_additional_parameters(x)
         return super().forward2volume(x, voxel_counts, self.out_spectra_dim, mask=mask, global_parameters=global_parameters)
 
@@ -355,18 +352,25 @@ class SRBFNet(RFNetBase):
         if training_params is None:
             training_params = {}
         learning_rate = training_params.get("learning_rate", 1e-3)
-        randomize_voxel_location_in_training = training_params.get("randomize_voxel_location_in_training", True)
+        if "randomize_voxel_location_in_training" in training_params:
+            raise ValueError(
+                "training_params.randomize_voxel_location_in_training was REMOVED. Use "
+                "voxel_supersampling instead: 1 = single node-grid sample (the old False), "
+                "K>1 = K jittered in-voxel samples whose predictions are voxel-mean-averaged "
+                "(supersedes the old jitter, which trained a staircase and cost ~8pp)."
+            )
+        voxel_supersampling = int(training_params.get("voxel_supersampling", 1))
         voxels_centered_around_origin = training_params.get("voxels_centered_around_origin", True)
         max_lr = training_params.get("max_lr", 5e-4)
         super().__init__(
             learning_rate=learning_rate,
-            randomize_voxel_location_in_training=randomize_voxel_location_in_training,
+            voxel_supersampling=voxel_supersampling,
             voxels_centered_around_origin=voxels_centered_around_origin,
             normalizer=normalizer
         )
         self._training_params = {
             "learning_rate": learning_rate,
-            "randomize_voxel_location_in_training": randomize_voxel_location_in_training,
+            "voxel_supersampling": voxel_supersampling,
             "voxels_centered_around_origin": voxels_centered_around_origin,
             "max_lr": max_lr,
         }
@@ -437,8 +441,10 @@ class SRBFNet(RFNetBase):
         if self.backbone_model.beam_conditioner2 is not None:
             self.backbone_model.beam_conditioner2.initialize()
 
-    def forward(self, batch: PositionalInput, global_parameters: Union[Tensor, None, list] = None):
-        return self.backbone_model.forward(batch, global_parameters=global_parameters)
+    def forward(self, batch: PositionalInput, global_parameters: Union[Tensor, None, list] = None,
+                region_state: Union[Tensor, None] = None):
+        return self.backbone_model.forward(batch, global_parameters=global_parameters,
+                                           region_state=region_state)
     
     def get_custom_parameters(self):
         return {
@@ -541,9 +547,12 @@ class PBRFNet(SPERFNet):
                      spectra_encoding_params: dict = None, conditioning_params: dict = None, trunk_depth: int = 4, flux_head_hidden: int = 1):
             super().__init__(d_model=d_model, out_spectra_dim=out_spectra_dim, normalizer=normalizer, conditioning_params=conditioning_params, spectra_encoding_params=spectra_encoding_params, precision=precision, flux_activation=flux_activation, location_encoding_params=location_encoding_params, direction_encoding_params=direction_encoding_params, trunk_depth=trunk_depth, flux_head_hidden=flux_head_hidden)
             # use_beam_shape lives in conditioning_params (folded with the fusion ``type``).
+            # beam_shape_param_dims: 1 = cone opening angle, 2 = rectangle (w, h) collimation.
             use_beam_shape = bool(self._conditioning_params.get("use_beam_shape", False))
+            self.beam_shape_param_dims = int(self._conditioning_params.get("beam_shape_param_dims", 1))
+            assert self.beam_shape_param_dims in (1, 2), f"beam_shape_param_dims must be 1 (cone) or 2 (rectangle), got {self.beam_shape_param_dims}"
             self.opening_angle_encoder = nn.Sequential(
-                nn.Linear(1, scalar_encoding_dims),
+                nn.Linear(1 if self.beam_shape_param_dims == 1 else 4, scalar_encoding_dims),
                 nn.SiLU(True),
                 nn.Linear(scalar_encoding_dims, scalar_encoding_dims),
                 nn.SiLU(True)
@@ -575,6 +584,15 @@ class PBRFNet(SPERFNet):
                 token_component_dims=token_component_dims if self._token_attention else None,
             )
 
+        def _beam_shape_features(self, params: Tensor) -> Tensor:
+            """Cone: the opening angle as-is. Rectangle: (w, h) plus area and a bounded
+            anisotropy ratio — area linearizes the 1/(w·h) fluence amplitude, the ratio
+            decouples shape from size."""
+            if self.beam_shape_param_dims == 1:
+                return params[:, :1]
+            w, h = params[:, 0], params[:, 1]
+            return torch.stack([w, h, w * h, (w - h) / (w + h + 1e-6)], dim=-1)
+
         def encode_additional_parameters(self, batch: PositionalInput) -> Tensor:
             dtype = self._compute_dtype
             assert batch.origin.shape[-1] == 1, f"Origin must be a single distance value for PBRFNet. Got shape: {batch.origin.shape}"
@@ -584,7 +602,7 @@ class PBRFNet(SPERFNet):
             spectrum = self.spectra_encoder(batch.spectrum.to(dtype))
             opening_angle = None
             if self.use_beam_shape:
-                opening_angle = self.opening_angle_encoder(batch.beam_shape_parameters[:, 0].unsqueeze(-1).to(dtype)).view(batch.spectrum.shape[0], -1)
+                opening_angle = self.opening_angle_encoder(self._beam_shape_features(batch.beam_shape_parameters.to(dtype))).view(batch.spectrum.shape[0], -1)
 
             enc = [dir_enc, origin_enc, spectrum, opening_angle] if opening_angle is not None else [dir_enc, origin_enc, spectrum]
             if getattr(self, "_token_attention", False):

@@ -210,6 +210,13 @@ class ModelPackager:
                     "beam_encoder": self._export_bytes(ModelExporter.onnx_export_beam_encoder),
                     "trunk":        self._export_bytes(ModelExporter.onnx_export_trunk),
                 }
+                # A resolution-aware location encoder gives the trunk a third input, `region_state`,
+                # whose value depends on the grid the consumer picks. The graph that produces it
+                # ships with the package, so the consumer can re-run it per LOD change instead of
+                # having the scale baked in as a constant.
+                if self.model.deploy_interface().resolution_aware:
+                    graphs["encoding_config"] = self._export_bytes(
+                        ModelExporter.onnx_export_encoding_config)
                 return self._maybe_fp16(graphs)
             except Exception as e:
                 print(f"[yellow]ModelPackager: two-graph export failed ({e}); using single trunk[/yellow]")
@@ -257,18 +264,51 @@ class ModelPackager:
                 for name, spec in domain["beam_parameters"]
             ],
         )
+        # The model DECLARES its I/O; the domain must be able to shape everything it declares.
+        # save() validates the two against each other and refuses a package that cannot hold up.
+        iface = self.model.deploy_interface()
+        if iface.takes(rd.ModelInput.BEAM_COLLIMATION):
+            core = self.model.get_core_model()
+            dims = int(getattr(core, "beam_shape_param_dims", 1))
+            rd_domain.collimation = (rd.CollimationType.Rectangle if dims == 2
+                                     else rd.CollimationType.Cone)
+
         rd_prov = rd.ModelProvenance(dataset_name=prov["dataset_name"],
                                      software_version=prov["software_version"], physics=prov["physics"])
         metrics = {str(k): float(v) for k, v in self.metrics.items()}
-        return rd, rd_domain, rd_prov, metrics
+        return rd, iface, rd_domain, rd_prov, metrics
 
     def to_bytes(self) -> bytes:
-        rd, domain, prov, metrics = self._rf3m_metadata()
-        return rd.save_to_memory(self._graphs(), domain, prov, metrics)
+        rd, iface, domain, prov, metrics = self._rf3m_metadata()
+        return rd.save_to_memory(self._graphs(), iface, domain, prov, metrics)
 
     def save(self, path: str) -> str:
-        rd, domain, prov, metrics = self._rf3m_metadata()
+        rd, iface, domain, prov, metrics = self._rf3m_metadata()
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        rd.save(path, self._graphs(), domain, prov, metrics)   # C++ writes the bytes
+        rd.save(path, self._graphs(), iface, domain, prov, metrics)   # C++ writes the bytes
         print(f"[green]Wrote RF3M model package -> {path} ({os.path.getsize(path)/1e6:.2f} MB)[/green]")
+        self._verify_readback(rd, path, iface)
         return path
+
+    def _verify_readback(self, rd, path: str, declared) -> None:
+        """Load the package back through the C++ runtime and check it is what we meant to write.
+
+        Writing an RF3M is the last step of training, so a package that is subtly wrong is not
+        noticed until someone deploys it. Reading it back here costs one CPU session and catches the
+        failure that matters: the DECLARED interface deciding the wrong executable class — a NeRF
+        must come back as a VoxelFieldPredictor (queried at points), a field-wise CNN as a
+        VolumeFieldPredictor (emits the volume in one shot).
+        """
+        loaded = rd.ModelStore.load(path, False)   # CPU: no GPU needed to verify the container
+        expected = rd.PredictorType.VoxelField if declared.is_voxelwise else rd.PredictorType.VolumeField
+        if loaded.type != expected:
+            raise RuntimeError(
+                f"RF3M read-back failed for {path}: the package declares "
+                f"{'a per-voxel' if declared.is_voxelwise else 'a whole-volume'} model but loaded as "
+                f"{loaded.type}. The declared interface and the exported trunk graph disagree.")
+        if loaded.interface.id != declared.id:
+            raise RuntimeError(
+                f"RF3M read-back failed for {path}: interface id {loaded.interface.id:#x} on disk != "
+                f"{declared.id:#x} as declared.")
+        print(f"[green]Verified RF3M read-back: {loaded.type} "
+              f"(interface {loaded.interface.id:#x})[/green]")

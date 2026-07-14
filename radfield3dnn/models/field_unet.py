@@ -188,6 +188,9 @@ class FieldScatterUNet(BaseNeuralRadFieldModel):
     def forward(self, batch: TrainingInputData) -> RadiationField:
         gt = batch.ground_truth
         direct = gt.direct_beam.flux if (isinstance(gt, RadiationField) and gt.direct_beam is not None) else gt.scatter_field.flux
+        # The samplers mark non-sampled voxels -inf; as network input that would NaN-poison the
+        # conv stack, so zero them (the -inf convention only applies to the training target).
+        direct = torch.where(torch.isfinite(direct), direct, torch.zeros_like(direct))
         return self._forward_from_direct(direct, batch.input.spectrum)
 
     def _forward_from_direct(self, direct: Tensor, beam_spectrum: Tensor) -> RadiationField:

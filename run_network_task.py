@@ -62,9 +62,7 @@ if __name__ == "__main__":
                         help="Random seed. Defaults to a fresh random seed each run (persisted to the run config).")
     args = parser.parse_args()
 
-    # Apply the global seed to every RNG (python / numpy / torch, and DataLoader workers) so the run
-    # is reproducible and everything downstream — including the max_fields shuffle in the datamodule —
-    # follows this single seed. (Previously --seed was parsed but never applied.)
+    # Apply the global seed to every RNG so the run is reproducible and follows this single seed.
     pl.seed_everything(args.seed, workers=True)
 
     cfg = load_config(args.config)
@@ -78,6 +76,26 @@ if __name__ == "__main__":
     with open(model_config) as f:
         raw_model_cfg = json.load(f)
     model_name = raw_model_cfg["model_name"]
+
+    # ── voxel_supersampling compatibility gate ────────────────────────────────
+    # K>1 replicates every kept voxel K times in forward2volume and mean-reduces the
+    # predictions; that path only exists in the pure-Python whole-field pipeline.
+    _tp = raw_model_cfg.get("parameters", {}).get("training_params", {}) or {}
+    _k = int(_tp.get("voxel_supersampling", 1))
+    if "randomize_voxel_location_in_training" in _tp:
+        raise SystemExit("Config error: training_params.randomize_voxel_location_in_training was "
+                         "removed — use voxel_supersampling (1 = old False; K>1 = K-sample voxel-mean).")
+    if _k > 1:
+        if model_name.endswith("CPP"):
+            raise SystemExit(f"Config error: voxel_supersampling={_k} is not supported for fused "
+                             f"tcnn models ({model_name}); the fp16 fused path is deprecated and "
+                             f"untested with mean-reduction. Use the pure-Python model or K=1.")
+        if cfg.get("dataset", {}).get("type", "Layerwise") == "Voxelwise":
+            raise SystemExit(f"Config error: voxel_supersampling={_k} requires the Layerwise "
+                             f"(whole-field) pipeline; dataset.type=Voxelwise bypasses forward2volume.")
+        if _k > 8:
+            print(f"[yellow]voxel_supersampling={_k}: step cost scales ~linearly with K; >8 is rarely worth it.")
+        print(f"[green]Voxel supersampling ON: K={_k} in-voxel samples per voxel, per-voxel mean supervision.")
 
     # ── Task setup ────────────────────────────────────────────────────────────
     dataset_base = os.path.splitext(os.path.basename(args.dataset_path))[0]
@@ -168,6 +186,16 @@ if __name__ == "__main__":
     # landmine and collapsing scatter accuracy. Snapshotting the uncut GT first keeps the
     # metric comparable to the no-MC-floor baseline.
     dataprocessings = [OriginalGroundTruthPreservation()]
+
+    # Multi-resolution resampling (training only) — MUST run before any -inf-masking stage
+    # (floor cut / ROI sampling). Teaches the scale axis for IPE encoders (auto_region_width).
+    mr_cfg = aug_cfg.get("multi_resolution", {})
+    if mr_cfg.get("enabled", False):
+        from radfield3dnn.preprocessing.augmentations.multi_resolution import MultiResolutionResampling
+        _scales = tuple(mr_cfg.get("scales", (0.5, 0.75, 1.0, 1.5, 2.0)))
+        dataprocessings.append(MultiResolutionResampling(scales=_scales))
+        print(f"[green]Multi-resolution resampling ON: scales {_scales} "
+              f"(area-pool down = exact labels; trilinear up = approximate labels).")
     mc_floor = aug_cfg.get("mc_floor_cut", None)
     if mc_floor:
         from radfield3dnn.datasets.mc_floor_cut import MCFloorCut
@@ -358,6 +386,7 @@ if __name__ == "__main__":
         max_fields=ds_cfg.get("max_fields", None),
         cache_to_ram=ds_cfg.get("cache_to_ram", False),
         cache_ram_gb=ds_cfg.get("cache_ram_gb", None),
+        use_translation=ds_cfg.get("use_translation", False),
     )
     _, VOXEL_SIZE_M = get_dataset_dimensions_and_voxel_size(datamodule)
 
@@ -404,9 +433,17 @@ if __name__ == "__main__":
     # ── Metrics plotter ───────────────────────────────────────────────────────
     voxel_res_for_plot = tuple(voxel_resolution) if voxel_resolution else (50, 50, 50)
     vx = VOXEL_SIZE_M if VOXEL_SIZE_M > 0.0 else 0.01
+    # Joined datasets (single 'radiation' channel) can't compute the scatter/beam-isolation metrics.
+    import glob as _glob
+    from RadFiled3D.utils import FieldStore as _FieldStore
+    _probe_files = sorted(_glob.glob(os.path.join(dataset_path, "fields", "*.rf3")))
+    _joined = bool(_probe_files) and not all(
+        c in _FieldStore.load(_probe_files[0]).get_channel_names() for c in ("scatter_field", "direct_beam"))
+    if _joined:
+        print("[yellow]Joined dataset (single 'radiation' channel) — scatter/beam-isolation metrics disabled.")
     metrics_plotter = MetricsPlotter(
         spectra_bins=32,
-        metrics=build_airkerma_metrics(mu_tr_file, vx),
+        metrics=build_airkerma_metrics(mu_tr_file, vx, joined=_joined),
         voxel_resolution=voxel_res_for_plot,
     )
 

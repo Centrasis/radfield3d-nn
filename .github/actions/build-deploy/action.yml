@@ -9,6 +9,12 @@ inputs:
   python-version:
     description: Python version to build the extension against.
     required: true
+  tests:
+    description: >-
+      Build the C++ test executables too (ON/OFF). ON fetches GoogleTest and produces the ctest
+      suite; the release gate needs this, the plain build check does not.
+    required: false
+    default: 'OFF' 
 
 runs:
   using: composite
@@ -54,7 +60,7 @@ runs:
           -DBuild_DeployPyBindings=ON `
           -DRFNN_WITH_TCNN=OFF `
           -DRFNN_BACKEND_VULKAN=OFF `
-          -DBUILD_RADFIELDNN_TESTS=OFF `
+          "-DBUILD_RADFIELDNN_TESTS=${{ inputs.tests }}" `
           -DBUILD_EXAMPLES=OFF `
           -DORT_GPU=OFF `
           -DCMAKE_BUILD_TYPE=Release
