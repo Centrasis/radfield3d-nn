@@ -17,6 +17,7 @@
 #include <functional>
 #include <map>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -143,6 +144,21 @@ static void append_tensorrt(VolumeFieldPredictor::Impl& im, const ExecutionOptio
 static void configure_options(VolumeFieldPredictor::Impl& im, const ExecutionOptions& exec) {
     im.opts.SetIntraOpNumThreads(0);
     im.opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+    // Diagnostics (env-var gated, zero cost when unset):
+    //   RFNN_ORT_VERBOSE=1     -> verbose session log: prints every node's EP assignment at session build
+    //                             (identifies the CPU-fallback ops behind "N Memcpy nodes added").
+    //   RFNN_ORT_PROFILE=<dir> -> write an ORT profiling JSON (per-node EP + microsecond timings) into
+    //                             <dir>; finalized when the session is destroyed.
+    if (const char* v = std::getenv("RFNN_ORT_VERBOSE"); v && v[0] == '1')
+        im.opts.SetLogSeverityLevel(0 /*ORT_LOGGING_LEVEL_VERBOSE*/);
+    if (const char* p = std::getenv("RFNN_ORT_PROFILE"); p && p[0]) {
+#ifdef _WIN32
+        std::wstring prefix(p, p + std::strlen(p)); prefix += L"\\rfnn_ort";
+#else
+        std::string prefix = std::string(p) + "/rfnn_ort";
+#endif
+        im.opts.EnableProfiling(prefix.c_str());
+    }
     im.device_id = exec.device_id;
     if (!exec.use_gpu) return;  // CPU only
 
@@ -1168,11 +1184,19 @@ static bool ensure_device_broadcast(VolumeFieldPredictor::Impl& im) {
     // crashes ORT), and it gives EVERY env a device data-transfer + shared allocator. A second
     // predictor's registration therefore throws "already registered" — harmless, the transfer still
     // works — so that throw is swallowed and only a missing shared allocator (no CUDA present) turns
-    // the device path off. Bare soname: the loader resolves it next to libonnxruntime on the path.
+    // the device path off. Bare library name (PLATFORM-CORRECT — a hardcoded Linux soname here used to
+    // fail silently on Windows, latching the device path off and pushing every predict through the
+    // host-tiling path with per-inference PCIe uploads, ~5x slower under WDDM): the loader resolves it
+    // next to the already-loaded onnxruntime library / via the process search path.
     try {
+#ifdef _WIN32
+        const wchar_t* libname = L"onnxruntime_providers_cuda.dll";
+        im.env.RegisterExecutionProviderLibrary("rfnn_cuda_ep", std::basic_string<ORTCHAR_T>(libname));
+#else
         const char* soname = "libonnxruntime_providers_cuda.so";
         im.env.RegisterExecutionProviderLibrary(
             "rfnn_cuda_ep", std::basic_string<ORTCHAR_T>(soname, soname + std::char_traits<char>::length(soname)));
+#endif
     } catch (const std::exception&) { /* already registered by an earlier predictor in this process */ }
 
     try {
