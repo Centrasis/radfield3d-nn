@@ -594,9 +594,9 @@ void VoxelFieldPredictor::tile_into(const EncodedBeam& enc, std::array<int, 3> d
                 spec_dst ? spec_dst + done * out_bins_ : nullptr);
         done += valid; pts.clear();
     };
-    for (int i = 0; i < D; ++i)
-    for (int j = 0; j < H; ++j)
-    for (int k = 0; k < W; ++k) {
+    for (int k = 0; k < W; ++k)   // x-FASTEST flat order: row r ↔ (i,j,k) = (r%D, (r/D)%H, r/(D*H)).
+    for (int j = 0; j < H; ++j)   // Matches RadFiled3D's VoxelGrid (x + X·y + X·Y·z) and the renderer's
+    for (int i = 0; i < D; ++i) { // texture layout — the old i-outer order transposed X↔Z on screen.
         pts.push_back({i / std::max(1.f, D - 1.f), j / std::max(1.f, H - 1.f), k / std::max(1.f, W - 1.f)});
         if (pts.size() == CH) flush();
     }
@@ -623,9 +623,9 @@ FieldPrediction VoxelFieldPredictor::predict_visible_voxels(const EncodedBeam& b
     // in vk/vulkan_field.h for the GPU compute-shader equivalent.
     const int D = dims[0], H = dims[1], W = dims[2];
     std::vector<std::array<float, 3>> pts;
-    for (int i = 0; i < D; ++i)
-    for (int j = 0; j < H; ++j)
-    for (int k = 0; k < W; ++k) {
+    for (int k = 0; k < W; ++k)   // x-FASTEST flat order: row r ↔ (i,j,k) = (r%D, (r/D)%H, r/(D*H)).
+    for (int j = 0; j < H; ++j)   // Matches RadFiled3D's VoxelGrid (x + X·y + X·Y·z) and the renderer's
+    for (int i = 0; i < D; ++i) { // texture layout — the old i-outer order transposed X↔Z on screen.
         const float x = i / std::max(1.f, D - 1.f);
         const float y = j / std::max(1.f, H - 1.f);
         const float z = k / std::max(1.f, W - 1.f);
@@ -772,9 +772,9 @@ DeviceFieldOutputs* VoxelFieldPredictor::predict_to_device(const BeamParameters&
     if (N <= kDeviceSingleRunMaxVoxels) {
         std::vector<std::array<float, 3>> pts(N);
         size_t idx = 0;
-        for (int i = 0; i < D; ++i)
+        for (int k = 0; k < W; ++k)   // x-fastest flat order (see the tiling loops)
         for (int j = 0; j < H; ++j)
-        for (int k = 0; k < W; ++k)
+        for (int i = 0; i < D; ++i)
             pts[idx++] = { i / std::max(1.f, D - 1.f), j / std::max(1.f, H - 1.f), k / std::max(1.f, W - 1.f) };
         try {
             std::vector<Ort::Value> res = run_positions(*impl_, reinterpret_cast<const float*>(pts.data()),
@@ -823,9 +823,9 @@ DeviceFieldOutputs* VoxelFieldPredictor::predict_to_device(const BeamParameters&
         }
         done += valid; pts.clear();
     };
-    for (int i = 0; i < D; ++i)
-    for (int j = 0; j < H; ++j)
-    for (int k = 0; k < W; ++k) {
+    for (int k = 0; k < W; ++k)   // x-FASTEST flat order: row r ↔ (i,j,k) = (r%D, (r/D)%H, r/(D*H)).
+    for (int j = 0; j < H; ++j)   // Matches RadFiled3D's VoxelGrid (x + X·y + X·Y·z) and the renderer's
+    for (int i = 0; i < D; ++i) { // texture layout — the old i-outer order transposed X↔Z on screen.
         pts.push_back({ i / std::max(1.f, D - 1.f), j / std::max(1.f, H - 1.f), k / std::max(1.f, W - 1.f) });
         if (pts.size() == CH) flush();
     }
@@ -896,10 +896,11 @@ void VoxelFieldPredictor::predict_into_field(const BeamParameters& beam,
     const EncodedBeam enc = encode_beam(beam);
     const FieldPrediction pred = predict_voxelwise(pts, enc);
 
-    // Scatter each prediction to its flat voxel index (((i*H)+j)*W+k, matching predict_volume).
+    // Scatter each prediction to its flat voxel index (i + D·j + D·H·k, x-fastest — matches
+    // predict_volume's tiling order and RadFiled3D's VoxelGrid layout).
     for (size_t m = 0; m < voxel_locations.size(); ++m) {
         const auto& v = voxel_locations[m];
-        const size_t idx = (static_cast<size_t>(v[0]) * H + v[1]) * W + v[2];
+        const size_t idx = static_cast<size_t>(v[2]) * H * D + static_cast<size_t>(v[1]) * D + v[0];
         if (idx >= n) continue;
         if (m < pred.flux.size()) flux_work[idx] = pred.flux[m];
         for (int b = 0; b < bins; ++b) {
@@ -1236,9 +1237,9 @@ static void ensure_positions_device(VolumeFieldPredictor::Impl& im, int D, int H
     const std::size_t N = static_cast<std::size_t>(D) * H * W;
     std::vector<float> host(N * 3);
     std::size_t idx = 0;
-    for (int i = 0; i < D; ++i)
-    for (int j = 0; j < H; ++j)
-    for (int k = 0; k < W; ++k) {
+    for (int k = 0; k < W; ++k)   // x-FASTEST flat order: row r ↔ (i,j,k) = (r%D, (r/D)%H, r/(D*H)).
+    for (int j = 0; j < H; ++j)   // Matches RadFiled3D's VoxelGrid (x + X·y + X·Y·z) and the renderer's
+    for (int i = 0; i < D; ++i) { // texture layout — the old i-outer order transposed X↔Z on screen.
         host[idx++] = i / std::max(1.f, D - 1.f);
         host[idx++] = j / std::max(1.f, H - 1.f);
         host[idx++] = k / std::max(1.f, W - 1.f);
@@ -1444,9 +1445,9 @@ void VoxelFieldPredictor::predict_volume() {
         pts.clear();
     };
 
-    for (int i = 0; i < D; ++i)
-    for (int j = 0; j < H; ++j)
-    for (int k = 0; k < W; ++k) {
+    for (int k = 0; k < W; ++k)   // x-FASTEST flat order: row r ↔ (i,j,k) = (r%D, (r/D)%H, r/(D*H)).
+    for (int j = 0; j < H; ++j)   // Matches RadFiled3D's VoxelGrid (x + X·y + X·Y·z) and the renderer's
+    for (int i = 0; i < D; ++i) { // texture layout — the old i-outer order transposed X↔Z on screen.
         pts.push_back({i / std::max(1.f, D - 1.f), j / std::max(1.f, H - 1.f), k / std::max(1.f, W - 1.f)});
         if (pts.size() == CH) flush();
     }
@@ -1664,7 +1665,7 @@ void VoxelFieldPredictor::predict_voxels(const std::vector<std::array<int, 3>>& 
                                + std::to_string(v[1]) + ", " + std::to_string(v[2])
                                + ") lies outside the bound grid " + std::to_string(D) + "x"
                                + std::to_string(H) + "x" + std::to_string(W) + ".");
-        flat.push_back((static_cast<std::size_t>(v[0]) * H + v[1]) * W + v[2]);
+        flat.push_back(static_cast<std::size_t>(v[2]) * H * D + static_cast<std::size_t>(v[1]) * D + v[0]);
     }
     std::sort(flat.begin(), flat.end());
     flat.erase(std::unique(flat.begin(), flat.end()), flat.end());
@@ -1687,9 +1688,10 @@ void VoxelFieldPredictor::predict_voxels(const std::vector<std::array<int, 3>>& 
         std::vector<std::array<float, 3>> pts;
         pts.reserve(rows);
         for (std::size_t f = flat[r]; f <= flat[e - 1]; ++f) {
-            const int k = static_cast<int>(f % W);
-            const int j = static_cast<int>((f / W) % H);
-            const int i = static_cast<int>(f / (static_cast<std::size_t>(W) * H));
+            // x-fastest flat order: f = i + D·j + D·H·k (matches the tiling loops / RadFiled3D layout).
+            const int i = static_cast<int>(f % D);
+            const int j = static_cast<int>((f / D) % H);
+            const int k = static_cast<int>(f / (static_cast<std::size_t>(D) * H));
             pts.push_back({i / std::max(1.f, D - 1.f),
                            j / std::max(1.f, H - 1.f),
                            k / std::max(1.f, W - 1.f)});

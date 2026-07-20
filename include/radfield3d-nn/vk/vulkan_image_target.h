@@ -68,6 +68,12 @@ public:
     // the session executes where the image lives. -1 for an empty target.
     int device_index() const;
 
+    // Max of the staging buffer's current contents (one DtoH copy + host scan; fp16-aware; non-finite
+    // values ignored). The renderer auto-scales by the layer max, which the HOST path computes during
+    // its upload — the zero-copy path must get it from here after a predict, or the density scale is
+    // stale and the volume renders arbitrarily dim/blown-out. 0 for an empty target / on failure.
+    float staging_max() const;
+
     explicit operator bool() const;
 
     VulkanImageTarget();

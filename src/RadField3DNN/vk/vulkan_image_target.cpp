@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
+#include <cmath>
 #include <cstdio>
 #include <vector>
 
@@ -200,6 +201,29 @@ bool VulkanImageTarget::fill_test_pattern() {
 }
 
 int VulkanImageTarget::device_index() const { return impl_ ? impl_->device : -1; }
+
+float VulkanImageTarget::staging_max() const {
+    if (!impl_ || !impl_->staging || impl_->n == 0) return 0.f;
+    if (cudaSetDevice(impl_->device) != cudaSuccess) return 0.f;
+    float mx = 0.f;
+    if (impl_->fp16) {
+        std::vector<__half> buf(impl_->n);
+        if (cudaMemcpy(buf.data(), impl_->staging, impl_->n * sizeof(__half),
+                       cudaMemcpyDeviceToHost) != cudaSuccess) return 0.f;
+        for (const __half& h : buf) {
+            const float v = __half2float(h);
+            if (std::isfinite(v) && v > mx) mx = v;
+        }
+    } else {
+        std::vector<float> buf(impl_->n);
+        if (cudaMemcpy(buf.data(), impl_->staging, impl_->n * sizeof(float),
+                       cudaMemcpyDeviceToHost) != cudaSuccess) return 0.f;
+        for (const float v : buf) {
+            if (std::isfinite(v) && v > mx) mx = v;
+        }
+    }
+    return mx;
+}
 VulkanImageTarget::operator bool() const { return impl_ != nullptr; }
 
 }  // namespace vk

@@ -359,7 +359,8 @@ public:
     // Predict ONLY these voxels of the bound grid, writing each one to ITS OWN location in the bound
     // output buffers. Every other voxel is left exactly as the caller had it — so a renderer can
     // refresh a moving ROI, or progressively fill a field, without recomputing (or clearing) the
-    // rest. Indices are (i, j, k) into the grid set by set_voxel_grid(); flat offset = (i*H + j)*W + k.
+    // rest. Indices are (i, j, k) into the grid set by set_voxel_grid(); flat offset = i + D*j + D*H*k
+    // (x-FASTEST — matches RadFiled3D's VoxelGrid layout and the renderer's texture layout).
     //
     // Still zero-copy: the voxels are sorted and grouped into contiguous runs, and each run's Run()
     // binds the caller's memory AT that run's offset. A compact ROI (a slab, a box) is therefore one
