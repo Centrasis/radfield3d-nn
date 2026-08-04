@@ -182,6 +182,54 @@ def test_beam_shape_features_cone_and_rect():
     assert torch.equal(cone_core._beam_shape_features(angle), torch.tensor([[0.7]]))
 
 
+def test_translation_fourier_encoding_is_default():
+    from radfield3dnn.models.encoders.sinusoidal_encoding import SinusoidalFrequencyEncoding
+    m = _build_model()
+    enc = m.get_core_model().translation_encoder
+    assert isinstance(enc[0], SinusoidalFrequencyEncoding)
+    assert enc[0].pos_enc_dim == 6 and enc[0].d_input == 2 and enc[0].append_input
+    # projection consumes the full Fourier width: 2 dims * 6 freqs * (sin, cos) + appended input
+    assert enc[1].in_features == 2 * 6 * 2 + 2
+    # resolved encoding is persisted into the stored config (checkpoint reload stability)
+    stored = m.get_custom_parameters()["conditioning_params"]["translation_encoding"]
+    assert stored["type"] == "fourier" and stored["n_frequencies"] == 6
+
+
+def test_translation_mlp_fallback_matches_pre_fourier_structure():
+    # {"type": "mlp"} must rebuild the ORIGINAL Linear(2, d) stack so checkpoints trained before
+    # the Fourier default keep loading.
+    torch.manual_seed(0)
+    kwargs = _model_kwargs()
+    kwargs["conditioning_params"] = {"type": "Concat", "use_beam_shape": False,
+                                     "translation_encoding": {"type": "mlp"}}
+    m = TPBRFNet(**kwargs)
+    enc = m.get_core_model().translation_encoder
+    assert isinstance(enc[0], torch.nn.Linear) and enc[0].in_features == 2
+    d = m.get_core_model().scalar_encoding_dims
+    assert sum(p.numel() for p in enc.parameters()) == (2 * d + d) + (d * d + d)
+
+
+def test_fourier_translation_conditions_output():
+    # normalized-domain inputs ([0,1], as TranslationNormalization delivers): the Fourier encoder
+    # must separate two translations and drive a different predicted field.
+    m = _build_model()
+    _activate_beam_conditioning(m)
+    x_a = _field_input(B=2, translation=torch.full((2, 3), 0.1))
+    x_b = x_a._replace(translation=torch.full((2, 3), 0.9))
+    with torch.no_grad():
+        out_a = m.forward2volume(x_a, torch.tensor([4, 4, 4]), spectra_bins=32)
+        out_b = m.forward2volume(x_b, torch.tensor([4, 4, 4]), spectra_bins=32)
+    assert not torch.allclose(out_a.scatter_field.flux, out_b.scatter_field.flux)
+
+
+def test_unknown_translation_encoding_rejected():
+    kwargs = _model_kwargs()
+    kwargs["conditioning_params"] = {"type": "Concat", "use_beam_shape": False,
+                                     "translation_encoding": {"type": "hash"}}
+    with pytest.raises(ValueError, match="translation_encoding"):
+        TPBRFNet(**kwargs)
+
+
 def test_pbrfnet_unaffected():
     from radfield3dnn.rftypes import DirectionalInput
     torch.manual_seed(0)

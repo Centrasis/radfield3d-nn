@@ -110,9 +110,19 @@ def get_dataset_dimensions_and_voxel_size(dataset: str | RadiationFieldDataModul
     return (field_dim.x, field_dim.y, field_dim.z), vx_size_x
 
 
-def construct_datamodule(dataset_path: str, batch_size: int, num_workers: int, use_geometry: bool, use_beam_parameters: bool, dataprocessings: list[DataProcessing] = None, voxel_resolution: tuple[int, int, int] = None, prefetch_to_device: bool = True, max_fields: int = None, cache_to_ram: bool = False, cache_ram_gb: float = None, use_translation: bool = False) -> RadiationFieldDataModule:
+def construct_datamodule(dataset_path: str, batch_size: int, num_workers: int, use_geometry: bool, use_beam_parameters: bool, dataprocessings: list[DataProcessing] = None, voxel_resolution: tuple[int, int, int] = None, prefetch_to_device: bool = True, max_fields: int = None, cache_to_ram: bool = False, cache_ram_gb: float = None, use_translation: bool = False, dataset_definition: str | dict = None) -> RadiationFieldDataModule:
+    """dataset_definition: optional path to (or parsed dict of) the dataset definition JSON the
+    dataset was GENERATED with (training config: ``dataset: definition_file``). When given, it is
+    the authoritative source for the beam-parameter ranges (instead of statistics.json) and for
+    the patient-translation ranges the TranslationNormalization needs with use_translation."""
     if dataprocessings is None:
         dataprocessings = []
+    if dataset_definition is not None and not isinstance(dataset_definition, dict):
+        definition_path = dataset_definition
+        assert os.path.exists(definition_path), f"dataset definition file not found: {definition_path}"
+        with open(definition_path, "r") as f:
+            dataset_definition = json.load(f)
+        print(f"[green]Loaded dataset definition from {definition_path}[/green]")
     dataset_cls = RadField3DDataset
     if use_translation:
         assert not use_geometry, "use_translation and use_geometry are not combinable yet."
@@ -147,32 +157,55 @@ def construct_datamodule(dataset_path: str, batch_size: int, num_workers: int, u
         print(f"[green]Voxel resolution of dataset matches enforced resolution {voxel_resolution}!")
 
     if use_beam_parameters:
-        # A missing statistics.json is only FATAL together with use_beam_parameters: the beam
-        # normalizer needs the dataset's opening-angle / distance ranges. Without those keys, fail
-        # loudly with a fixable message instead of a raw KeyError.
-        required = ("tube_opening_angles_deg", "tube_distances_m")
-        missing = [k for k in required if k not in stats]
-        if missing:
-            raise ValueError(
-                f"use_beam_parameters=True requires dataset statistics, but "
-                f"{os.path.join(dataset_path, 'statistics.json')} is missing or lacks keys {missing}. "
-                f"Generate it with scripts/compute_dataset_statistics.py, or disable use_beam_parameters."
+        if dataset_definition is not None:
+            # The definition file the dataset was generated with is authoritative — it holds the
+            # exact sampling ranges, so no statistics.json is required.
+            print("[yellow]Using beam parameters normalization (ranges from dataset definition)!")
+            beam_normalizer = BeamParametersNormalization.from_dataset_definition(
+                dataset_definition, size_per_voxel_m=vx_size, is_origin_centered=False
             )
-        print("[yellow]Using beam parameters normalization!")
-        beam_normalizer = BeamParametersNormalization(
-            opening_angle_range_deg=(
-                stats["tube_opening_angles_deg"]["Min"],
-                stats["tube_opening_angles_deg"]["Max"]
-            ),
-            size_per_voxel_m=vx_size,
-            is_origin_centered=False,
-            distance_range_m=(
-                stats["tube_distances_m"]["Min"],
-                stats["tube_distances_m"]["Max"]
-            ),
-            half_field_size=(field_dim[0]/2, field_dim[1]/2, field_dim[2]/2)
-        )
+        else:
+            # A missing statistics.json is only FATAL together with use_beam_parameters: the beam
+            # normalizer needs the dataset's opening-angle / distance ranges. Without those keys, fail
+            # loudly with a fixable message instead of a raw KeyError.
+            required = ("tube_opening_angles_deg", "tube_distances_m")
+            missing = [k for k in required if k not in stats]
+            if missing:
+                raise ValueError(
+                    f"use_beam_parameters=True requires dataset statistics, but "
+                    f"{os.path.join(dataset_path, 'statistics.json')} is missing or lacks keys {missing}. "
+                    f"Generate it with scripts/compute_dataset_statistics.py, provide the dataset "
+                    f"definition file (training config: dataset.definition_file), or disable use_beam_parameters."
+                )
+            print("[yellow]Using beam parameters normalization!")
+            beam_normalizer = BeamParametersNormalization(
+                opening_angle_range_deg=(
+                    stats["tube_opening_angles_deg"]["Min"],
+                    stats["tube_opening_angles_deg"]["Max"]
+                ),
+                size_per_voxel_m=vx_size,
+                is_origin_centered=False,
+                distance_range_m=(
+                    stats["tube_distances_m"]["Min"],
+                    stats["tube_distances_m"]["Max"]
+                ),
+                half_field_size=(field_dim[0]/2, field_dim[1]/2, field_dim[2]/2)
+            )
         dataprocessings.append(beam_normalizer)
+
+    if use_translation:
+        # Normalize the patient translation to [0, 1] from the generation ranges. Requires the
+        # dataset definition file — without it the translation reaches the network in raw metres
+        # (previous behavior), which trains but couples the checkpoint to the dataset's extent.
+        from radfield3dnn.preprocessing.normalizations.translation import TranslationNormalization
+        if dataset_definition is not None and "GeometryTransformations" in dataset_definition:
+            translation_normalizer = TranslationNormalization.from_dataset_definition(dataset_definition)
+            print(f"[yellow]Using translation normalization: {translation_normalizer.get_parameters()['translation_ranges_m']}")
+            dataprocessings.append(translation_normalizer)
+        else:
+            print("[yellow]WARNING: use_translation without a dataset definition file "
+                  "(dataset.definition_file in the training config) — patient translation stays "
+                  "UN-normalized (raw metres).")
 
     datamodule = RadiationFieldDataModule(
         Path(dataset_path),

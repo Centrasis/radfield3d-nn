@@ -94,6 +94,46 @@ class BeamParametersNormalization(DataProcessing):
                 pass
             return x
 
+    @classmethod
+    def from_dataset_definition(cls, definition, size_per_voxel_m: float | None = None, is_origin_centered: bool = False) -> 'BeamParametersNormalization':
+        """Build from the dataset definition JSON (path or already-parsed dict) the dataset was
+        GENERATED with — the authoritative source for the parameter ranges, available even when no
+        statistics.json was computed. Reads ``Parameters`` (source_distance, source_opening_angle)
+        and ``Metaparameters`` (WorldDim, VoxelSize).
+
+        source_opening_angle is a per-axis rectangle range ([[w_min, h_min], [w_max, h_max]], in
+        metres) for rectangle collimation — unused by the RECTANGLE normalization branch, which
+        scales by field extent — or a scalar [deg_min, deg_max] range for cone beams."""
+        import json as _json
+        if not isinstance(definition, dict):
+            with open(definition, "r") as f:
+                definition = _json.load(f)
+        params = {p["name"]: p for p in definition.get("Parameters", [])}
+        meta = definition.get("Metaparameters", {})
+
+        assert "source_distance" in params and "range" in params["source_distance"], \
+            "Dataset definition lacks a source_distance range"
+        distance_range_m = tuple(float(v) for v in params["source_distance"]["range"])
+
+        opening_angle_range_deg = (1.0, 1.0)  # harmless placeholder; only the CONE branch reads it
+        oa = params.get("source_opening_angle", {}).get("range")
+        if oa is not None and not isinstance(oa[0], (list, tuple)):
+            opening_angle_range_deg = (float(oa[0]), float(oa[1]))  # cone: scalar degree range
+
+        world_dim = meta.get("WorldDim")
+        half_field_size = tuple(float(d) / 2.0 for d in world_dim) if world_dim is not None else None
+        if size_per_voxel_m is None:
+            size_per_voxel_m = float(meta.get("VoxelSize", 0.0))
+        assert size_per_voxel_m > 0, "VoxelSize missing from definition and size_per_voxel_m not given"
+
+        return cls(
+            opening_angle_range_deg=opening_angle_range_deg,
+            size_per_voxel_m=size_per_voxel_m,
+            is_origin_centered=is_origin_centered,
+            distance_range_m=distance_range_m,
+            half_field_size=half_field_size,
+        )
+
     @staticmethod
     def create_from_config(config: dict) -> 'BeamParametersNormalization':
         """

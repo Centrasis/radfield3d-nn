@@ -387,6 +387,9 @@ if __name__ == "__main__":
         cache_to_ram=ds_cfg.get("cache_to_ram", False),
         cache_ram_gb=ds_cfg.get("cache_ram_gb", None),
         use_translation=ds_cfg.get("use_translation", False),
+        # `dataset: definition_file:` — path to the dataset definition JSON the dataset was
+        # generated with; source of the beam-parameter + patient-translation normalization ranges.
+        dataset_definition=ds_cfg.get("definition_file", None),
     )
     _, VOXEL_SIZE_M = get_dataset_dimensions_and_voxel_size(datamodule)
 

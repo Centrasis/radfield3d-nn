@@ -216,7 +216,7 @@ setup(
     python_requires=">=3.12",
     install_requires=[
         "rich>=15.0.0",
-        "RadFiled3D>=1.3.5",
+        "RadFiled3D>=1.3.6",
         "torch>=2.10.0",
         "numpy>=2.4.6",
         "pyyaml>=6.0.3",
