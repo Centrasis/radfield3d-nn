@@ -1,5 +1,5 @@
-# 3.18+: gtest_discover_tests(DISCOVERY_MODE PRE_TEST) below.
-cmake_minimum_required(VERSION 3.18...3.29)
+# 3.21+: gtest_discover_tests(DISCOVERY_MODE PRE_TEST) + $<TARGET_RUNTIME_DLLS> below.
+cmake_minimum_required(VERSION 3.21...3.29)
 
 # RadField3DNN. The project splits into two largely independent halves:
 #   * the DEPLOYMENT runtime (libRadField3DNNDeploy) — ONNX Runtime + RadFiled3D + a GPU
@@ -341,12 +341,27 @@ if(BUILD_RADFIELDNN_TESTS)
   # silent <target>_NOT_BUILT placeholder.
   set(CMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE PRE_TEST)
 
+  # Windows: the test executables link ONNX Runtime's DLL but a Windows exe has no RPATH, so
+  # running them (ctest, or gtest discovery) depends on PATH containing the fetched DLL dir.
+  # Instead, copy every runtime DLL a test target links next to the executable — the exe's own
+  # directory is the first place the Windows loader searches, so the tests run with no PATH
+  # setup at all. No-op on Linux (RPATH already resolves the .so from the build tree).
+  function(rfnn_stage_test_dlls target)
+    if(WIN32)
+      add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_RUNTIME_DLLS:${target}> $<TARGET_FILE_DIR:${target}>
+        COMMAND_EXPAND_LISTS)
+    endif()
+  endfunction()
+
   # Deployment tests (no CUDA): Vulkan export + model-package round-trip.
   if(RFNN_BACKEND_VULKAN)
     add_executable(test_vulkan_export tests/cxx/test_vulkan_export.cpp)
     set_target_properties(test_vulkan_export PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON FOLDER "Tests")
     target_link_libraries(test_vulkan_export libRadField3DNNDeploy GTest::gtest_main)
     gtest_discover_tests(test_vulkan_export)
+    rfnn_stage_test_dlls(test_vulkan_export)
   endif()
 
   add_executable(test_model_io tests/cxx/test_model_io.cpp)
@@ -355,12 +370,14 @@ if(BUILD_RADFIELDNN_TESTS)
     RFNN_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/cxx/data")
   target_link_libraries(test_model_io libRadField3DNNDeploy GTest::gtest_main)
   gtest_discover_tests(test_model_io)
+  rfnn_stage_test_dlls(test_model_io)
 
   # The deployment interface + binding diagnostics. Pure header/ABI contract — no ONNX, no GPU.
   add_executable(test_model_interface tests/cxx/test_model_interface.cpp)
   set_target_properties(test_model_interface PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON FOLDER "Tests")
   target_link_libraries(test_model_interface libRadField3DNNDeploy GTest::gtest_main)
   gtest_discover_tests(test_model_interface)
+  rfnn_stage_test_dlls(test_model_interface)
 
   # VulkanBufferTarget: registering an external allocation as a direct prediction output. Needs the
   # interop (cudart) + the CUDA driver lib to fabricate the opaque FD; skips itself without a GPU.
@@ -369,6 +386,7 @@ if(BUILD_RADFIELDNN_TESTS)
     set_target_properties(test_vulkan_buffer_target PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON FOLDER "Tests")
     target_link_libraries(test_vulkan_buffer_target libRadField3DNNDeploy CUDA::cudart CUDA::cuda_driver GTest::gtest_main)
     gtest_discover_tests(test_vulkan_buffer_target)
+    rfnn_stage_test_dlls(test_vulkan_buffer_target)
   endif()
 
   # tcnn CUDA tests (gated).
