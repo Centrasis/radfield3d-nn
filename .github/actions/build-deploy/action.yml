@@ -65,7 +65,15 @@ runs:
           -DORT_GPU=OFF `
           -DCMAKE_BUILD_TYPE=Release
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-        cmake --build build_deploy --target rfnn_deploy
+        # tests=ON: build EVERYTHING, not just rfnn_deploy — the ctest executables
+        # (test_model_io, test_model_interface, ...) are separate targets that
+        # `--target rfnn_deploy` never builds, which left ctest with only
+        # `<name>_NOT_BUILT` placeholders (exit code 8 under --no-tests=error).
+        if ('${{ inputs.tests }}' -eq 'ON') {
+          cmake --build build_deploy
+        } else {
+          cmake --build build_deploy --target rfnn_deploy
+        }
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
     # The module links ONNX Runtime's shared lib (libonnxruntime.so / onnxruntime.dll). Copy it

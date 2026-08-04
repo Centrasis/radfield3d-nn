@@ -127,3 +127,5 @@ dmypy.json
 cython_debug/
 
 .vscode/
+# test_model_io round-trip artifact (written into the source tree at test time)
+tests/cxx/data/roundtrip.rf3m

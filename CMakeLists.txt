@@ -1,4 +1,5 @@
-cmake_minimum_required(VERSION 3.16...3.29)
+# 3.18+: gtest_discover_tests(DISCOVERY_MODE PRE_TEST) below.
+cmake_minimum_required(VERSION 3.18...3.29)
 
 # RadField3DNN. The project splits into two largely independent halves:
 #   * the DEPLOYMENT runtime (libRadField3DNNDeploy) — ONNX Runtime + RadFiled3D + a GPU
@@ -332,6 +333,13 @@ if(BUILD_RADFIELDNN_TESTS)
   endif()
   enable_testing()
   include(GoogleTest)
+  # PRE_TEST: enumerate the gtest cases when ctest RUNS, not as a post-build step. The test
+  # executables link ONNX Runtime's shared library, so running them at build time would need
+  # PATH/LD_LIBRARY_PATH set during the BUILD (it fails on Windows, where there is no RPATH);
+  # at ctest time the CI workflow already sets it. It also fails loudly ("Unable to find
+  # executable") if a test target was configured but never built, instead of registering a
+  # silent <target>_NOT_BUILT placeholder.
+  set(CMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE PRE_TEST)
 
   # Deployment tests (no CUDA): Vulkan export + model-package round-trip.
   if(RFNN_BACKEND_VULKAN)
