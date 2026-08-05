@@ -22,7 +22,8 @@ class MLFlowLogger(LoggerBase):
         
         # Handle network paths (UNC paths like \\server.de\folder)
         if logs_dir.startswith(('\\\\', '//')):
-            self.tracking_uri = f"file://{logs_dir.replace('\\', '/')}"
+            unc_fwd = logs_dir.replace('\\', '/')  # no backslash in f-string exprs before py3.12
+            self.tracking_uri = f"file://{unc_fwd}"
 
         elif not logs_dir.startswith(('file://', 'http://', 'https://', 'sqlite://', 'mysql://', 'postgresql://')):
             # Local path - convert to file URI
@@ -31,7 +32,11 @@ class MLFlowLogger(LoggerBase):
             # Already a proper URI
             self.tracking_uri = logs_dir
 
-        if project_name is not None:
+        # Project grouping: for FILE stores the project becomes a subdirectory of the tracking
+        # root. For a remote tracking SERVER (http/https) or a DB backend the URI must stay
+        # untouched — grouping there happens via experiment names, and a path suffix would point
+        # at a non-existent endpoint.
+        if project_name is not None and self.tracking_uri.startswith("file://"):
             self.tracking_uri = f"{self.tracking_uri}/{project_name}"
 
     def setup_experiment(self, experiment_name, settings):

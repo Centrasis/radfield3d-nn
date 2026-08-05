@@ -46,6 +46,59 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f)
 
 
+def resolve_logger_config(train_cfg: dict) -> dict:
+    """Normalize the experiment-tracking config into {type, project_name, run_name, offline,
+    mlflow_tracking_uri}.
+
+    Canonical form is a SUB-SECTION under ``training``::
+
+        training:
+          logger:
+            type: mlflow                     # mlflow | wandb
+            mlflow_tracking_uri: /data/mlflow   # mlflow only
+            project_name: radiation-field-estimator
+            run_name: tpbrfnet-fourier-ds04
+            offline: false
+
+    The legacy flat form (``training: logger: wandb`` plus sibling ``project_name`` /
+    ``run_name`` / ``offline`` / ``mlflow_tracking_uri`` keys) is still accepted so existing
+    configs keep running; a flat key is only consulted when the section omits it."""
+    section = train_cfg.get("logger", None)
+    if isinstance(section, dict):
+        cfg = dict(section)
+    else:
+        # str -> the legacy `logger: wandb` scalar; None -> logger block absent entirely.
+        cfg = {"type": section} if section is not None else {}
+    pick = lambda key, default=None: cfg.get(key, train_cfg.get(key, default))
+    return {
+        "type": str(pick("type", "wandb")).lower(),
+        "project_name": pick("project_name", "radiation-field-estimator"),
+        "run_name": pick("run_name", None),
+        "offline": bool(pick("offline", False)),
+        "mlflow_tracking_uri": pick("mlflow_tracking_uri", None),
+    }
+
+
+def collect_cacheable_files(dataset_path: str, min_age_s: float, now: float = None) -> tuple[list[str], int]:
+    """Walk the dataset and return (relative paths to cache, number skipped as too young).
+
+    Guard for datasets that are still GROWING: a field whose file was modified less than
+    ``min_age_s`` seconds ago may still be open in a running simulation writer — copying it would
+    poison the cache with a half-written .rf3. Such files are skipped for this run (0 disables)."""
+    import time as _time
+    if now is None:
+        now = _time.time()
+    files_rel, skipped_young = [], 0
+    for root, _, files in os.walk(dataset_path):
+        for f in files:
+            full = os.path.join(root, f)
+            if min_age_s > 0 and (now - os.path.getmtime(full)) < min_age_s:
+                skipped_young += 1
+                continue
+            files_rel.append(full.removeprefix(dataset_path).lstrip("/\\"))
+    return files_rel, skipped_young
+
+
 if __name__ == "__main__":
     mp.set_start_method('spawn', force=True)
     mp.freeze_support()
@@ -54,7 +107,9 @@ if __name__ == "__main__":
     parser.add_argument("config", type=str, help="YAML training configuration file.")
     parser.add_argument("--task", type=str, default="train", choices=["train", "tune"],
                         help="Task to run: 'train' or 'tune'.")
-    parser.add_argument("--dataset_path", type=str, required=True, help="Path to the dataset.")
+    parser.add_argument("--dataset_path", type=str, default=None,
+                        help="Path to the dataset. Optional if the YAML sets `dataset: path:`; "
+                             "the CLI value wins when both are given.")
     parser.add_argument("--logs_path", type=str, required=True, help="Path to save logs and checkpoints.")
     parser.add_argument("--mu_tr_file", type=str, default=None,
                         help="Mass energy absorption coefficients file for Airkerma metric.")
@@ -70,6 +125,21 @@ if __name__ == "__main__":
     ds_cfg = cfg.get("dataset", {})
     aug_cfg = cfg.get("augmentations", {})
     tune_cfg = cfg.get("tune", {})
+
+    # ── Dataset path ──────────────────────────────────────────────────────────
+    # The YAML `dataset: path:` makes the config self-contained; --dataset_path overrides it
+    # (same dataset config, different machine/mount).
+    dataset_path = args.dataset_path or ds_cfg.get("path")
+    if not dataset_path:
+        raise SystemExit("Config error: no dataset given — set `dataset: path:` in the YAML "
+                         "or pass --dataset_path.")
+    # The run chdirs into its logs working dir below, so pin relative paths NOW: dataset_path
+    # against the invocation cwd, definition_file against the YAML's own directory (so the config
+    # folder stays relocatable as a unit).
+    dataset_path = os.path.abspath(dataset_path)
+    dataset_definition_file = ds_cfg.get("definition_file")
+    if dataset_definition_file and not os.path.isabs(dataset_definition_file):
+        dataset_definition_file = os.path.join(os.path.dirname(os.path.abspath(args.config)), dataset_definition_file)
 
     # ── Model config ──────────────────────────────────────────────────────────
     model_config = train_cfg["model_config"]
@@ -98,10 +168,11 @@ if __name__ == "__main__":
         print(f"[green]Voxel supersampling ON: K={_k} in-voxel samples per voxel, per-voxel mean supervision.")
 
     # ── Task setup ────────────────────────────────────────────────────────────
-    dataset_base = os.path.splitext(os.path.basename(args.dataset_path))[0]
-    # Run name: defaults to "<model>-<dataset>", but the YAML `training: run_name:` overrides it so
+    dataset_base = os.path.splitext(os.path.basename(dataset_path))[0]
+    # Run name: defaults to "<model>-<dataset>", but `training: logger: run_name:` overrides it so
     # ablation runs can be named by their VERSION (e.g. "concat-d4") in a dedicated project_name.
-    experiment_name = train_cfg.get("run_name", f"{model_name}-{dataset_base}")
+    logger_cfg = resolve_logger_config(train_cfg)
+    experiment_name = logger_cfg["run_name"] or f"{model_name}-{dataset_base}"
 
     if args.task == "train":
         from tasks.train import TrainTask
@@ -121,7 +192,7 @@ if __name__ == "__main__":
     os.chdir(new_cwd)
 
     # ── Dataset caching ───────────────────────────────────────────────────────
-    dataset_path = args.dataset_path
+    # (dataset_path already resolved from --dataset_path / `dataset: path:` above)
     if ds_cfg.get("cache", False):
         import shutil, time
         from joblib import Parallel, delayed
@@ -132,10 +203,14 @@ if __name__ == "__main__":
         cache_dir = ds_cfg.get("cache_dir", "./.cache")
         cache_path = cache_dir if os.path.isabs(cache_dir) else os.path.abspath(cache_dir)
 
-        files_rel = []
-        for root, _, files in os.walk(dataset_path):
-            for f in files:
-                files_rel.append(os.path.join(root, f).removeprefix(dataset_path).lstrip("/\\"))
+        # `dataset: cache_min_age_s` (default 60, 0 = off): don't copy fields younger than this —
+        # they may still be being written by a running simulation (see collect_cacheable_files).
+        min_age_s = float(ds_cfg.get("cache_min_age_s", 60))
+        files_rel, skipped_young = collect_cacheable_files(dataset_path, min_age_s)
+        if skipped_young:
+            print(f"[yellow]Dataset cache: skipped {skipped_young} file(s) modified less than "
+                  f"{min_age_s:.0f}s ago (possibly still under simulation); they are excluded "
+                  f"from this run.")
 
         if os.path.exists(cache_path):
             existing = set()
@@ -389,7 +464,8 @@ if __name__ == "__main__":
         use_translation=ds_cfg.get("use_translation", False),
         # `dataset: definition_file:` — path to the dataset definition JSON the dataset was
         # generated with; source of the beam-parameter + patient-translation normalization ranges.
-        dataset_definition=ds_cfg.get("definition_file", None),
+        # (resolved above relative to the YAML config's directory)
+        dataset_definition=dataset_definition_file,
     )
     _, VOXEL_SIZE_M = get_dataset_dimensions_and_voxel_size(datamodule)
 
@@ -402,25 +478,29 @@ if __name__ == "__main__":
     logs_path = os.path.join(args.logs_path, experiment_name)
     os.makedirs(logs_path, exist_ok=True)
 
-    logger_name = train_cfg.get("logger", "wandb").lower()
-    offline = train_cfg.get("offline", False)
-    # Experiment-tracking project. Override per-run via the YAML `training:
-    # project_name:` key to keep separate runs (e.g. ablations / loss changes)
-    # in their own project instead of the shared default.
-    project_name = train_cfg.get("project_name", "radiation-field-estimator")
+    # (logger_cfg resolved above from the `training: logger:` sub-section; see
+    # resolve_logger_config for the accepted forms.)
+    logger_name = logger_cfg["type"]
+    # Experiment-tracking project. Override per-run via `training: logger: project_name:` to keep
+    # separate runs (e.g. ablations / loss changes) in their own project.
+    project_name = logger_cfg["project_name"]
     if logger_name == "wandb":
         logger: LoggerBase = WandBLogger(
             project_name=project_name,
             logs_dir=os.path.join(logs_path, "wandb"),
-            offline=offline,
+            offline=logger_cfg["offline"],
         )
     elif logger_name == "mlflow":
+        # `training: logger: mlflow_tracking_uri:` — where MLflow tracks to: a local/UNC
+        # directory, a file:// URI, or an http(s)://... tracking server. Default:
+        # <logs_path>/<run>/mlflow.
         logger: LoggerBase = MLFlowLogger(
             project_name=project_name,
-            logs_dir=os.path.join(logs_path, "mlflow"),
+            logs_dir=logger_cfg["mlflow_tracking_uri"] or os.path.join(logs_path, "mlflow"),
         )
     else:
-        raise ValueError(f"Unknown logger: {logger_name}")
+        raise ValueError(f"Unknown logger type: {logger_name!r} (training: logger: type:). "
+                         f"Valid: 'mlflow', 'wandb'.")
 
     logger.setup_experiment(experiment_name, TrainingSettings(
         batch_size=train_cfg.get("batch_size", 32),

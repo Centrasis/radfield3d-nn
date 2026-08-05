@@ -99,22 +99,31 @@ training:
   test_mode: false                   # short smoke run
   debug_probe: false                 # log a per-step LOSS/region breakdown to <logs>/debug_probe.log
   debug_probe_every: 50              # debug-probe interval (steps)
-  logger: wandb                      # wandb | mlflow
-  project_name: radiation-field-estimator  # experiment-tracking project (separate ablations)
-  run_name: null                     # run name (defaults to "<model>-<dataset>")
-  offline: false                     # log offline (no network)
+  logger:                            # experiment tracking (sub-section of `training`)
+    type: wandb                      #   wandb | mlflow
+    mlflow_tracking_uri: null        #   mlflow only: local/UNC dir, file:// URI, or http(s)://
+                                     #     tracking-server URL; default <logs_path>/<run>/mlflow
+    project_name: radiation-field-estimator  # tracking project (separate ablations)
+    run_name: null                   #   run name (defaults to "<model>-<dataset>")
+    offline: false                   #   wandb only: log offline (no network)
 
 dataset:
+  path: null                         # dataset directory; --dataset_path on the CLI overrides it
+                                     #   (one of the two is required)
   type: Layerwise                    # Layerwise | Voxelwise (mostly a batch-size switch; see note)
   voxel_resolution: null             # [x, y, z] inference grid, or null to use the field's own
   use_beam_parameters: false         # reshape 3D origin -> 1D source distance (PBRFNet needs TRUE)
   use_geometry: false                # load the phantom density channel (analytic direct beam shadow)
-  use_translation: false             # derive the 1D patient translation from the geometry density layer (TPBRFNet needs TRUE)
-  translation_axis: z                # axis the patient moves along (density center-of-mass, meters from box center)
+  use_translation: false             # yield TranslationalInput: vec3 patient translation from field metadata (TPBRFNet needs TRUE)
+  definition_file: null              # dataset definition JSON the dataset was GENERATED with; source of the
+                                     #   beam-parameter ranges (replaces statistics.json) and of the patient-
+                                     #   translation [0,1] normalization ranges (required for use_translation)
   use_airkerma: false                # train directly on the air-kerma field
   max_fields: null                   # cap the number of fields loaded (fast iteration)
   cache: false                       # cache decoded fields to disk
   cache_dir: ./.cache                # disk cache location
+  cache_min_age_s: 60                # don't cache files modified less than this many seconds ago
+                                     #   (they may still be written by a running simulation; 0 = off)
   cache_to_ram: false                # cache decoded fields in RAM
   cache_ram_gb: null                 # RAM cache budget (GB)
 
@@ -145,6 +154,10 @@ tune:
   n_trials: 50                       # Optuna trials when --task tune
 ```
 
+> **Logger block:** the legacy flat form (`training: logger: wandb` with sibling `project_name` /
+> `run_name` / `offline` / `mlflow_tracking_uri` keys) is still accepted; a flat key is only read
+> when the `logger:` sub-section does not define it.
+>
 > **Training-only:** `mc_floor_cut` and the importance samplers apply only during training;
 > validation/test always see the whole, unmasked field, so reported accuracy measures whole-field
 > generalisation.
