@@ -160,18 +160,51 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
         return []
 
     def _generate_random_input(self, device, batch_size=2) -> PositionalInput:
-        return PositionalInput(
+        # Shapes come from THIS model's configuration, not from constants: a random input is fed
+        # straight into the model's own encoders (batch-size search, ONNX export, plot callbacks),
+        # so a hardcoded width silently mismatches every model configured differently — e.g. a
+        # rectangle-collimated model (beam_shape_param_dims=2) is indexed at [:, 1] and raises
+        # IndexError on a [B, 1] beam-shape tensor.
+        try:
+            core = self.get_core_model()
+        except NotImplementedError:
+            core = None
+        # The spectrum width is the model's INPUT contract (the dataset's tube-spectrum bin count,
+        # 150 by default), NOT the encoder's internal in_spectra_dim it rebins to — tracing the
+        # export with the internal width would make the deployed graph reject the real input.
+        spectrum_bins = int(getattr(getattr(core, "spectra_encoder", None), "input_spectra_dim", 150))
+        beam_shape_dims = int(getattr(core, "beam_shape_param_dims", 1))
+        # Keep the declared shape TYPE consistent with the parameter width (1 = cone, 2 = the
+        # rectangle's (w, h)); the beam normalizer and any shape-dependent branch key off it.
+        try:
+            from RadFiled3D.RadFiled3D import FieldShape
+            shape_id = float(int(FieldShape.RECTANGLE if beam_shape_dims == 2 else FieldShape.CONE))
+            beam_shape_type = torch.full((batch_size, 1), shape_id, device=device, dtype=torch.float32)
+        except Exception:
+            beam_shape_type = torch.randint(0, 2, (batch_size, 1), device=device, dtype=torch.float32)
+        x = PositionalInput(
             direction=torch.rand(batch_size, 3, device=device),
-            spectrum=HistogramNormalize(dim=-1)(torch.rand(batch_size, 150, device=device)),
+            spectrum=HistogramNormalize(dim=-1)(torch.rand(batch_size, spectrum_bins, device=device)),
             position=torch.rand(batch_size, 3, device=device),
             # origin is the per-sample source distance (a scalar) — [B, 1].
             # PBRFNet(CPP)'s beam encoder asserts origin.shape[-1] == 1; the
             # other models are shape-agnostic about it.
             origin=torch.rand(batch_size, 1, device=device),
             geometry=None,
-            beam_shape_parameters=torch.rand(batch_size, 1, device=device),
-            beam_shape_type=torch.randint(0, 2, (batch_size, 1), device=device, dtype=torch.float32)
+            beam_shape_parameters=torch.rand(batch_size, beam_shape_dims, device=device),
+            beam_shape_type=beam_shape_type,
         )
+        return self._augment_random_input(x, device=device, batch_size=batch_size)
+
+    def _augment_random_input(self, x: PositionalInput, device, batch_size: int) -> PositionalInput:
+        """Hook: models whose beam encoder consumes EXTRA parameters beyond the PositionalInput
+        fields (e.g. TPBRFNet's patient translation) rebuild ``x`` here.
+
+        Every random-input consumer runs the model's own encoder with ``global_parameters=None``
+        — the batch-size search (on_fit_start), the ONNX exporters, the plot callbacks — so an
+        input missing a required beam parameter fails there, not in training. Overriding this one
+        hook fixes all of them at once."""
+        return x
 
     def _search_optimal_batch_size(self):
         print(f"[yellow]Try finding max inner batch_size...")

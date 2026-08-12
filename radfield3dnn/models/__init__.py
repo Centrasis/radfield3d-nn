@@ -11,7 +11,7 @@ from .nerf_cpp import *
 from .nerf_translation import *
 from .feedforward import *
 from .field_unet import *
-from radfield3dnn.rftypes import PositionalInput
+from radfield3dnn.rftypes import PositionalInput, positional_like
 
 
 class ModelConstructor:
@@ -111,24 +111,41 @@ class ModelConstructor:
 class ModelExporter:
     @staticmethod
     def onnx_export(model: BaseNeuralRadFieldModel, path: str):
+        inp = model._generate_random_input(model.device)
+        inp = getattr(inp, "input", inp)   # _generate_random_input may return a PositionalInput directly
+        # Extra beam parameters of the concrete input type (TPBRFNet's patient translation) become
+        # extra graph inputs; "translation" is the name the deploy runtime binds by intent.
+        _translation = getattr(inp, "translation", None)
+
         class _OnnxWrapper(BaseNeuralRadFieldModel):
             def __init__(self, decoratee):
                 super().__init__()
                 self._d = decoratee
 
-            def forward(self, direction, position, spectrum, origin, beam_shape_parameters, beam_shape_type, geometry):
-                return self._d.forward(PositionalInput(
+            def forward(self, direction, position, spectrum, origin, beam_shape_parameters, beam_shape_type, geometry, translation=None):
+                return self._d.forward(positional_like(
+                    inp,
                     direction=direction, beam_shape_parameters=beam_shape_parameters,
                     beam_shape_type=beam_shape_type, position=position,
                     origin=origin, geometry=geometry, spectrum=spectrum,
+                    translation=translation,
                 ))
 
-        inp = model._generate_random_input(model.device)
-        inp = getattr(inp, "input", inp)   # _generate_random_input may return a PositionalInput directly
         wrapped = _OnnxWrapper(model.get_core_model())
         args = (inp.direction, inp.position, inp.spectrum,
                 inp.origin, inp.beam_shape_parameters,
                 inp.beam_shape_type, inp.geometry)
+        arg_names = ["direction", "position", "spectrum", "origin",
+                     "beam_shape_parameters", "beam_shape_type", "geometry"]
+        if _translation is not None:
+            # trailing keyword-with-default -> safe to append positionally
+            args = args + (_translation,)
+            arg_names = arg_names + ["translation"]
+        # A None arg produces NO graph input, and input_names is applied POSITIONALLY to the ones
+        # that exist — so listing a name for a skipped arg shifts every later name onto the wrong
+        # tensor (with geometry=None that silently labelled the translation "geometry", which the
+        # deploy runtime binds by name).
+        input_names = [n for n, a in zip(arg_names, args) if a is not None]
         # Dynamic batch axis on every (non-None) input: a stored model must accept any batch size
         # at inference. Without this dynamo freezes the traced example batch into the graph and the
         # deployed ONNX rejects every other batch size.
@@ -137,8 +154,7 @@ class ModelExporter:
         torch.onnx.export(
             model=wrapped,
             args=args,
-            input_names=["direction", "position", "spectrum", "origin",
-                         "beam_shape_parameters", "beam_shape_type", "geometry"],
+            input_names=input_names,
             dynamic_shapes=dynamic_shapes,
             dynamo=True,
         ).save(path)
@@ -161,27 +177,38 @@ class ModelExporter:
         inp = model._generate_random_input(model.device)
         inp = getattr(inp, "input", inp)
 
+        # A beam parameter the model's input type adds beyond PositionalInput becomes an extra
+        # traced graph input. The name must match what the deploy runtime binds by intent:
+        # "translation" -> ModelInput::PatientTranslation3D (see field_predictors.cpp).
+        translation = getattr(inp, "translation", None)
+
         class _BeamEnc(BaseNeuralRadFieldModel):
             def __init__(self, d):
                 super().__init__()
                 self._d = d
-            def forward(self, direction, distance, spectrum, beam_shape_parameters=None):
-                return self._d.encode_additional_parameters(PositionalInput(
+            def forward(self, direction, distance, spectrum, beam_shape_parameters=None, translation=None):
+                return self._d.encode_additional_parameters(positional_like(
+                    inp,
                     direction=direction, origin=distance, spectrum=spectrum,
                     position=torch.zeros_like(direction),  # unused by the beam encoder
-                    beam_shape_parameters=beam_shape_parameters))
+                    beam_shape_parameters=beam_shape_parameters,
+                    translation=translation))
 
-        args = [inp.direction, inp.origin, inp.spectrum]
-        names = ["direction", "distance", "spectrum"]
+        # The graph's input SET is data-dependent (beam shape and/or translation may be absent), so
+        # the example inputs are passed BY NAME: positional args would bind e.g. the translation to
+        # the beam_shape_parameters slot whenever an earlier optional input is skipped.
+        graph_inputs = {"direction": inp.direction, "distance": inp.origin, "spectrum": inp.spectrum}
         if use_beam_shape:
-            args.append(inp.beam_shape_parameters)
-            names.append("beam_shape_parameters")
+            graph_inputs["beam_shape_parameters"] = inp.beam_shape_parameters
+        if translation is not None:
+            graph_inputs["translation"] = translation
+        names = list(graph_inputs)
         # Dynamic batch axis: without it dynamo freezes the traced batch (=2) into the graph and
         # the deployed ONNX rejects any other batch size (observed via the rfnn_deploy bindings).
         batch = torch.export.Dim("batch")
-        dyn = tuple({0: batch} for _ in args)
-        torch.onnx.export(model=_BeamEnc(core), args=tuple(args), input_names=names,
-                          dynamic_shapes=dyn, dynamo=True).save(path)
+        dyn = {name: {0: batch} for name in names}
+        torch.onnx.export(model=_BeamEnc(core).eval(), args=(), kwargs=graph_inputs,
+                          input_names=names, dynamic_shapes=dyn, dynamo=True).save(path)
 
     @staticmethod
     def onnx_export_encoding_config(model: BaseNeuralRadFieldModel, path: str):

@@ -35,4 +35,12 @@ def build_spectra_encoding(params: dict):
     etype = params["type"]
     if etype not in SPECTRA_ENCODER_REGISTRY:
         raise ValueError(f"Unknown spectra encoding type {etype!r}. Valid: {list(SPECTRA_ENCODER_REGISTRY)}.")
-    return SPECTRA_ENCODER_REGISTRY[etype](**p)
+    # ``input_spectra_dim`` is the width of the tube spectrum as the DATASET delivers it (e.g. 150
+    # bins), which every encoder rebins to its own ``in_spectra_dim`` (e.g. 32). It changes no
+    # weights — it is the model's declared INPUT contract, and it is what the ONNX export must
+    # trace with, otherwise the deployed graph declares the internal width and the runtime's
+    # 150-bin spectrum is rejected ("Got invalid dimensions for input: spectrum").
+    input_spectra_dim = p.pop("input_spectra_dim", None)
+    encoder = SPECTRA_ENCODER_REGISTRY[etype](**p)
+    encoder.input_spectra_dim = int(input_spectra_dim) if input_spectra_dim is not None else 150
+    return encoder

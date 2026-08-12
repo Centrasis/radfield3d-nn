@@ -2,7 +2,7 @@ from .base import BaseNeuralRadFieldModel
 import torch
 from torch import Tensor
 from torch import nn
-from radfield3dnn.rftypes import AirKermaField, RadiationField, PositionalInput, RadiationFieldChannel, DirectionalInput, PositionalInput
+from radfield3dnn.rftypes import AirKermaField, RadiationField, PositionalInput, RadiationFieldChannel, DirectionalInput, positional_like
 from typing import Union
 from radfield3dnn.models.activations.HistogramNormalize import HistogramNormalize
 from radfield3dnn.utils.mean_sampling import resample_histogram_bilinear
@@ -248,15 +248,22 @@ class FeedforwardPointwiseModel(BaseNeuralRadFieldModel):
                 # index 0 is always valid; these rows are discarded via [:n].
                 batch_idx = nn.functional.pad(batch_idx, (0, pad))
 
+            # positional_like (not a bare PositionalInput): the field-level input may carry beam
+            # parameters PositionalInput has no field for — TranslationalInput's patient
+            # translation — and dropping them here leaves the chunk unencodable by the model's own
+            # beam encoder whenever global_parameters is not precomputed.
+            _translation = getattr(x, "translation", None)
             pred_field = self.forward(
-                PositionalInput(
+                positional_like(
+                    x,
                     direction=directions,
                     position=voxels[:, 0:3],
                     spectrum=x.spectrum.index_select(0, batch_idx) if x.spectrum is not None else None,
                     geometry=x.geometry.index_select(0, batch_idx) if x.geometry is not None else None,
                     origin=x.origin.index_select(0, batch_idx) if x.origin is not None else None,
                     beam_shape_parameters=x.beam_shape_parameters.index_select(0, batch_idx) if x.beam_shape_parameters is not None else None,
-                    beam_shape_type=x.beam_shape_type.index_select(0, batch_idx) if x.beam_shape_type is not None else None
+                    beam_shape_type=x.beam_shape_type.index_select(0, batch_idx) if x.beam_shape_type is not None else None,
+                    translation=_translation.index_select(0, batch_idx) if _translation is not None else None,
                 ),
                 global_parameters=global_parameters.index_select(0, batch_idx) if global_parameters is not None else None,
                 region_state=region_state,

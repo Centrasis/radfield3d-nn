@@ -4,7 +4,7 @@ from torch import Tensor
 
 from .nerf import PBRFNet
 from .encoders.sinusoidal_encoding import SinusoidalFrequencyEncoding
-from radfield3dnn.rftypes import PositionalInput
+from radfield3dnn.rftypes import PositionalInput, positional_like
 # The patient translation (vec3, in metres) is loaded from field metadata by RadFiled3D's
 # RadField3DTranslationDataset, which yields this TranslationalInput.
 from RadFiled3D.pytorch.types import TranslationalInput
@@ -103,6 +103,13 @@ class TPBRFNet(PBRFNet):
                 return torch.cat(enc, dim=-1)
 
             return self.beam_encoder(enc)
+
+    def _augment_random_input(self, x, device, batch_size: int):
+        """Random inputs must carry a translation: every consumer of them (batch-size search,
+        ONNX export, plot callbacks) runs encode_additional_parameters directly. Sampled in the
+        NORMALIZED [0, 1] domain the TranslationNormalization delivers."""
+        return positional_like(x, **x._asdict(),
+                               translation=torch.rand(batch_size, 3, device=device))
 
     def get_custom_parameters(self):
         # Persist the RESOLVED translation encoding into the stored config: a checkpoint saved

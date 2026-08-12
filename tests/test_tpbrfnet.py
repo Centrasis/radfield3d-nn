@@ -230,6 +230,81 @@ def test_unknown_translation_encoding_rejected():
         TPBRFNet(**kwargs)
 
 
+def test_random_input_carries_translation_and_forwards():
+    # The batch-size search (on_fit_start) feeds _generate_random_input straight into forward()
+    # with global_parameters=None -> the beam encoder runs on it. A plain PositionalInput here
+    # crashed every TPBRFNet run at startup with "requires a TranslationalInput".
+    from radfield3dnn.rftypes import TranslationalPositionalInput
+    m = _build_model()
+    x = m._generate_random_input(device="cpu")
+    assert isinstance(x, TranslationalPositionalInput)
+    assert x.translation.shape == (2, 3)
+    assert x.position is not None          # still a per-voxel input
+    with torch.no_grad():
+        out = m.forward(x)
+    assert torch.isfinite(out.scatter_field.flux).all()
+
+
+def test_random_input_shapes_follow_the_model_config():
+    # Widths must come from the model's own config: a rectangle model (beam_shape_param_dims=2)
+    # indexes beam_shape_parameters[:, 1], so a hardcoded [B, 1] raised IndexError.
+    rect = _rect_model()
+    x = rect._generate_random_input(device="cpu")
+    assert x.beam_shape_parameters.shape == (2, 2)
+    with torch.no_grad():
+        rect.forward(x)   # must not raise
+    cone = _build_model()
+    assert cone._generate_random_input(device="cpu").beam_shape_parameters.shape == (2, 1)
+
+
+def test_random_input_spectrum_is_the_dataset_width_not_the_rebin_width():
+    # in_spectra_dim (32) is what the encoder REBINS to; the model's input contract is the
+    # dataset's tube-spectrum width (150 by default, configurable) — and that is what the ONNX
+    # export traces, so the deployed graph must not declare the internal width.
+    m = _build_model()   # spectra_encoding_params: in_spectra_dim=32
+    assert m._generate_random_input(device="cpu").spectrum.shape == (2, 150)
+    torch.manual_seed(0)
+    kwargs = _model_kwargs()
+    kwargs["spectra_encoding_params"] = {"type": "simple", "in_spectra_dim": 32,
+                                         "encoded_spectra_dims": 32, "input_spectra_dim": 64}
+    assert TPBRFNet(**kwargs)._generate_random_input(device="cpu").spectrum.shape == (2, 64)
+
+
+def test_positional_like_preserves_translation_across_rebuilds():
+    from radfield3dnn.rftypes import positional_like, TranslationalPositionalInput, PositionalInput
+    x = _field_input(B=2)
+    rebuilt = positional_like(x, direction=x.direction, origin=x.origin, spectrum=x.spectrum,
+                              position=torch.rand(2, 3))
+    assert isinstance(rebuilt, TranslationalPositionalInput)
+    assert torch.equal(rebuilt.translation, x.translation)
+    # per-chunk re-indexing: an explicit translation overrides the template's
+    idx = torch.tensor([0, 0, 1])
+    chunked = positional_like(x, direction=x.direction[idx], origin=x.origin[idx],
+                              spectrum=x.spectrum[idx], position=torch.rand(3, 3),
+                              translation=x.translation[idx])
+    assert chunked.translation.shape == (3, 3)
+    # a template WITHOUT translation still yields a plain PositionalInput
+    from radfield3dnn.rftypes import DirectionalInput
+    plain = DirectionalInput(direction=x.direction, origin=x.origin, spectrum=x.spectrum)
+    assert type(positional_like(plain, direction=x.direction, origin=x.origin,
+                                spectrum=x.spectrum, position=torch.rand(2, 3))) is PositionalInput
+
+
+@pytest.mark.slow
+def test_beam_encoder_export_declares_the_translation_input():
+    # The deploy runtime binds ONNX inputs BY NAME ("translation" -> PatientTranslation3D), so a
+    # missing/misnamed input silently breaks the exported package.
+    onnx = pytest.importorskip("onnx")
+    pytest.importorskip("onnxscript")
+    import tempfile, os
+    from radfield3dnn.models import ModelExporter
+    m = _rect_model()
+    path = os.path.join(tempfile.mkdtemp(), "beam.onnx")
+    ModelExporter.onnx_export_beam_encoder(m, path)
+    names = [i.name for i in onnx.load(path).graph.input]
+    assert names == ["direction", "distance", "spectrum", "beam_shape_parameters", "translation"]
+
+
 def test_pbrfnet_unaffected():
     from radfield3dnn.rftypes import DirectionalInput
     torch.manual_seed(0)

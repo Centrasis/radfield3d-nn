@@ -3,7 +3,7 @@ from lightning.pytorch.trainer import Trainer
 from loggers.logger import LoggerBase
 import torch
 import random
-from radfield3dnn.rftypes import AirKermaField, TrainingInputData, RadiationField, PositionalInput
+from radfield3dnn.rftypes import AirKermaField, TrainingInputData, RadiationField, PositionalInput, positional_like
 from torch import Tensor
 import plotly.graph_objects as go
 from rich import print
@@ -298,14 +298,21 @@ class ValidationDepthIntesityPlotter(Callback):
             steps = torch.arange(0, length, step).unsqueeze(1).to(direction.device)
             steps: Tensor = steps * direction + origin_point
 
-            net_in = PositionalInput(
+            # positional_like: this input goes to forward() WITHOUT precomputed global_parameters,
+            # so it must carry every beam parameter the model's encoder reads — including the
+            # patient translation of a TranslationalInput batch (repeated per ray step, like the
+            # other per-sample fields).
+            _translation = getattr(inputs, "translation", None)
+            net_in = positional_like(
+                inputs,
                 direction=direction.repeat(steps.shape[0], 1),
                 spectrum=spectrum.repeat(steps.shape[0], 1),
                 position=steps,
                 origin=origin_point.repeat(steps.shape[0], 1),
                 geometry=inputs.geometry[idx].unsqueeze(0).repeat(steps.shape[0], 1) if inputs.geometry is not None else None,
                 beam_shape_parameters=inputs.beam_shape_parameters[idx].unsqueeze(0).repeat(steps.shape[0], 1) if inputs.beam_shape_parameters is not None else None,
-                beam_shape_type=inputs.beam_shape_type[idx].unsqueeze(0).repeat(steps.shape[0], 1) if inputs.beam_shape_type is not None else None
+                beam_shape_type=inputs.beam_shape_type[idx].unsqueeze(0).repeat(steps.shape[0], 1) if inputs.beam_shape_type is not None else None,
+                translation=_translation[idx].unsqueeze(0).repeat(steps.shape[0], 1) if _translation is not None else None,
             )
 
             field: RadiationField = pl_module.forward(net_in)
