@@ -558,6 +558,40 @@ if __name__ == "__main__":
         raise ValueError(f"effective_batch_size ({effective_batch_size}) < batch_size ({batch_size})")
     grad_accum = effective_batch_size // batch_size if effective_batch_size else None
 
+    # ── VRAM preflight ────────────────────────────────────────────────────────
+    # A whole-field step keeps the activations of EVERY voxel of every field in the batch alive for
+    # the backward pass, so the requirement scales with batch_size x voxels. Estimate it up front:
+    # an OOM here surfaces deep inside Lightning and is then MASKED by a teardown error
+    # ("Please call `iter(combined_loader)` first."), which says nothing about the real cause.
+    if hasattr(model, "estimate_step_activation_bytes") and torch.cuda.is_available():
+        _preflight_counts = voxel_resolution if voxel_resolution is not None else None
+        if _preflight_counts is None:
+            try:
+                _dim, _vx = get_dataset_dimensions_and_voxel_size(datamodule)
+                _preflight_counts = tuple(int(round(d / _vx)) for d in _dim)
+            except Exception:
+                _preflight_counts = None
+        if _preflight_counts is not None:
+            try:
+                need = model.estimate_step_activation_bytes(batch_size, _preflight_counts)
+                total = torch.cuda.get_device_properties(0).total_memory
+                voxels = 1
+                for _c in _preflight_counts:
+                    voxels *= int(_c)
+                print(f"[blue]VRAM preflight: batch_size {batch_size} x {voxels:,} voxels "
+                      f"≈ {need / 2**30:.1f} GiB retained activations vs {total / 2**30:.1f} GiB on GPU 0.[/blue]")
+                if need > 0.8 * total:
+                    fits = max(1, int(0.8 * total / max(need / max(batch_size, 1), 1)))
+                    print(f"[red]VRAM preflight: this step almost certainly runs out of memory.[/red]\n"
+                          f"[yellow]  Lower `training: batch_size` to ~{fits} (and set "
+                          f"`effective_batch_size: {batch_size}` to keep the same effective batch via "
+                          f"gradient accumulation), reduce `dataset: voxel_resolution`, or enable "
+                          f"`augmentations: importance_sampling` — it drops most voxels before the "
+                          f"forward. NOTE: `max_inner_batch_size` does NOT help; every chunk's "
+                          f"activations are retained until backward.[/yellow]")
+            except Exception as _e:
+                print(f"[yellow]VRAM preflight skipped: {_e}[/yellow]")
+
     callbacks = [
         LearningRateMonitor("epoch"),
         DeviceStatsMonitor(),

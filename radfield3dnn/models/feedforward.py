@@ -86,6 +86,37 @@ class FeedforwardPointwiseModel(BaseNeuralRadFieldModel):
         n = float(torch.as_tensor(voxel_counts).float().mean())
         return self.encoder_frame_extent / n
 
+    def estimate_step_activation_bytes(self, batch_size: int, voxel_counts) -> int:
+        """Rough activation memory ONE optimizer step retains for the backward pass, in bytes.
+
+        A whole-field step predicts every voxel of every field in the batch. forward2volume splits
+        that into chunks of ``max_inner_batch_size``, but all chunks belong to the SAME loss, so
+        every chunk's activations stay alive until backward: the retained memory scales with
+        batch_size x voxels, NOT with the chunk size. Lowering max_inner_batch_size therefore does
+        not fix an out-of-memory here — fewer voxels per step does (smaller batch_size, with
+        `effective_batch_size` restoring the effective batch via gradient accumulation; a smaller
+        voxel_resolution; or an importance sampler, which drops most voxels before the forward).
+
+        Counts one tensor per Linear output in the trunk and heads plus the encoded location and
+        the two skip/fusion tensors — an estimate, not an allocator-accurate figure.
+        """
+        core = self.get_core_model()
+        floats_per_point = 0
+        for name in ("block1", "block2", "spectra_decoder", "flux_decoder"):
+            module = getattr(core, name, None)
+            if module is not None:
+                floats_per_point += sum(m.out_features for m in module.modules() if isinstance(m, nn.Linear))
+        enc = getattr(core, "positional_location_encoding", None)
+        floats_per_point += int(getattr(enc, "encoded_dims", 0)) + 2 * int(getattr(core, "d_model", 0))
+
+        counts = [int(c) for c in (voxel_counts.tolist() if isinstance(voxel_counts, Tensor) else voxel_counts)]
+        voxels = 1
+        for c in counts:
+            voxels *= c
+        points = int(batch_size) * voxels * max(int(self.voxel_supersampling), 1)
+        bytes_per_float = 2 if getattr(self, "_precision", "fp32") == "fp16" else 4
+        return points * floats_per_point * bytes_per_float
+
     def deploy_interface(self):
         """The beam interface of the base, plus the two things only a per-voxel model can say:
         that it is queried at POSITIONS, and how its location encoder must be configured for the

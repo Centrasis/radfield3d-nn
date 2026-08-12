@@ -80,7 +80,7 @@ training:
   epochs: 25                         # number of training epochs
   batch_size: 32                     # fields per optimizer step (whole fields, not voxels)
   effective_batch_size: null         # if set, gradient-accumulate up to this many fields/step
-  max_inner_batch_size: null         # voxel-chunk size for full-volume assembly (caps VRAM)
+  max_inner_batch_size: null         # voxel-chunk size for full-volume assembly (transient VRAM only)
   num_workers: 4                     # dataloader workers (keep low; /dev/shm is small)
   precision: fp32                    # fp32 | fp16 — pure-Python model compute precision
   mixed_precision: false             # AMP: fp32 master weights, fp16 compute
@@ -154,6 +154,16 @@ tune:
   n_trials: 50                       # Optuna trials when --task tune
 ```
 
+> **VRAM / batch_size:** a whole-field step predicts every voxel of every field in the batch, and
+> all of those activations stay alive until the backward pass — the requirement scales with
+> `batch_size x voxels`, roughly `2 KB x (2 + trunk_depth + 3) x d_model / 192` per voxel. At
+> `voxel_resolution: [64, 64, 64]` with `d_model: 192, trunk_depth: 5` that is ~2 GiB per field, so
+> `batch_size: 32` needs ~67 GiB. Keep the per-step batch small and restore the effective batch
+> with `effective_batch_size` (gradient accumulation), reduce the resolution, or enable
+> `augmentations: importance_sampling` (it drops most voxels before the forward).
+> **`max_inner_batch_size` does not help here** — it bounds the transient chunk size, not the
+> retained graph. The run prints a VRAM preflight estimate at startup.
+>
 > **Logger block:** the legacy flat form (`training: logger: wandb` with sibling `project_name` /
 > `run_name` / `offline` / `mlflow_tracking_uri` keys) is still accepted; a flat key is only read
 > when the `logger:` sub-section does not define it.
