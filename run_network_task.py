@@ -466,6 +466,11 @@ if __name__ == "__main__":
         # generated with; source of the beam-parameter + patient-translation normalization ranges.
         # (resolved above relative to the YAML config's directory)
         dataset_definition=dataset_definition_file,
+        # `dataset: scan_translation_metadata:` (default true) — check every field for the
+        # patient_translation entry before training; `skip_fields_without_translation:` trains on
+        # the fields that have it instead of failing.
+        scan_translation_metadata=ds_cfg.get("scan_translation_metadata", True),
+        skip_fields_without_translation=ds_cfg.get("skip_fields_without_translation", False),
     )
     _, VOXEL_SIZE_M = get_dataset_dimensions_and_voxel_size(datamodule)
 

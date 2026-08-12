@@ -115,6 +115,9 @@ dataset:
   use_beam_parameters: false         # reshape 3D origin -> 1D source distance (PBRFNet needs TRUE)
   use_geometry: false                # load the phantom density channel (analytic direct beam shadow)
   use_translation: false             # yield TranslationalInput: vec3 patient translation from field metadata (TPBRFNet needs TRUE)
+  scan_translation_metadata: true    # with use_translation: check EVERY field for the patient_translation
+                                     #   entry before training and report all offenders (metadata-only read)
+  skip_fields_without_translation: false  # train on the fields that have it instead of failing
   definition_file: null              # dataset definition JSON the dataset was GENERATED with; source of the
                                      #   beam-parameter ranges (replaces statistics.json) and of the patient-
                                      #   translation [0,1] normalization ranges (required for use_translation)

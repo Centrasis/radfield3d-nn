@@ -9,7 +9,7 @@ from radfield3dnn.datasets.prefetcher import CudaStreamPrefetcher
 
 
 class RadiationFieldDataModule(pl.LightningDataModule):
-    def __init__(self, zip_directory, dataset_cls: Type[RadField3DDataset], batch_size=32, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, num_workers=None, data_processings: list[DataProcessing]=None, prefetch_to_device: bool = True, max_fields: int = None, cache_to_ram: bool = False, cache_ram_gb: float = None):
+    def __init__(self, zip_directory, dataset_cls: Type[RadField3DDataset], batch_size=32, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, num_workers=None, data_processings: list[DataProcessing]=None, prefetch_to_device: bool = True, max_fields: int = None, cache_to_ram: bool = False, cache_ram_gb: float = None, exclude_files: set = None):
         super().__init__()
         self.zip_directory = zip_directory
         # Overlap the H2D upload + GPU preprocessing of the next batch with the current step's
@@ -46,6 +46,20 @@ class RadiationFieldDataModule(pl.LightningDataModule):
             dataset_class=self._dataset_cls,
             on_dataset_created=set_augmentations
         )
+
+        # Drop unusable fields (e.g. missing the patient_translation metadata a translation dataset
+        # needs) BEFORE the split, so no split contains a field that would kill a worker mid-epoch.
+        if exclude_files:
+            from torch.utils.data import random_split
+            keep = [f for f in self._dataloader_builder.file_paths if f not in exclude_files]
+            dropped = len(self._dataloader_builder.file_paths) - len(keep)
+            if dropped:
+                if not keep:
+                    raise ValueError("Every field was excluded — nothing left to train on.")
+                self._dataloader_builder.file_paths = keep
+                self._dataloader_builder.train_files, self._dataloader_builder.val_files, self._dataloader_builder.test_files = \
+                    random_split(keep, [self.train_ratio, self.val_ratio, self.test_ratio])
+                print(f"[yellow]Excluded {dropped} unusable field(s); {len(keep)} remain.[/yellow]")
 
         # Optional field-count cap for fast iteration. Subsample the file list
         # (seeded deterministically by the run's global seed) and re-split into train/val/test, so a

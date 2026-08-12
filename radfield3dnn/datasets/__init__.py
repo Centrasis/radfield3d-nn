@@ -110,7 +110,7 @@ def get_dataset_dimensions_and_voxel_size(dataset: str | RadiationFieldDataModul
     return (field_dim.x, field_dim.y, field_dim.z), vx_size_x
 
 
-def construct_datamodule(dataset_path: str, batch_size: int, num_workers: int, use_geometry: bool, use_beam_parameters: bool, dataprocessings: list[DataProcessing] = None, voxel_resolution: tuple[int, int, int] = None, prefetch_to_device: bool = True, max_fields: int = None, cache_to_ram: bool = False, cache_ram_gb: float = None, use_translation: bool = False, dataset_definition: str | dict = None) -> RadiationFieldDataModule:
+def construct_datamodule(dataset_path: str, batch_size: int, num_workers: int, use_geometry: bool, use_beam_parameters: bool, dataprocessings: list[DataProcessing] = None, voxel_resolution: tuple[int, int, int] = None, prefetch_to_device: bool = True, max_fields: int = None, cache_to_ram: bool = False, cache_ram_gb: float = None, use_translation: bool = False, dataset_definition: str | dict = None, scan_translation_metadata: bool = True, skip_fields_without_translation: bool = False) -> RadiationFieldDataModule:
     """dataset_definition: optional path to (or parsed dict of) the dataset definition JSON the
     dataset was GENERATED with (training config: ``dataset: definition_file``). When given, it is
     the authoritative source for the beam-parameter ranges (instead of statistics.json) and for
@@ -207,6 +207,41 @@ def construct_datamodule(dataset_path: str, batch_size: int, num_workers: int, u
                   "(dataset.definition_file in the training config) — patient translation stays "
                   "UN-normalized (raw metres).")
 
+    # ── Translation-metadata preflight ────────────────────────────────────────
+    # RadField3DTranslationDataset raises when a field carries no patient_translation entry. In a
+    # dataset that mixes generation runs that happens at a RANDOM step inside a DataLoader worker,
+    # minutes into training, naming no file. Scan the metadata (cheap: no field decode) up front.
+    exclude_files = None
+    if use_translation and scan_translation_metadata:
+        from radfield3dnn.datasets.translation_scan import (
+            resolve_missing_translation, scan_fields_missing_translation, write_missing_report)
+        # Read the file list the same way DataLoaderBuilder will (directory, or its fields/ subdir).
+        field_dir = os.path.join(dataset_path, "fields")
+        search_dir = field_dir if os.path.isdir(field_dir) else dataset_path
+        candidates = [os.path.join(search_dir, f) for f in sorted(os.listdir(search_dir)) if f.endswith(".rf3")]
+        print(f"[blue]Scanning {len(candidates)} field(s) for patient_translation metadata…[/blue]")
+        missing = scan_fields_missing_translation(candidates, workers=num_workers)
+        if missing:
+            # Report EVERY offender: printed in full, and written one-per-line to the run's working
+            # directory so the list can be fed straight to a cleanup command. Written BEFORE the
+            # decision so it exists even when the run then fails.
+            report_path = write_missing_report(missing)
+            print(f"[red]{len(missing)} of {len(candidates)} field(s) carry NO patient_translation "
+                  f"metadata (unreadable fields are listed here too):[/red]")
+            for path in missing:
+                print(f"  {path}")
+            if report_path:
+                print(f"[blue]Full list written to {report_path} "
+                      f"(e.g. `xargs rm < {os.path.basename(report_path)}`).[/blue]")
+            # Raises unless the run explicitly opts into training on the valid subset.
+            exclude_files = resolve_missing_translation(
+                dataset_path, candidates, missing, skip_fields_without_translation,
+                report_path=report_path)
+            print(f"[yellow]Those {len(missing)} field(s) are EXCLUDED from this run; "
+                  f"{len(candidates) - len(missing)} remain.[/yellow]")
+        else:
+            print(f"[green]All {len(candidates)} fields carry patient_translation metadata.[/green]")
+
     datamodule = RadiationFieldDataModule(
         Path(dataset_path),
         batch_size=batch_size,
@@ -216,7 +251,8 @@ def construct_datamodule(dataset_path: str, batch_size: int, num_workers: int, u
         prefetch_to_device=prefetch_to_device,
         max_fields=max_fields,
         cache_to_ram=cache_to_ram,
-        cache_ram_gb=cache_ram_gb
+        cache_ram_gb=cache_ram_gb,
+        exclude_files=exclude_files,
     )
     datamodule.prepare_data()
 
