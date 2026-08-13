@@ -113,7 +113,7 @@ dataset:
   type: Layerwise                    # Layerwise | Voxelwise (mostly a batch-size switch; see note)
   voxel_resolution: null             # [x, y, z] inference grid, or null to use the field's own
   use_beam_parameters: false         # reshape 3D origin -> 1D source distance (PBRFNet needs TRUE)
-  use_geometry: false                # load the phantom density channel (analytic direct beam shadow)
+  use_geometry: false                # load the phantom geometry channel (binary occupancy mask)
   use_translation: false             # yield TranslationalInput: vec3 patient translation from field metadata (TPBRFNet needs TRUE)
   scan_translation_metadata: true    # with use_translation: check EVERY field for the patient_translation
                                      #   entry before training and report all offenders (metadata-only read)
@@ -132,6 +132,11 @@ dataset:
 
 augmentations:
   enabled: false                     # Gaussian fluence noise + smoothing (first half of training)
+  exclude_geometry_voxels: true      # drop geometry-covered voxels from the TRAINING target: the
+                                     #   simulation excludes them from scoring, so their GT holds no
+                                     #   statistics (mask read from the field's geometry channel;
+                                     #   fields without one are unaffected)
+  geometry_threshold: 0.0            # covered = geometry/density > this (0.0 also fits binary masks)
   smooth_spectra: false              # 3D Gaussian smoothing over the spatial domain
   join_channels: false               # join scatter + direct into one flux target
   mc_floor_cut:                      # remove the Monte-Carlo noise floor from the TRAINING target
@@ -177,6 +182,13 @@ tune:
 >
 > **`use_beam_parameters`:** PBRFNet / `*CPP` require it `true` (their beam encoder expects a 1D
 > source distance). Per-voxel models that consume the 3D origin need it `false`.
+>
+> **Feature composition:** `use_geometry`, `use_translation` and `use_beam_parameters` combine
+> FREELY. The network input is one class with every possible member (`rftypes.FieldInput`); each
+> optional member is initialized by its input decorator (`datasets/decorators.py` — geometry,
+> translation) stacked over the plain dataset, while the beam-parameter members come from the base
+> input and the flag only adds the normalization. A decorator never overwrites a member another
+> source already set — it warns and keeps the existing value.
 
 ### Model JSON
 

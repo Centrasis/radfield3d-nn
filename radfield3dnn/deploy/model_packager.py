@@ -171,11 +171,19 @@ class ModelPackager:
         tmp.close()
         try:
             was_training = self.model.training
-            self.model.eval()
-            with torch.no_grad():
-                export_fn(self.model, tmp.name)
-            if was_training:
-                self.model.train()
+            # Export on CPU: torch.export traces the ops the CURRENT device dispatches to, and
+            # CUDA-specialized kernels (cudnn_*) are not all fake-tensor-traceable. The export
+            # needs no GPU; weights are identical either way. Restored afterwards so the test-end
+            # callback leaves the model where it found it.
+            prior_device = next(self.model.parameters()).device
+            self.model.eval().cpu()
+            try:
+                with torch.no_grad():
+                    export_fn(self.model, tmp.name)
+            finally:
+                self.model.to(prior_device)
+                if was_training:
+                    self.model.train()
             with open(tmp.name, "rb") as f:
                 return f.read()
         finally:

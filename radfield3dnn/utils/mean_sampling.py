@@ -57,21 +57,19 @@ def resample_histogram_bilinear(histogram: torch.Tensor, target_bins: int) -> to
         Resampled histogram of shape (N, target_bins)
     """
     batch_size, source_bins = histogram.shape
-    
-    x_coords = torch.linspace(-1, 1, target_bins, device=histogram.device, dtype=histogram.dtype)
 
-    grid = torch.zeros((batch_size, 1, target_bins, 2), device=histogram.device, dtype=histogram.dtype)
-    grid[:, :, :, 0] = x_coords.view(1, 1, -1)
-    histogram_input = histogram.view(batch_size, 1, 1, source_bins)
-
-    try:
-        resampled = F.grid_sample(histogram_input, grid, mode='bilinear', align_corners=True)
-    except RuntimeError as e:
-        if "CUDNN" in str(e):
-            raise torch.cuda.OutOfMemoryError("Out of memory error during grid_sample. Try reducing the batch size.")
-        else:
-            raise e
-    resampled = resampled.squeeze(1).squeeze(1)
+    if source_bins == target_bins:
+        # Identity width: skip the resample, keep the renormalization below (the fn's contract).
+        resampled = histogram
+    else:
+        # 1D linear resample. Deliberately F.interpolate and NOT grid_sample: numerically
+        # identical here (uniform grid, align_corners=True; verified <=2e-5 fp32 rounding), but on
+        # CUDA grid_sample dispatches to aten.cudnn_grid_sampler, which torch.export's fake-tensor
+        # tracing does not support — it broke the ONNX package export of every model whose
+        # spectrum encoder rebins (UnsupportedOperatorException: aten.cudnn_grid_sampler.default).
+        # interpolate also maps 1:1 onto the ONNX Resize op.
+        resampled = F.interpolate(histogram.unsqueeze(1), size=target_bins,
+                                  mode='linear', align_corners=True).squeeze(1)
     
     resampled_sum = resampled.sum(dim=1, keepdim=True)
     resampled_sum = torch.where(resampled_sum == 0, torch.ones_like(resampled_sum), resampled_sum)

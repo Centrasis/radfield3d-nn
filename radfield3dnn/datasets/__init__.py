@@ -19,6 +19,12 @@ class DatasetType(Enum):
     Layerwise = 1
 
 
+# Dataset feature composition lives in radfield3dnn.datasets.decorators: the plain
+# RadField3DDataset is wrapped in input decorators (translation, geometry) so
+# use_geometry / use_translation / use_beam_parameters combine freely — no per-combination
+# subclasses.
+
+
 class OriginalGroundTruthPreservation(DataProcessing):
     def clone_channel(self, channel: RadiationFieldChannel) -> RadiationFieldChannel:
         return RadiationFieldChannel(
@@ -110,7 +116,7 @@ def get_dataset_dimensions_and_voxel_size(dataset: str | RadiationFieldDataModul
     return (field_dim.x, field_dim.y, field_dim.z), vx_size_x
 
 
-def construct_datamodule(dataset_path: str, batch_size: int, num_workers: int, use_geometry: bool, use_beam_parameters: bool, dataprocessings: list[DataProcessing] = None, voxel_resolution: tuple[int, int, int] = None, prefetch_to_device: bool = True, max_fields: int = None, cache_to_ram: bool = False, cache_ram_gb: float = None, use_translation: bool = False, dataset_definition: str | dict = None, scan_translation_metadata: bool = True, skip_fields_without_translation: bool = False) -> RadiationFieldDataModule:
+def construct_datamodule(dataset_path: str, batch_size: int, num_workers: int, use_geometry: bool, use_beam_parameters: bool, dataprocessings: list[DataProcessing] = None, voxel_resolution: tuple[int, int, int] = None, prefetch_to_device: bool = True, max_fields: int = None, cache_to_ram: bool = False, cache_ram_gb: float = None, use_translation: bool = False, dataset_definition: str | dict = None, scan_translation_metadata: bool = True, skip_fields_without_translation: bool = False, attach_geometry_mask: bool = False) -> RadiationFieldDataModule:
     """dataset_definition: optional path to (or parsed dict of) the dataset definition JSON the
     dataset was GENERATED with (training config: ``dataset: definition_file``). When given, it is
     the authoritative source for the beam-parameter ranges (instead of statistics.json) and for
@@ -123,16 +129,24 @@ def construct_datamodule(dataset_path: str, batch_size: int, num_workers: int, u
         with open(definition_path, "r") as f:
             dataset_definition = json.load(f)
         print(f"[green]Loaded dataset definition from {definition_path}[/green]")
-    dataset_cls = RadField3DDataset
+    # ── Input decorators: any combination of dataset features ─────────────────
+    # The plain dataset provides the core input (direction, origin, spectrum, beam shape — which
+    # is all use_beam_parameters needs); each decorator initializes exactly one optional
+    # FieldInput member, so the flags compose freely. attach_geometry_mask loads the geometry
+    # occupancy mask for GeometryVoxelExclusion even when use_geometry is off.
+    from radfield3dnn.datasets.decorators import GeometryInputDecorator, TranslationInputDecorator
     if use_translation:
-        assert not use_geometry, "use_translation and use_geometry are not combinable yet."
-        print("[yellow]Using translation dataset (patient translation read from field metadata)!")
-        dataset_cls = RadField3DTranslationDataset
-    elif use_geometry:
-        print("[yellow]Using geometry dataset with voxelized geometries!")
-        def create_geom_ds(file_paths: list[str] = None, zip_file: str = None, data_processings: list["DataProcessing"] = None):
-            return RadField3DDatasetWithGeometry(file_paths=file_paths, zip_file=zip_file, data_processings=data_processings, create_binary_geometry_mask=True)
-        dataset_cls = create_geom_ds
+        print("[yellow]Input decorator: patient translation (from field metadata).")
+    if use_geometry or attach_geometry_mask:
+        print("[yellow]Input decorator: geometry occupancy mask (binary, from the geometry channel).")
+
+    def dataset_cls(file_paths: list[str] = None, zip_file: str = None, data_processings: list["DataProcessing"] = None):
+        ds = RadField3DDataset(file_paths=file_paths, zip_file=zip_file, data_processings=data_processings)
+        if use_translation:
+            ds = TranslationInputDecorator(ds)
+        if use_geometry or attach_geometry_mask:
+            ds = GeometryInputDecorator(ds, binary=True)
+        return ds
 
     stats = {}
     if os.path.exists(os.path.join(dataset_path, "statistics.json")):

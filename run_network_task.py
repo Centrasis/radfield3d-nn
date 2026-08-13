@@ -397,6 +397,19 @@ if __name__ == "__main__":
             raise ValueError("--mu_tr_file required when use_airkerma=true")
         dataprocessings.append(AirkermaProcessing(mu_tr_file=mu_tr_file, bins=32, max_energy_eV=1.5e+5))
 
+    # ── Geometry-covered voxel exclusion (DEFAULT ON) ─────────────────────────
+    # Voxels inside the phantom are excluded from scoring by the simulation — their GT holds no
+    # statistics, so they are dropped (-inf) from the TRAINING target. Appended AFTER the samplers
+    # so a floor-zero-injected geometry voxel still ends dropped, not "confidently zero".
+    # `augmentations: exclude_geometry_voxels: false` disables; `geometry_threshold` tunes the
+    # density cutoff (0.0 = any occupancy counts, also matches the binary mask).
+    exclude_geometry = aug_cfg.get("exclude_geometry_voxels", True)
+    if exclude_geometry:
+        from radfield3dnn.preprocessing.augmentations.geometry_exclusion import GeometryVoxelExclusion
+        dataprocessings.append(GeometryVoxelExclusion(threshold=float(aug_cfg.get("geometry_threshold", 0.0))))
+        print("[green]Geometry-covered voxels are excluded from the training target "
+              "(augmentations: exclude_geometry_voxels).")
+
     # ── Model ─────────────────────────────────────────────────────────────────
     torch.set_float32_matmul_precision('high')
 
@@ -471,6 +484,9 @@ if __name__ == "__main__":
         # the fields that have it instead of failing.
         scan_translation_metadata=ds_cfg.get("scan_translation_metadata", True),
         skip_fields_without_translation=ds_cfg.get("skip_fields_without_translation", False),
+        # attach the binary geometry-occupancy mask so GeometryVoxelExclusion has its channel
+        # (no-op for fields without a geometry channel; use_geometry attaches it anyway)
+        attach_geometry_mask=exclude_geometry and not ds_cfg.get("use_geometry", False),
     )
     _, VOXEL_SIZE_M = get_dataset_dimensions_and_voxel_size(datamodule)
 

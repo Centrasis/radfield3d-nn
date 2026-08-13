@@ -14,6 +14,40 @@ class AirKermaField(NamedTuple):
     geometry: Union[Tensor, None] = None  # Optional geometry tensor associated with the air kerma field
 
 
+class FieldInput(NamedTuple):
+    """The ONE field-level network input: every member any dataset feature can provide.
+
+    The base dataset initializes the core members (direction, origin, spectrum, beam shape from
+    the tube metadata); each OPTIONAL member is initialized by its input DECORATOR
+    (radfield3dnn.datasets.decorators): GeometryInputDecorator -> ``geometry``,
+    TranslationInputDecorator -> ``translation``. Absent features stay None, so
+    use_geometry / use_translation / use_beam_parameters combine freely — consumers already
+    read optional members via getattr(..., None) and rebuild via _replace, both of which are
+    structural, not class-bound.
+    """
+    direction: Tensor
+    origin: Tensor
+    spectrum: Tensor
+    geometry: Union[Tensor, None] = None
+    beam_shape_type: Union[Tensor, None] = None
+    beam_shape_parameters: Union[Tensor, None] = None
+    translation: Union[Tensor, None] = None
+
+
+def as_field_input(x) -> FieldInput:
+    """Lift any DirectionalInput-shaped NamedTuple into a FieldInput, carrying over every member
+    the source provides and leaving the rest None. A FieldInput passes through unchanged."""
+    if isinstance(x, FieldInput):
+        return x
+    return FieldInput(
+        direction=x.direction, origin=x.origin, spectrum=x.spectrum,
+        geometry=getattr(x, "geometry", None),
+        beam_shape_type=getattr(x, "beam_shape_type", None),
+        beam_shape_parameters=getattr(x, "beam_shape_parameters", None),
+        translation=getattr(x, "translation", None),
+    )
+
+
 class TranslationalPositionalInput(NamedTuple):
     """A PER-VOXEL query input that also carries the patient translation.
 
