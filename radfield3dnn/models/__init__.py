@@ -14,6 +14,18 @@ from .field_unet import *
 from radfield3dnn.rftypes import PositionalInput, positional_like
 
 
+def _export_batch_dim():
+    """Dynamic batch dim for the ONNX exports, with an EXPLICIT upper bound.
+
+    An unbounded Dim declares the range [0, int64_max]; some traced ops then emit the guard
+    `batch != int64_max` (broadcast/expand sentinel), which the declared range cannot satisfy —
+    torch.export aborts with "Constraints violated (batch) ... != 9223372036854775807" (seen on
+    the trained-model package export). Bounding the dim to a realistic maximum removes the
+    conflict without freezing the batch size.
+    """
+    return torch.export.Dim("batch", min=1, max=2**31 - 1)
+
+
 class ModelConstructor:
     @staticmethod
     def get_subclasses(cls) -> List[Type[BaseNeuralRadFieldModel]]:
@@ -149,7 +161,7 @@ class ModelExporter:
         # Dynamic batch axis on every (non-None) input: a stored model must accept any batch size
         # at inference. Without this dynamo freezes the traced example batch into the graph and the
         # deployed ONNX rejects every other batch size.
-        batch = torch.export.Dim("batch")
+        batch = _export_batch_dim()
         dynamic_shapes = tuple({0: batch} if a is not None else None for a in args)
         torch.onnx.export(
             model=wrapped,
@@ -205,7 +217,7 @@ class ModelExporter:
         names = list(graph_inputs)
         # Dynamic batch axis: without it dynamo freezes the traced batch (=2) into the graph and
         # the deployed ONNX rejects any other batch size (observed via the rfnn_deploy bindings).
-        batch = torch.export.Dim("batch")
+        batch = _export_batch_dim()
         dyn = {name: {0: batch} for name in names}
         torch.onnx.export(model=_BeamEnc(core).eval(), args=(), kwargs=graph_inputs,
                           input_names=names, dynamic_shapes=dyn, dynamo=True).save(path)
@@ -262,7 +274,7 @@ class ModelExporter:
         # Dynamic batch on the per-voxel inputs: position rows vary per inner batch at deploy time,
         # and the latent is broadcast to the same row count by the caller. region_state is per-GRID
         # (not per-row), so it carries no batch axis.
-        batch = torch.export.Dim("batch")
+        batch = _export_batch_dim()
         args = (inp.position, latent)
         names = ["position", "latent"]
         dyn = ({0: batch}, {0: batch})

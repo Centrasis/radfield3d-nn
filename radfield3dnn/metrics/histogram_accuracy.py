@@ -9,22 +9,28 @@ class HistogramOverlapAccuracy(MetricBase):
         super().__init__(layer_name='spectrum', reduction=reduction, weight_with_error=weight_with_error, eps=epsilon)
 
     def _calc_metric(self, target: Tensor, prediction: Tensor) -> Tensor:
-        valid_mask = torch.isfinite(target) & torch.isfinite(prediction)
-        if not valid_mask.any():
+        # PER-VOXEL histogram intersection-over-union: reduce over the BIN axis only, keep every
+        # voxel. The previous implementation flattened via boolean indexing first, which collapsed
+        # `sum(dim=())` over EVERYTHING — one global flux-weighted scalar that could not see
+        # per-voxel spectral shape errors at all (swapping the spectra of two equal-flux voxels
+        # left it unchanged).
+        bin_axis = 1 if target.ndim >= 3 else 0   # (B, bins, ...) batched, (bins, ...) unbatched
+        valid = torch.isfinite(target) & torch.isfinite(prediction)
+        # a voxel counts only when its WHOLE histogram is valid — partially masked histograms are
+        # excluded voxels (ROI wrappers / geometry exclusion mark them via -inf bins)
+        voxel_valid = valid.all(dim=bin_axis)
+        if not voxel_valid.any():
             return torch.zeros(0, device=target.device, dtype=target.dtype)
 
-        target = target[valid_mask]
-        prediction = prediction[valid_mask]
-
-        prediction = prediction + self.eps
-        target = target + self.eps
-        intersection = torch.min(prediction, target)
-        union = (prediction + target) - intersection
-
-        reduce_dims = tuple(range(1, prediction.ndim))
-        iou = intersection.sum(dim=reduce_dims) / union.sum(dim=reduce_dims)
-
-        return iou if self.weight_with_error else self.reduction_fn(iou)
+        t = torch.where(valid, target, torch.zeros_like(target)) + self.eps
+        p = torch.where(valid, prediction, torch.zeros_like(prediction)) + self.eps
+        minimum = torch.min(p, t)
+        intersection = minimum.sum(dim=bin_axis)
+        union = (p + t - minimum).sum(dim=bin_axis)
+        iou = intersection / union
+        # excluded voxels -> -inf; MetricBase.forward's finite-filter drops them before reduction
+        iou = torch.where(voxel_valid, iou, torch.full_like(iou, -torch.inf))
+        return iou.view(-1) if self.weight_with_error else self.reduction_fn(iou.view(-1)[voxel_valid.view(-1)])
 
 
 class SpectrumROIAccuracy(MetricBase):
@@ -80,8 +86,13 @@ class SpectrumROIAccuracy(MetricBase):
         def masked(field):
             spec = field.spectrum
             nr = non_roi
-            while nr.ndim < spec.ndim:
-                nr = nr.unsqueeze(-1)
+            # insert the missing BIN axis where it lives: position 1 (after batch) for a batched
+            # (B, bins, D, H, W) spectrum, position 0 for an unbatched (bins, D, H, W) one.
+            # (The previous trailing unsqueeze built (B, D, H, W, 1) and expanded onto the wrong
+            # axis / failed outright.)
+            if nr.ndim == spec.ndim - 1:
+                nr = nr.unsqueeze(1 if spec.ndim >= 5 else 0)
+            assert nr.ndim == spec.ndim, f"ROI mask rank {nr.ndim} does not match spectrum rank {spec.ndim}"
             spec = torch.where(nr.expand_as(spec), torch.full_like(spec, float('-inf')), spec)
             return field._replace(spectrum=spec)
 

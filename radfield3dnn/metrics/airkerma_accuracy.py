@@ -152,8 +152,15 @@ class AirkermaSphereAccuracy(MetricBase):
         sphere_mask = sphere_mask.unsqueeze(1)
         target_airkerma = target_airkerma[sphere_mask]
         prediction_airkerma = prediction_airkerma[sphere_mask]
-        
+
+        if target_airkerma.numel() == 0:
+            # The shell lies outside the field (radius vs grid extent mismatch): return an EMPTY
+            # result so the epoch accumulator SKIPS this batch — `.mean()` of an empty selection
+            # is NaN, and one NaN poisoned the accumulated metric for the whole epoch.
+            return torch.zeros(0, device=device, dtype=distances.dtype)
         accuracy = self.metric._calc_metric(target_airkerma, prediction_airkerma)
+        if accuracy.numel() == 0:   # everything on the shell was excluded (-inf) / below threshold
+            return torch.zeros(0, device=device, dtype=distances.dtype)
         return accuracy.mean()
 
 
@@ -181,6 +188,11 @@ class AirkermaSupervoxelScatterAccuracy(AirkermaAccuracy):
     def _pool(self, vol: Tensor) -> Tensor:
         """Sum-pool the spatial dims by sv (crop the remainder)."""
         v = vol
+        # 4-D means a BATCHED (B, D, H, W) flux missing its channel dim — insert it at axis 1;
+        # a leading unsqueeze would fabricate (1, B, d, h, w), turning the per-field max into a
+        # batch-global one and breaking the beam-mask broadcast against (B, 1, d, h, w).
+        if v.dim() == 4:
+            v = v.unsqueeze(1)
         while v.dim() < 5:
             v = v.unsqueeze(0)
         D, H, W = v.shape[-3:]

@@ -109,14 +109,19 @@ class MetricBase(nn.Module):
         if self.weight_with_error and input is not None:
             metric = self.weight_by_statistical_error(metric, input=input)
 
-        if len(metric.shape) > 1 or (len(metric.shape) > 0 and metric.shape[0] > 1):
+        if len(metric.shape) > 0 and metric.numel() > 0:
+            # Reduce EVERY non-scalar result, including shape (1,) — batch size 1 is the common
+            # full-volume case, and skipping the finite-filter there let a single NaN/-inf voxel
+            # value pass straight into the epoch accumulator.
             metric = metric.view(-1)
             valid_mask = torch.isfinite(metric)
             if valid_mask.any():
                 metric = metric[valid_mask]
                 metric = self.reduction_fn(metric)
             else:
-                metric = torch.tensor(torch.nan, device=metric.device, dtype=metric.dtype)
+                # nothing valid in this batch: return EMPTY so the accumulator skips it —
+                # a NaN here poisoned the accumulated epoch metric permanently.
+                metric = torch.zeros(0, device=metric.device, dtype=metric.dtype)
         return metric
 
     def weight_by_statistical_error(self, tensor: Tensor, input: TrainingInputData) -> Tensor:

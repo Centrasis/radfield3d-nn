@@ -20,7 +20,18 @@ class GammaPassingRate(MetricBase):
         B, C, D, H, W = tgt.shape
         device = tgt.device
 
-        # normalization (global, per-batch, per-channel) and threshold mask
+        # EXCLUDED voxels: a non-finite prediction voxel (geometry exclusion, masking) must never
+        # act as an agreement CANDIDATE in the neighborhood search — normalize every non-finite
+        # value to +inf, the same sentinel the out-of-bounds shift uses, so its dose term is
+        # infinite and the candidate can never win the minimum. (A bare -inf already behaves that
+        # way through the squared difference; NaN would poison torch.minimum instead.)
+        pred = torch.where(torch.isfinite(pred), pred, torch.full_like(pred, torch.inf))
+
+        # normalization (global, per-batch, per-channel) and threshold mask.
+        # `tgt >= threshold*max` is False for -inf, so excluded REFERENCE voxels drop out here;
+        # a reference voxel whose entire candidate neighborhood is excluded/out-of-bounds keeps
+        # gamma == inf and is dropped by the isfinite(gamma_map) filter below — skipped, not
+        # failed (relevant for large dist_crit reaching into masked regions).
         max_tgt = tgt.amax(dim=(2, 3, 4), keepdim=True)  # shape: (B,C,1,1,1)
         mask = tgt >= (dose_threshold * max_tgt)
 
@@ -77,8 +88,13 @@ class GammaPassingRate(MetricBase):
 
         valid_count = valid.view(B, -1).sum(dim=1)
         pass_count = pass_map.view(B, -1).sum(dim=1)
-        # avoid division by zero if no valid voxels
-        pass_rate = torch.where(valid_count > 0, pass_count.float() / valid_count.float(), torch.zeros_like(pass_count, dtype=torch.float32))
+        # A field with NO valid reference voxel (everything below the dose threshold, or fully
+        # excluded) carries no information for this criterion: report NaN so the metric pipeline
+        # SKIPS it (MetricBase filters non-finite entries; an all-NaN batch returns empty and the
+        # epoch accumulator skips the batch). The previous 0.0 scored such fields as total
+        # failures and dragged the epoch mean down.
+        pass_rate = torch.where(valid_count > 0, pass_count.float() / valid_count.float(),
+                                torch.full_like(pass_count, torch.nan, dtype=torch.float32))
         return pass_rate, pass_map
 
     @torch.no_grad()

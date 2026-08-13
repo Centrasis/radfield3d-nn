@@ -25,7 +25,7 @@ class SSIM3D(MetricBase):
         return g3d.view(1, 1, window_size, window_size, window_size)
 
     @staticmethod
-    def ssim3d(target: Tensor, prediction: Tensor, window_size: int = 7, max_val: float = 1.0, eps: float = 1e-8, kernel_type: Union[Literal['gaussian', 'uniform']] = 'uniform') -> Tensor:
+    def ssim3d(target: Tensor, prediction: Tensor, window_size: int = 7, max_val: float = 1.0, eps: float = 1e-8, kernel_type: Union[Literal['gaussian', 'uniform']] = 'uniform', valid_mask: Tensor = None) -> Tensor:
         assert prediction.shape == target.shape, "Prediction and target must have the same shape."
         B, C, D, H, W = prediction.shape
         if kernel_type == 'gaussian':
@@ -47,20 +47,37 @@ class SSIM3D(MetricBase):
         C2 = (0.03 * max_val) ** 2
         ssim_map = ((2 * mu_xy + C1) * (2 * sigma_xy + C2)) / ((mu_x2 + mu_y2 + C1) * (sigma_x2 + sigma_y2 + C2) + eps)
 
+        if valid_mask is not None:
+            # EXCLUDED voxels (e.g. geometry-covered: not scored by the simulation) must not
+            # contribute to the score. Windows overlapping them are still slightly biased by the
+            # zero-filled values inside the conv, but their CENTERS are dropped from the mean —
+            # the previous behaviour scored them as "both zero -> perfect" instead.
+            valid = valid_mask.to(ssim_map.dtype)
+            ssim = (ssim_map * valid).sum(dim=[1, 2, 3, 4]) / valid.sum(dim=[1, 2, 3, 4]).clamp_min(1.0)
+            return ssim
         ssim = ssim_map.mean(dim=[1, 2, 3, 4])
         return ssim
 
+    @staticmethod
+    def _sanitize_pair(target: Tensor, prediction: Tensor):
+        """Return (target, prediction, valid_mask): non-finite voxels in EITHER side are the
+        exclusion set; both sides get them zero-filled (out-of-place) so the convs stay finite,
+        and the mask keeps them out of the final mean."""
+        valid = torch.isfinite(target) & torch.isfinite(prediction)
+        if not valid.all():
+            target = torch.where(valid, target, torch.zeros_like(target))
+            prediction = torch.where(valid, prediction, torch.zeros_like(prediction))
+            return target, prediction, valid
+        return target, prediction, None
+
     def _calc_metric(self, target: Tensor, prediction: Tensor) -> Tensor:
-        # sanitize on a clone — in-place mutation here leaks into metrics evaluated after
+        # sanitize on clones — in-place mutation here leaks into metrics evaluated after
         # this one on the same tensors (same class of bug as the scatter-metric -inf leak)
-        mask = torch.isinf(prediction) & (prediction < 0)
-        if mask.any():
-            prediction = prediction.clone()
-            prediction[mask] = 0.0
+        target, prediction, valid = SSIM3D._sanitize_pair(target, prediction)
 
         target = target / (target.max() + self.eps)
         prediction = prediction / (prediction.max() + self.eps)
-        return SSIM3D.ssim3d(target, prediction, window_size=7, max_val=1.0, eps=self.eps.item())
+        return SSIM3D.ssim3d(target, prediction, window_size=7, max_val=1.0, eps=self.eps.item(), valid_mask=valid)
 
 
 class MultiLevelSSIM(MetricBase):
@@ -119,11 +136,8 @@ class GradientSSIM3D(SSIM3D):
         return gmag.squeeze(1) if squeezed else gmag
 
     def _calc_metric(self, target: Tensor, prediction: Tensor) -> Tensor:
-        # sanitize like SSIM3D
-        mask = torch.isinf(prediction) & (prediction < 0)
-        if mask.any():
-            prediction = prediction.clone()
-            prediction[mask] = 0.0
+        # sanitize like SSIM3D (both sides, keep the exclusion mask)
+        target, prediction, valid = SSIM3D._sanitize_pair(target, prediction)
 
         # normalize inputs to [0,1]
         target = target / (target.max() + self.eps)
@@ -143,6 +157,7 @@ class GradientSSIM3D(SSIM3D):
             max_val=1.0,
             eps=self.eps.item() if isinstance(self.eps, torch.Tensor) else float(self.eps),
             kernel_type=self.kernel_type,
+            valid_mask=valid,
         )
 
 
@@ -164,27 +179,27 @@ class AirkermaSSIM(MetricBase):
         if isinstance(prediction, RadiationFieldChannel) and (prediction.spectrum is None or prediction.flux is None):
             return None
         
-        # sanitise non-finite voxels out-of-place; never mutate the caller's tensors.
-        if isinstance(prediction, RadiationFieldChannel):
-            flux, spectrum = prediction.flux, prediction.spectrum
-            invalid = ~torch.isfinite(flux)
-            if invalid.any():
-                flux = torch.where(invalid, torch.zeros_like(flux), flux)
-                inv_s = invalid.expand_as(spectrum)
-                spectrum = torch.where(inv_s, torch.full_like(spectrum, 1.0 / spectrum.size(1)), spectrum)
-            prediction_airkerma = self.airkerma.forward(spectrum, flux)
-        elif isinstance(prediction, AirKermaField):
-            ak = prediction.air_kerma
-            prediction_airkerma = torch.where(~torch.isfinite(ak), torch.zeros_like(ak), ak)
-        else:
-            prediction_airkerma = torch.where(~torch.isfinite(prediction), torch.zeros_like(prediction), prediction)
+        # Convert to air-kerma while PRESERVING exclusion: the air-kerma integral needs finite
+        # inputs, so non-finite voxels are zero-filled for the compute (out-of-place; never mutate
+        # the caller's tensors) and then re-marked -inf in the RESULT — the inner SSIM builds its
+        # validity mask from that and drops them from the mean instead of scoring them as zero.
+        def _ak_with_exclusion(field):
+            if isinstance(field, RadiationFieldChannel):
+                flux, spectrum = field.flux, field.spectrum
+                invalid = ~torch.isfinite(flux)
+                if invalid.any():
+                    flux = torch.where(invalid, torch.zeros_like(flux), flux)
+                    inv_s = invalid.expand_as(spectrum) if invalid.dim() == spectrum.dim() else invalid.unsqueeze(1).expand_as(spectrum)
+                    spectrum = torch.where(inv_s, torch.full_like(spectrum, 1.0 / spectrum.size(1)), spectrum)
+                ak = self.airkerma.forward(spectrum, flux)
+                if invalid.any():
+                    inv_ak = invalid if invalid.dim() == ak.dim() else invalid.unsqueeze(1).expand_as(ak)
+                    ak = torch.where(inv_ak, torch.full_like(ak, -torch.inf), ak)
+                return ak
+            ak = field.air_kerma if isinstance(field, AirKermaField) else field
+            return ak
 
-        if isinstance(target, RadiationFieldChannel):
-            target_airkerma = self.airkerma.forward(target.spectrum, target.flux)
-        elif isinstance(target, AirKermaField):
-            target_airkerma = target.air_kerma
-        else:
-            target_airkerma = target
-        target_airkerma = torch.where(~torch.isfinite(target_airkerma), torch.zeros_like(target_airkerma), target_airkerma)
+        prediction_airkerma = _ak_with_exclusion(prediction)
+        target_airkerma = _ak_with_exclusion(target)
 
         return self.ssim.forward(target_airkerma, prediction_airkerma, input)

@@ -82,7 +82,43 @@ class InferenceHelper:
             pred_field = InferenceHelper.linear_normalizer.forward(pred_field)
             gt = InferenceHelper.linear_normalizer.forward(gt)
 
+            # ── Geometry exclusion for EVALUATION ─────────────────────────────
+            # Voxels inside the phantom are excluded from scoring by the simulation — their GT is
+            # not a statistic, so scoring against it is meaningless. Mask them to -inf in BOTH
+            # sides; every metric routed through MetricBase/SMAPE/gamma/histogram drops non-finite
+            # voxels, and the SSIM path excludes them explicitly. Applied AFTER the linear
+            # normalizer on purpose: injecting -inf earlier would flip its scaling branch.
+            gt, pred_field = InferenceHelper._exclude_geometry_voxels(batch, gt, pred_field)
+
             return gt, pred_field
+
+    @staticmethod
+    def _exclude_geometry_voxels(batch: TrainingInputData, gt, pred):
+        """Mask geometry-covered voxels (from the batch's occupancy mask, attached by the
+        GeometryInputDecorator) to -inf in gt AND pred. No-op when the batch carries no geometry
+        channel or the grids cannot be reconciled."""
+        geometry = getattr(batch.input, "geometry", None)
+        if geometry is None:
+            return gt, pred
+        from radfield3dnn.preprocessing.augmentations.geometry_exclusion import GeometryVoxelExclusion
+        probe = gt.air_kerma if isinstance(gt, AirKermaField) else gt.flux
+        excl = GeometryVoxelExclusion()
+        covered = excl._covered_mask(geometry.to(probe.device), probe)
+        if covered is None or not covered.any():
+            return gt, pred
+
+        def _drop(t):
+            if t is None:
+                return None
+            mask = GeometryVoxelExclusion._expand(covered, t)
+            return t if mask is None else torch.where(mask, torch.full_like(t, -torch.inf), t)
+
+        def _mask(field):
+            if isinstance(field, AirKermaField):
+                return field._replace(air_kerma=_drop(field.air_kerma))
+            return field._replace(flux=_drop(field.flux), spectrum=_drop(field.spectrum))
+
+        return _mask(gt), _mask(pred)
 
     @staticmethod
     def extract_gt(batch: TrainingInputData) -> RadiationFieldChannel | AirKermaField:
