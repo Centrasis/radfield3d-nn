@@ -103,6 +103,14 @@ if __name__ == "__main__":
     mp.set_start_method('spawn', force=True)
     mp.freeze_support()
 
+    # Hang diagnosis on clusters: `kill -USR1 <pid>` dumps every thread's stack to stderr
+    # without killing the process — if a run ever wedges again, this names the blocked frame.
+    try:
+        import faulthandler, signal
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
+    except Exception:
+        pass
+
     parser = argparse.ArgumentParser(description="Train a radfield3d neural network model.")
     parser.add_argument("config", type=str, help="YAML training configuration file.")
     parser.add_argument("--task", type=str, default="train", choices=["train", "tune"],
@@ -674,3 +682,31 @@ if __name__ == "__main__":
 
     NETWORK_TASK.run_task(trainer, model, datamodule)
     logger.finalize_logging()
+
+    # ── Deterministic shutdown ────────────────────────────────────────────────
+    # The dataloaders run persistent workers wrapped in the CUDA-stream prefetcher, which
+    # Lightning's teardown cannot see — left alone, their cleanup at interpreter exit can
+    # deadlock against the collapsing CUDA context and the run never terminates (observed as a
+    # dead-but-running SLURM step after the final test table). Shut everything down explicitly,
+    # then hard-exit as a last resort: everything worth persisting (checkpoints, RF3M package,
+    # logger run) is already flushed at this point.
+    print("[green]Run complete — shutting down dataloaders and CUDA.[/green]")
+    try:
+        datamodule.shutdown_dataloaders()
+    except Exception as _e:
+        print(f"[yellow]Dataloader shutdown: {_e}[/yellow]")
+    try:
+        import gc
+        del trainer, model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+    except Exception as _e:
+        print(f"[yellow]CUDA cleanup: {_e}[/yellow]")
+    if train_cfg.get("hard_exit", True):
+        # `training: hard_exit: false` opts out (e.g. when profiling interpreter shutdown).
+        import sys as _sys
+        _sys.stdout.flush()
+        _sys.stderr.flush()
+        os._exit(0)

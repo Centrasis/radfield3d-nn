@@ -205,3 +205,49 @@ def test_batch_size_search_at_fit_start():
     model._search_optimal_batch_size()
     assert rounds["n"] > 1                    # the real encoders ran on the random input
     assert model.max_inner_batch_size is not None and model.max_inner_batch_size >= 2
+
+
+def test_datamodule_shutdown_closes_persistent_loaders():
+    # The shutdown must reach BOTH shapes: prefetcher-wrapped (has .shutdown) and plain
+    # DataLoader with a live persistent-worker iterator.
+    import radfield3dnn.datasets.dataloader as dlmod
+
+    class _Iter:
+        def __init__(self):
+            self.closed = False
+        def _shutdown_workers(self):
+            self.closed = True
+
+    class _Loader:
+        def __init__(self):
+            self._iterator = _Iter()
+
+    class _Prefetcher:
+        def __init__(self):
+            self.closed = False
+        def shutdown(self):
+            self.closed = True
+
+    dm = dlmod.RadiationFieldDataModule.__new__(dlmod.RadiationFieldDataModule)
+    plain, pref = _Loader(), _Prefetcher()
+    it = plain._iterator
+    dm._live_loaders = [plain, pref]
+    dm.shutdown_dataloaders()
+    assert it.closed and pref.closed and plain._iterator is None
+    dm.shutdown_dataloaders()      # idempotent
+
+
+def test_prefetcher_shutdown_releases_iterator_without_cuda():
+    # shutdown() must not require an active iterator or CUDA state.
+    from radfield3dnn.datasets.prefetcher import CudaStreamPrefetcher
+    p = CudaStreamPrefetcher.__new__(CudaStreamPrefetcher)   # skip __init__ (needs a CUDA stream)
+    closed = {"n": 0}
+
+    class _It:
+        def _shutdown_workers(self):
+            closed["n"] += 1
+
+    p._next, p._it = object(), _It()
+    p.shutdown()
+    assert closed["n"] == 1 and p._next is None and p._it is None
+    p.shutdown()                                             # idempotent, no iterator left

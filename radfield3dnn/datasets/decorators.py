@@ -28,14 +28,71 @@ import torch
 from radfield3dnn.rftypes import FieldInput, as_field_input
 
 
+def decorator_chain(dataset):
+    """Yield every layer of a (possibly) decorated dataset, outermost first, innermost last."""
+    layer = dataset
+    while True:
+        yield layer
+        inner = layer.__dict__.get("_inner") if hasattr(layer, "__dict__") else None
+        if inner is None:
+            return
+        layer = inner
+
+
+def unwrap_dataset(dataset, cls=None):
+    """Return the innermost dataset, or — with ``cls`` — the first chain layer whose REAL type
+    is (a subclass of) ``cls``, or None if no layer matches. Matches by ``type(layer)`` on
+    purpose: the decorators spoof ``__class__`` for isinstance-transparency, and unwrap must
+    return the actual instance of the requested class, not a look-alike."""
+    last = None
+    for layer in decorator_chain(dataset):
+        if cls is not None and issubclass(type(layer), cls):
+            return layer
+        last = layer
+    return last if cls is None else None
+
+
+def has_dataset_type(dataset, cls) -> bool:
+    """True when ``cls`` occurs anywhere in the decorator chain — the check to use when testing
+    dataset types explicitly (e.g. has_dataset_type(ds, TranslationInputDecorator) or
+    has_dataset_type(ds, RadField3DDataset))."""
+    return unwrap_dataset(dataset, cls) is not None
+
+
+def _rebuild_decorator(cls, state):
+    """Pickle reconstructor: bypass __init__/__setattr__ and restore the instance dict raw."""
+    obj = object.__new__(cls)
+    for key, value in state.items():
+        object.__setattr__(obj, key, value)
+    return obj
+
+
 class FieldInputDecorator:
-    """Base decorator: wraps a dataset, fills ``member_name`` on each item's input."""
+    """Base decorator: wraps a dataset, fills ``member_name`` on each item's input.
+
+    TRANSPARENT TO isinstance: ``__class__`` reports the wrapped dataset's class, so
+    ``isinstance(decorated, RadiationFieldDataset)`` (RadFiled3D's DataLoaderBuilder asserts
+    exactly this) and any check against the inner dataset's type pass; checks against the
+    decorator's own type still pass too (CPython consults type() first). For explicit
+    chain-membership tests use ``has_dataset_type`` / ``unwrap_dataset`` above.
+    """
 
     member_name: str = None   # set by subclasses
 
     def __init__(self, inner):
         object.__setattr__(self, "_inner", inner)
         object.__setattr__(self, "_warned_existing", False)
+
+    @property
+    def __class__(self):  # noqa: F811 — deliberate isinstance transparency (wrapt-style)
+        return object.__getattribute__(self, "_inner").__class__
+
+    def __reduce__(self):
+        # The __class__ spoof breaks default pickling (protocol-2 __newobj__ reads __class__);
+        # reconstruct explicitly from the REAL type + raw instance dict instead. Spawn-based
+        # DataLoader workers depend on this.
+        return (_rebuild_decorator,
+                (type(self), dict(object.__getattribute__(self, "__dict__"))))
 
     # ── own state vs delegation ───────────────────────────────────────────────
     def _own(self, name, value):

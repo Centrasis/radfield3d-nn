@@ -18,6 +18,7 @@ class RadiationFieldDataModule(pl.LightningDataModule):
         # transfer hooks below to short-circuit (the prefetcher already did their work).
         self._prefetch_to_device = prefetch_to_device
         self._prefetch_active = False
+        self._live_loaders = []   # every built loader/prefetcher, for deterministic shutdown
         self.batch_size = batch_size
         self.train_ratio = train_ratio
         self.val_ratio = val_ratio
@@ -158,12 +159,37 @@ class RadiationFieldDataModule(pl.LightningDataModule):
         device is available; otherwise return it untouched. ``is_training`` is propagated to the
         processings so train-only augmentations/samplers are skipped on the val/test loaders."""
         if not self._prefetch_to_device:
+            self._live_loaders.append(dl)
             return dl
         device = self._resolve_device()
         if device is None:
+            self._live_loaders.append(dl)
             return dl
         self._prefetch_active = True
-        return CudaStreamPrefetcher(dl, device, self.data_processings, is_training=is_training)
+        prefetcher = CudaStreamPrefetcher(dl, device, self.data_processings, is_training=is_training)
+        self._live_loaders.append(prefetcher)
+        return prefetcher
+
+    def shutdown_dataloaders(self):
+        """Deterministically shut down every loader/prefetcher this datamodule handed out.
+
+        build_dataloader uses persistent_workers, and the CudaStreamPrefetcher wrapper hides the
+        DataLoader from Lightning's teardown — without this, the worker processes, pin-memory
+        threads and the prefetcher's in-flight CUDA batch live until interpreter exit, whose
+        cleanup order can deadlock (a finished run that never terminates). Called by
+        run_network_task after logging is finalized; safe to call twice."""
+        loaders, self._live_loaders = self._live_loaders, []
+        for loader in loaders:
+            try:
+                if hasattr(loader, "shutdown"):          # CudaStreamPrefetcher
+                    loader.shutdown()
+                else:                                    # plain DataLoader: close persistent workers
+                    it = getattr(loader, "_iterator", None)
+                    if it is not None and hasattr(it, "_shutdown_workers"):
+                        it._shutdown_workers()
+                    loader._iterator = None
+            except Exception:
+                pass
 
     def train_dataloader(self):
         dl = self.dataloader_builder.build_dataloader(self.train_dataset, batch_size=self.batch_size, shuffle=True, worker_count=self.cpu_count)

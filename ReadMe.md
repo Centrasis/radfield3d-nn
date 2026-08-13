@@ -96,6 +96,9 @@ training:
   mtl_gradient_balancing: false      # extra per-task gradient-magnitude balancing (costly)
   spectrum_loss_weight: null         # fixed weight on the spectrum task (overrides MTL if set)
   validate_gt: false                 # sanity-check the ground truth at startup
+  hard_exit: true                    # os._exit(0) after the run's own shutdown — guards against
+                                     #   interpreter-exit deadlocks (persistent dataloader workers +
+                                     #   CUDA teardown) leaving a dead-but-running cluster job
   test_mode: false                   # short smoke run
   debug_probe: false                 # log a per-step LOSS/region breakdown to <logs>/debug_probe.log
   debug_probe_every: 50              # debug-probe interval (steps)

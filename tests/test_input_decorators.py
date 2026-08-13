@@ -152,3 +152,45 @@ def test_as_field_input_lifts_foreign_named_tuples():
 def test_base_decorator_requires_member_hook():
     with pytest.raises(NotImplementedError):
         FieldInputDecorator(StubFieldDataset()).compute_member(0)
+
+
+# ── isinstance transparency + chain checks ────────────────────────────────────
+
+def _real_decorated():
+    from RadFiled3D.pytorch.datasets.radfield3d import RadField3DDataset
+    return GeometryInputDecorator(TranslationInputDecorator(RadField3DDataset(file_paths=["dummy.rf3"])))
+
+
+def test_isinstance_passes_through_to_the_wrapped_dataset():
+    # EXACTLY the assert that crashed: RadFiled3D's DataLoaderBuilder.build_train_dataset does
+    # `assert isinstance(ds, RadiationFieldDataset)` on the decorated dataset.
+    from RadFiled3D.pytorch.datasets.base import RadiationFieldDataset
+    from RadFiled3D.pytorch.datasets.radfield3d import RadField3DDataset
+    ds = _real_decorated()
+    assert isinstance(ds, RadiationFieldDataset)
+    assert isinstance(ds, RadField3DDataset)
+    # the decorator's own type still tests positive (CPython consults type() first)
+    assert isinstance(ds, GeometryInputDecorator) and isinstance(ds, FieldInputDecorator)
+
+
+def test_chain_membership_check():
+    from radfield3dnn.datasets.decorators import has_dataset_type, unwrap_dataset
+    from RadFiled3D.pytorch.datasets.radfield3d import RadField3DDataset
+    ds = _real_decorated()
+    assert has_dataset_type(ds, TranslationInputDecorator)      # buried mid-chain
+    assert has_dataset_type(ds, GeometryInputDecorator)
+    assert has_dataset_type(ds, RadField3DDataset)
+    assert not has_dataset_type(ds, dict)
+    # unwrap returns the ACTUAL instance of the requested class, not an isinstance look-alike
+    assert type(unwrap_dataset(ds, TranslationInputDecorator)) is TranslationInputDecorator
+    assert type(unwrap_dataset(ds, RadField3DDataset)) is RadField3DDataset
+    assert type(unwrap_dataset(ds)) is RadField3DDataset        # no cls -> innermost
+
+
+def test_spoofed_class_does_not_break_pickling():
+    ds = _real_decorated()
+    clone = pickle.loads(pickle.dumps(ds))
+    assert type(clone) is GeometryInputDecorator                # real type restored
+    from RadFiled3D.pytorch.datasets.base import RadiationFieldDataset
+    assert isinstance(clone, RadiationFieldDataset)             # spoof restored too
+    assert clone.file_paths == ["dummy.rf3"]                    # delegation intact

@@ -32,6 +32,26 @@ class CudaStreamPrefetcher:
         self._preload()
         return self
 
+    def shutdown(self):
+        """Release the live worker iterator and the preloaded CUDA batch.
+
+        The wrapped DataLoader runs with persistent_workers, and Lightning's teardown only knows
+        how to shut down actual DataLoader objects — wrapped in this prefetcher, the worker
+        processes (+ pin-memory thread) and the side-stream batch would otherwise survive until
+        interpreter exit, where their cleanup can deadlock against the collapsing CUDA context
+        (observed as a finished run that never terminates on the cluster)."""
+        self._next = None
+        it = self._it
+        self._it = None
+        if it is not None:
+            shutdown_workers = getattr(it, "_shutdown_workers", None)
+            if shutdown_workers is not None:
+                try:
+                    shutdown_workers()
+                except Exception:
+                    pass
+            del it
+
     def _move(self, batch):
         # apply_to_collection preserves the nested TrainingInputData / PositionalInput /
         # RadiationField namedtuples while moving every Tensor leaf.
