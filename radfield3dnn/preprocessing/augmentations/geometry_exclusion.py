@@ -35,17 +35,33 @@ class GeometryVoxelExclusion(DataProcessing):
         return self
 
     def _covered_mask(self, geometry: torch.Tensor, flux: torch.Tensor) -> torch.Tensor | None:
-        """Boolean mask shaped like ``flux`` (True = geometry-covered), or None if shapes cannot
-        be reconciled (mismatched grid — better to train on everything than to mask wrongly)."""
+        """CANONICAL SPATIAL boolean mask (B, X, Y, Z) — True = geometry-covered — or None if the
+        grids cannot be reconciled (better to train on everything than to mask wrongly).
+
+        Both sides may carry a channel dim: geometry arrives as (B, 1, D, W, H) from the dataset,
+        and the Layerwise GT flux is (B, 1, X, Y, Z) while the spectrum is (B, bins, X, Y, Z) —
+        so the mask is reduced to the bare spatial shape here and re-expanded PER TENSOR in
+        ``_expand`` (a flux-shaped mask cannot be unsqueezed onto the spectrum; that was a real
+        6-dim expand crash in the prefetcher)."""
         g = geometry
-        # geometry arrives as (B, 1, D, W, H) (dataset adds a channel dim) or already (B, D, W, H)
-        while g.dim() > flux.dim() and g.shape[1] == 1:
+        while g.dim() > 4 and g.shape[1] == 1:          # strip channel dims -> (B, D, W, H)
             g = g.squeeze(1)
-        if g.dim() == flux.dim() - 1 and flux.shape[1] == 1:      # flux carries a channel dim
-            g = g.unsqueeze(1)
-        if g.shape != flux.shape:
+        spatial = flux.shape
+        if flux.dim() == 5 and flux.shape[1] == 1:      # flux with channel dim
+            spatial = (flux.shape[0], *flux.shape[2:])
+        if tuple(g.shape) != tuple(spatial):
             return None
         return g > self.threshold
+
+    @staticmethod
+    def _expand(mask: torch.Tensor, t: torch.Tensor) -> torch.Tensor | None:
+        """Broadcast the spatial (B, X, Y, Z) mask onto ``t``: identical shape, or one extra
+        channel/bins dim at position 1 ((B, 1, ...) flux and (B, bins, ...) spectrum alike)."""
+        if t.shape == mask.shape:
+            return mask
+        if t.dim() == mask.dim() + 1 and t.shape[0] == mask.shape[0] and t.shape[2:] == mask.shape[1:]:
+            return mask.unsqueeze(1).expand_as(t)
+        return None
 
     def forward(self, x: TrainingInputData) -> TrainingInputData:
         if not self.training:
@@ -70,14 +86,18 @@ class GeometryVoxelExclusion(DataProcessing):
         if covered is None or not covered.any():
             return x
 
-        def _drop(t: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        def _drop(t: torch.Tensor) -> torch.Tensor:
+            if t is None:
+                return None
+            mask = self._expand(covered, t)
+            if mask is None:                      # irreconcilable tensor: leave it untouched
+                return t
             return torch.where(mask, torch.full_like(t, -torch.inf), t).contiguous()
 
         def _mask_channel(ch: RadiationFieldChannel) -> RadiationFieldChannel:
             if ch is None:
                 return None
-            spec = _drop(ch.spectrum, covered.unsqueeze(1).expand_as(ch.spectrum)) if ch.spectrum is not None else None
-            return ch._replace(flux=_drop(ch.flux, covered.expand_as(ch.flux)), spectrum=spec)
+            return ch._replace(flux=_drop(ch.flux), spectrum=_drop(ch.spectrum))
 
         if isinstance(gt, (RadiationField, rf3RadiationField)):
             new_gt = gt._replace(scatter_field=_mask_channel(gt.scatter_field),
@@ -85,7 +105,7 @@ class GeometryVoxelExclusion(DataProcessing):
         elif isinstance(gt, RadiationFieldChannel):
             new_gt = _mask_channel(gt)
         else:  # AirKermaField
-            new_gt = gt._replace(air_kerma=_drop(gt.air_kerma, covered.expand_as(gt.air_kerma)))
+            new_gt = gt._replace(air_kerma=_drop(gt.air_kerma))
 
         return x._replace(ground_truth=new_gt)
 

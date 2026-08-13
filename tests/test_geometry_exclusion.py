@@ -90,4 +90,26 @@ def test_floor_injected_geometry_voxel_stays_dropped():
     assert torch.isneginf(out.ground_truth.scatter_field.flux).all()
 
 
+def test_real_layerwise_shapes_with_channel_dims():
+    # EXACTLY the shapes from the prefetcher crash: geometry (B, 1, 64^3), flux (B, 1, 64^3),
+    # spectrum (B, 32, 64^3) — the flux-shaped mask must NOT be unsqueezed onto the spectrum
+    # (that produced a 6-dim expand RuntimeError); each tensor gets its own broadcast.
+    B, N, BINS_ = 4, 6, 32   # 6^3 instead of 64^3: same rank/semantics, fast
+    g = torch.Generator().manual_seed(0)
+    geometry = torch.zeros(B, 1, N, N, N)
+    geometry[:, 0, 1, 2, 3] = 1.0
+    inp = TranslationalInput(direction=torch.randn(B, 3, generator=g), origin=torch.rand(B, 1, generator=g),
+                             spectrum=torch.rand(B, 32, generator=g), translation=torch.rand(B, 3, generator=g),
+                             geometry=geometry)
+    gt = RadiationField(
+        scatter_field=RadiationFieldChannel(flux=torch.rand(B, 1, N, N, N, generator=g),
+                                            spectrum=torch.rand(B, BINS_, N, N, N, generator=g), error=None),
+        direct_beam=None, geometry=None)
+    x = TrainingInputData(input=inp, ground_truth=gt, original_ground_truth=gt)
+    out = GeometryVoxelExclusion().train(True)(x)
+    flux, spec = out.ground_truth.scatter_field.flux, out.ground_truth.scatter_field.spectrum
+    assert torch.isneginf(flux[:, 0, 1, 2, 3]).all() and int(torch.isneginf(flux).sum()) == B
+    assert torch.isneginf(spec[:, :, 1, 2, 3]).all() and int(torch.isneginf(spec).sum()) == B * BINS_
+
+
 # (dataset composition is covered in tests/test_input_decorators.py)
