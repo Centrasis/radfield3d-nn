@@ -315,3 +315,38 @@ def test_pbrfnet_unaffected():
     with torch.no_grad():
         out = m.forward2volume(plain, torch.tensor([4, 4, 4]), spectra_bins=32)
     assert torch.isfinite(out.scatter_field.flux).all()
+
+
+def test_export_outputs_contain_no_none_leaves():
+    # The models return NamedTuples with None members (RadiationField.direct_beam/geometry,
+    # RadiationFieldChannel.error). ONNX's converter asks every returned pytree leaf for .name
+    # and dies on None ("'NoneType' object has no attribute 'name'", step 3/3 of the export).
+    from radfield3dnn.models import _field_output_tensors, _output_names_for
+    from radfield3dnn.rftypes import AirKermaField, RadiationField
+    from RadFiled3D.pytorch.types import RadiationFieldChannel
+    flux, spec = torch.rand(4), torch.rand(4, 32)
+    field = RadiationField(scatter_field=RadiationFieldChannel(spectrum=spec, flux=flux, error=None),
+                           direct_beam=None, geometry=None)
+    out = _field_output_tensors(field)
+    assert len(out) == 2 and all(isinstance(t, torch.Tensor) for t in out)
+    assert out[0] is flux and out[1] is spec                    # (flux, spectrum) order
+    assert _output_names_for(field) == ["flux", "spectrum"]
+    # two-head field keeps both channels; air-kerma collapses to one output
+    two = field._replace(direct_beam=RadiationFieldChannel(spectrum=spec, flux=flux, error=None))
+    assert len(_field_output_tensors(two)) == 4
+    assert len(_field_output_tensors(AirKermaField(air_kerma=flux, geometry=None))) == 1
+
+
+@pytest.mark.slow
+def test_single_graph_export_has_named_tensor_outputs():
+    onnx = pytest.importorskip("onnx")
+    pytest.importorskip("onnxscript")
+    import tempfile, os
+    from radfield3dnn.models import ModelExporter
+    m = _rect_model().eval()
+    path = os.path.join(tempfile.mkdtemp(), "single.onnx")
+    ModelExporter.onnx_export(m, path)
+    g = onnx.load(path).graph
+    assert [o.name for o in g.output] == ["flux", "spectrum"]
+    # the spectrum output must keep its bin axis — that is what the deploy runtime binds by
+    assert g.output[1].type.tensor_type.shape.dim[-1].dim_value == 32

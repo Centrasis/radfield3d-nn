@@ -14,6 +14,47 @@ from .field_unet import *
 from radfield3dnn.rftypes import PositionalInput, positional_like
 
 
+def _field_output_tensors(out):
+    """Flatten a model output into a plain tuple of TENSORS for the ONNX export.
+
+    The models return NamedTuples whose unused members are None
+    (``RadiationField(scatter_field=RadiationFieldChannel(spectrum, flux, error=None),
+    direct_beam=None, geometry=None)`` flattens to ``(spectrum, flux, None, None, None)``).
+    torch.onnx's converter walks the returned pytree and asks every leaf for its ``.name`` —
+    a None leaf aborts the conversion with "'NoneType' object has no attribute 'name'"
+    (step 3/3). Returning only the real tensors also fixes the output ORDER contract: the deploy
+    runtime identifies them structurally (the one whose trailing dim is the bin count is the
+    spectrum), so (flux, spectrum) is unambiguous.
+    """
+    from radfield3dnn.rftypes import AirKermaField, RadiationField, rf3RadiationField
+    from RadFiled3D.pytorch.types import RadiationFieldChannel
+
+    def channel(ch):
+        return tuple(t for t in (ch.flux, ch.spectrum) if t is not None)
+
+    if isinstance(out, (RadiationField, rf3RadiationField)):
+        tensors = channel(out.scatter_field) if out.scatter_field is not None else ()
+        if out.direct_beam is not None:
+            tensors = tensors + channel(out.direct_beam)
+        return tensors
+    if isinstance(out, RadiationFieldChannel):
+        return channel(out)
+    if isinstance(out, AirKermaField):
+        return (out.air_kerma,)
+    if isinstance(out, torch.Tensor):
+        return (out,)
+    # unknown structure: keep every tensor leaf, drop the Nones
+    return tuple(t for t in out if isinstance(t, torch.Tensor))
+
+
+def _output_names_for(out) -> list:
+    """Names matching _field_output_tensors' order (informational: the deploy runtime binds
+    outputs structurally, not by name)."""
+    n = len(_field_output_tensors(out))
+    base = ["flux", "spectrum", "direct_flux", "direct_spectrum"]
+    return base[:n] if n <= len(base) else [f"output_{i}" for i in range(n)]
+
+
 def _export_batch_dim():
     """Dynamic batch dim for the ONNX exports, with an EXPLICIT upper bound.
 
@@ -135,13 +176,14 @@ class ModelExporter:
                 self._d = decoratee
 
             def forward(self, direction, position, spectrum, origin, beam_shape_parameters, beam_shape_type, geometry, translation=None):
-                return self._d.forward(positional_like(
+                # tensors only — a None in the returned pytree kills the ONNX conversion
+                return _field_output_tensors(self._d.forward(positional_like(
                     inp,
                     direction=direction, beam_shape_parameters=beam_shape_parameters,
                     beam_shape_type=beam_shape_type, position=position,
                     origin=origin, geometry=geometry, spectrum=spectrum,
                     translation=translation,
-                ))
+                )))
 
         wrapped = _OnnxWrapper(model.get_core_model())
         args = (inp.direction, inp.position, inp.spectrum,
@@ -163,10 +205,13 @@ class ModelExporter:
         # deployed ONNX rejects every other batch size.
         batch = _export_batch_dim()
         dynamic_shapes = tuple({0: batch} if a is not None else None for a in args)
+        with torch.no_grad():
+            output_names = _output_names_for(model.get_core_model().forward(inp))
         torch.onnx.export(
             model=wrapped,
             args=args,
             input_names=input_names,
+            output_names=output_names,
             dynamic_shapes=dynamic_shapes,
             dynamo=True,
         ).save(path)
@@ -266,10 +311,11 @@ class ModelExporter:
                 super().__init__()
                 self._d = d
             def forward(self, position, latent, region_state=None):
-                return self._d.forward(PositionalInput(
+                # tensors only — see _field_output_tensors
+                return _field_output_tensors(self._d.forward(PositionalInput(
                     direction=torch.zeros_like(position), origin=position[..., :1] * 0,
                     spectrum=position[..., :1] * 0, position=position),
-                    global_parameters=latent, region_state=region_state)
+                    global_parameters=latent, region_state=region_state))
 
         # Dynamic batch on the per-voxel inputs: position rows vary per inner batch at deploy time,
         # and the latent is broadcast to the same row count by the caller. region_state is per-GRID
@@ -285,5 +331,7 @@ class ModelExporter:
             args = args + (state,)
             names = names + ["region_state"]
             dyn = dyn + (None,)
+        with torch.no_grad():
+            out_names = _output_names_for(core.forward(inp, global_parameters=latent))
         torch.onnx.export(model=_Trunk(core), args=args, input_names=names,
-                          dynamic_shapes=dyn, dynamo=True).save(path)
+                          output_names=out_names, dynamic_shapes=dyn, dynamo=True).save(path)
