@@ -102,13 +102,15 @@ class HyperparameterTuningTask(Task):
 
     @staticmethod
     def create_processing_from_config(name: str, norm_cfg: dict):
+        supported_cls = []
         for cls in DataProcessing.__subclasses__():
+            supported_cls.append(cls.__name__)
             if cls.__name__ == name:
                 try:
                     return cls.create_from_config(norm_cfg)
                 except Exception as e:
                     raise ValueError(f"Error creating DataProcessing ({name}) from config: {e}")
-        raise ValueError(f"Unsupported DataProcessing class in config: {name}")
+        raise ValueError(f"Unsupported DataProcessing class in config: '{name}' supported are: {supported_cls}")
 
     def run_task(self, trainer: pl.Trainer, model: BaseNeuralRadFieldModel, datamodule: RadiationFieldDataModule):
         self.max_inner_batch_size = model.max_inner_batch_size
