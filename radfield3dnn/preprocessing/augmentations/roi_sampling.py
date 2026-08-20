@@ -191,6 +191,21 @@ class ROIbasedSampler(DataProcessing):
             "schedule_switch": self.schedule_switch,
         }
 
+    @classmethod
+    def create_from_config(cls, config: dict) -> "ROIbasedSampler":
+        return ROIbasedSampler(
+            beam_rel=config["beam_rel"],
+            scatter_lo=config["scatter_lo"],
+            beam_keep_ratio=config["beam_keep_ratio"],
+            scatter_ratio=config["scatter_ratio"],
+            floor_ratio=config["floor_ratio"],
+            field_multiplier=config["field_multiplier"],
+            floor_as_zero=config["floor_as_zero"],
+            floor_value=config["floor_value"],
+            scatter_ratio_end=config["scatter_ratio_end"],
+            schedule_switch=config["schedule_switch"]
+        )
+
 
 class FullScatterROISampler(ROIbasedSampler):
     """ROI sampler that trains the WHOLE signal and only sips the floor.
@@ -231,3 +246,14 @@ class FullScatterROISampler(ROIbasedSampler):
             "floor_as_zero": self.floor_as_zero,
             "floor_value": self.floor_value,
         }
+
+    @classmethod
+    def create_from_config(cls, config: dict) -> "FullScatterROISampler":
+        return FullScatterROISampler(
+            beam_rel=config["beam_rel"],
+            scatter_lo=config["scatter_lo"],
+            floor_keep_ratio=config["floor_keep_ratio"],
+            field_multiplier=config["field_multiplier"],
+            floor_as_zero=config["floor_as_zero"],
+            floor_value=config["floor_value"]
+        )

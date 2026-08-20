@@ -7,6 +7,7 @@ from RadFiled3D.RadFiled3D import CartesianRadiationField
 from enum import Enum
 from RadFiled3D.pytorch.datasets.processing import DataProcessing
 from .crop_dataset import CropDataset
+from .mc_floor_cut import MCFloorCut
 from radfield3dnn.rftypes import TrainingInputData, rf3TrainingInputData, RadiationField, rf3RadiationField, RadiationFieldChannel, AirKermaField
 import os
 from radfield3dnn.preprocessing.normalizations.beam_parameters import BeamParametersNormalization
