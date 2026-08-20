@@ -2,6 +2,7 @@ from .base import Normalizer
 from .linear import LinearNormalizer
 from .asinh import AsinhTonemapNormalizer
 from .lognormalizer import LogNormalizer
+from .translation import TranslationNormalization
 
 
 class NormalizerConstructor:

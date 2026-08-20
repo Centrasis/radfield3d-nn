@@ -17,6 +17,7 @@ from radfield3dnn.models import ModelConstructor
 from lightning.pytorch.callbacks import ModelSummary
 from radfield3dnn.datasets.mc_floor_cut import MCFloorCut
 from radfield3dnn.preprocessing.augmentations import ROIbasedSampler
+from radfield3dnn.preprocessing.normalizations import TranslationNormalization
 
 import optuna
 from optuna.integration import PyTorchLightningPruningCallback
