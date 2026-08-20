@@ -34,6 +34,52 @@ from radfield3dnn.metrics import HistogramOverlapAccuracy
 from radfield3dnn.metrics.factory import build_airkerma_metrics
 
 
+def suggest_parameters(trial, hyper_space: dict) -> dict:
+    """Draw one suggestion per entry of ``hyperparameter_space`` (categorical lists only).
+
+    Plain values (int/float/str/bool) go to Optuna directly. STRUCTURED choices (dicts/lists —
+    e.g. whole ``conditioning_params`` or ``location_encoding_params`` blocks) are JSON-encoded
+    for Optuna and decoded after the draw: Optuna's sqlite storage and distribution-compatibility
+    checks on study resume want hashable primitive choices, and the JSON string doubles as a
+    readable parameter value in the study UI/CSV.
+    """
+    suggestions = {}
+    for pname, pvals in hyper_space.items():
+        if not isinstance(pvals, (list, tuple)):
+            raise ValueError(f"Hyperparameter space for {pname} must be list/tuple.")
+        if any(isinstance(v, (dict, list)) for v in pvals):
+            encoded = [json.dumps(v, sort_keys=True) for v in pvals]
+            suggestions[pname] = json.loads(trial.suggest_categorical(pname, encoded))
+        else:
+            suggestions[pname] = trial.suggest_categorical(pname, list(pvals))
+    return suggestions
+
+
+def apply_suggestions(parameters: dict, suggestions: dict) -> dict:
+    """Apply drawn suggestions onto a (deep-copied) ``parameters`` dict.
+
+    A plain key replaces the top-level parameter. A DOTTED key ("conditioning_params.
+    translation_encoding") replaces a nested block — that is what lets orthogonal sub-blocks be
+    separate search axes instead of enumerating their cross product by hand. Intermediate dicts
+    are copied (never mutated: the base config is reused across trials) and must already exist —
+    a typo'd path fails loudly instead of silently creating a parameter no model reads.
+    """
+    out = copy.deepcopy(parameters)
+    for key, value in suggestions.items():
+        if "." not in key:
+            out[key] = value
+            continue
+        node = out
+        parts = key.split(".")
+        for part in parts[:-1]:
+            if not isinstance(node.get(part), dict):
+                raise KeyError(f"hyperparameter path {key!r}: {part!r} is not an existing dict "
+                               f"in the base parameters — fix the path or the base config.")
+            node = node[part]
+        node[parts[-1]] = value
+    return out
+
+
 class HyperparameterTuningTask(Task):
     def __init__(self, model_config: str, experiment_name: str, n_trials: int):
         super().__init__()
@@ -309,16 +355,12 @@ def _run_single_trial_subprocess(
         )
 
         def objective(trial: optuna.Trial):
-            # Hyperparameter suggestions
-            parameter_suggestions = {}
-            for pname, pvals in hyper_space.items():
-                if isinstance(pvals, (list, tuple)):
-                    parameter_suggestions[pname] = trial.suggest_categorical(pname, list(pvals))
-                else:
-                    raise ValueError(f"Hyperparameter space for {pname} must be list/tuple.")
+            # Hyperparameter suggestions (dict-valued blocks JSON-round-trip through Optuna;
+            # dotted keys replace nested sub-blocks)
+            parameter_suggestions = suggest_parameters(trial, hyper_space)
             # Build model
             model_config = copy.deepcopy(base_model_config)
-            model_config["parameters"].update(parameter_suggestions)
+            model_config["parameters"] = apply_suggestions(model_config["parameters"], parameter_suggestions)
             model_cls = ModelConstructor.create_model_from_dict(model_config)
             model = model_cls()
             model.max_inner_batch_size = max_inner_batch_size

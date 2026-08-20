@@ -95,37 +95,14 @@ class RFBackboneModel(nn.Module):
 
         self._normalizer: Normalizer = normalizer
         self.activation_fn = nn.SiLU(inplace=True)
+        self._trunk_depth = int(trunk_depth)
         self.configure_beam_encoding(conditioning, self.positional_direction_encoding.encoded_dims, self.d_model)
 
         self.decoder_in_dim = d_model
 
-        self.block1 = nn.Sequential(
-            nn.Linear(self.positional_location_encoding.encoded_dims, d_model) if self.use_conditioning else nn.Linear(self.positional_location_encoding.encoded_dims + d_model, d_model),
-            nn.Identity() if not self.use_layer_norm else nn.LayerNorm(d_model),  # LayerNorm only if not using FiLM
-            nn.SiLU(True),
-            nn.Linear(d_model, d_model),
-            nn.SiLU(True) if self.use_conditioning else nn.Identity()
-        )
-
-        if self.use_layer_norm:
-            _block2_in = d_model * 2 + self.positional_location_encoding.encoded_dims
-        else:
-            _block2_in = d_model
-
         if int(trunk_depth) < 2:
             raise ValueError(f"trunk_depth must be >= 2, got {trunk_depth}")
-        _block2_layers: list[nn.Module] = [
-            nn.Linear(_block2_in, d_model),
-            nn.Identity() if not self.use_layer_norm else nn.LayerNorm(d_model),
-            nn.SiLU(True),
-        ]
-        for _ in range(int(trunk_depth) - 2):
-            _block2_layers += [nn.Linear(d_model, d_model), nn.SiLU(True)]
-        _block2_layers += [
-            nn.Linear(d_model, d_model),
-            nn.SiLU(True) if self.use_conditioning else nn.Identity(),
-        ]
-        self.block2 = nn.Sequential(*_block2_layers)
+        self._build_trunk_blocks(self.location_feature_dims)
 
         self.spectra_decoder = nn.Sequential(
             nn.Linear(self.decoder_in_dim, d_model // 2),
@@ -196,6 +173,50 @@ class RFBackboneModel(nn.Module):
     @property
     def _compute_dtype(self) -> torch.dtype:
         return torch.float16 if self._precision == "fp16" else torch.float32
+
+    @property
+    def location_feature_dims(self) -> int:
+        """Width of the per-point feature vector the trunk consumes. Subclasses that append
+        further per-point features (e.g. TPBRFNet's relative patient-frame coordinate) override
+        this AND encode_location, then re-call _build_trunk_blocks with the new width."""
+        return self.positional_location_encoding.encoded_dims
+
+    def encode_location(self, batch: PositionalInput, region_state: Tensor | None = None) -> Tensor:
+        """Per-point trunk input features. Base: the encoded query position; overridable hook so
+        subclasses can append additional per-point features (row-aligned with the position)."""
+        return self.positional_location_encoding(batch.position.to(self._compute_dtype), region_state)
+
+    def _build_trunk_blocks(self, loc_dims: int):
+        """(Re)build block1/block2 for a per-point feature width of ``loc_dims``. Called by
+        __init__ with the location encoder's width; a subclass that widens the per-point features
+        calls it again — module names and structure stay identical, so checkpoints of models
+        that do NOT widen are unaffected."""
+        d_model = self.d_model
+        self.block1 = nn.Sequential(
+            nn.Linear(loc_dims, d_model) if self.use_conditioning else nn.Linear(loc_dims + d_model, d_model),
+            nn.Identity() if not self.use_layer_norm else nn.LayerNorm(d_model),  # LayerNorm only if not using FiLM
+            nn.SiLU(True),
+            nn.Linear(d_model, d_model),
+            nn.SiLU(True) if self.use_conditioning else nn.Identity()
+        )
+
+        if self.use_layer_norm:
+            _block2_in = d_model * 2 + loc_dims
+        else:
+            _block2_in = d_model
+
+        _block2_layers: list[nn.Module] = [
+            nn.Linear(_block2_in, d_model),
+            nn.Identity() if not self.use_layer_norm else nn.LayerNorm(d_model),
+            nn.SiLU(True),
+        ]
+        for _ in range(self._trunk_depth - 2):
+            _block2_layers += [nn.Linear(d_model, d_model), nn.SiLU(True)]
+        _block2_layers += [
+            nn.Linear(d_model, d_model),
+            nn.SiLU(True) if self.use_conditioning else nn.Identity(),
+        ]
+        self.block2 = nn.Sequential(*_block2_layers)
 
     def encode_additional_parameters(self, batch: PositionalInput) -> Tensor:
         direction = batch.direction.to(self._compute_dtype)
@@ -272,8 +293,7 @@ class RFBackboneModel(nn.Module):
                 region_state: Union[Tensor, None] = None):
         # region_state describes the spatial extent each queried point represents (from the
         # location encoder's compute_region_state); point encoders ignore it.
-        position = batch.position.to(self._compute_dtype)
-        xyz_enc = self.positional_location_encoding(position, region_state)
+        xyz_enc = self.encode_location(batch, region_state)
         params_enc = self.encode_additional_parameters(batch) if global_parameters is None else global_parameters.to(self._compute_dtype)
 
         x0 = xyz_enc if self.use_conditioning else torch.cat((xyz_enc, params_enc), dim=-1)

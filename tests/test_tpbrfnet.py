@@ -70,8 +70,10 @@ def test_registered_and_extends_pbrfnet():
 def _activate_beam_conditioning(m):
     # ConcatLinear identity-starts with the cond-half of its weight at ZERO (no beam influence at
     # init, by design) — randomize it so translation sensitivity/gradients are observable.
+    # Other fusions (FiLM, ...) have no .proj and need no activation for these tests.
     for c in (m.get_core_model().beam_conditioner1, m.get_core_model().beam_conditioner2):
-        torch.nn.init.xavier_uniform_(c.proj.weight)
+        if hasattr(c, "proj"):
+            torch.nn.init.xavier_uniform_(c.proj.weight)
 
 
 def test_beam_encoding_reacts_to_translation():
@@ -350,3 +352,101 @@ def test_single_graph_export_has_named_tensor_outputs():
     assert [o.name for o in g.output] == ["flux", "spectrum"]
     # the spectrum output must keep its bin axis — that is what the deploy runtime binds by
     assert g.output[1].type.tensor_type.shape.dim[-1].dim_value == 32
+
+
+# ── relative (dual-frame) translation encoding ───────────────────────────────
+
+def _relative_model(cond_type="Concat"):
+    torch.manual_seed(0)
+    kwargs = _model_kwargs()
+    kwargs["conditioning_params"] = {"type": cond_type, "use_beam_shape": False,
+                                     "translation_encoding": {"type": "relative", "n_frequencies": 6,
+                                                              "append_input": True}}
+    m = TPBRFNet(**kwargs)
+    m.max_inner_batch_size = 4096
+    return m
+
+
+def test_relative_mode_widens_trunk_not_beam():
+    m = _relative_model()
+    core = m.get_core_model()
+    assert core._relative_translation and core.translation_encoder is None
+    # trunk input = location features + relative-coordinate features
+    loc = core.positional_location_encoding.encoded_dims
+    rel = core.relative_translation_encoding.encoded_dims
+    assert core.block1[0].in_features == loc + rel
+    assert core.location_feature_dims == loc + rel
+    # beam vector is exactly PBRFNet's (translation left it)
+    torch.manual_seed(0)
+    base = PBRFNet(**_model_kwargs())
+    assert core.beam_encoder[1].in_features == base.get_core_model().beam_encoder[1].in_features
+    # learnable frame alignment exists
+    assert core.translation_frame_scale.shape == (2,) and core.translation_frame_scale.requires_grad
+
+
+def test_relative_mode_translation_conditions_output_via_position():
+    for cond in ("Concat", "FiLM"):
+        m = _relative_model(cond)
+        _activate_beam_conditioning(m)
+        x_a = _field_input(B=2, translation=torch.full((2, 3), 0.1))
+        x_b = x_a._replace(translation=torch.full((2, 3), 0.9))
+        with torch.no_grad():
+            out_a = m.forward2volume(x_a, torch.tensor([4, 4, 4]), spectra_bins=32)
+            out_b = m.forward2volume(x_b, torch.tensor([4, 4, 4]), spectra_bins=32)
+        assert torch.isfinite(out_a.scatter_field.flux).all()
+        assert not torch.allclose(out_a.scatter_field.flux, out_b.scatter_field.flux), cond
+
+
+def test_relative_mode_frame_parameters_receive_gradient():
+    m = _relative_model()
+    x = _field_input(B=2)
+    out = m.forward2volume(x, torch.tensor([4, 4, 4]), spectra_bins=32)
+    out.scatter_field.flux.sum().backward()
+    core = m.get_core_model()
+    assert core.translation_frame_scale.grad is not None
+    assert core.translation_frame_shift.grad is not None
+    assert core.translation_frame_scale.grad.abs().sum() > 0
+
+
+def test_relative_mode_missing_translation_fails_loudly():
+    from radfield3dnn.rftypes import DirectionalInput
+    m = _relative_model()
+    x = _field_input(B=2)
+    plain = DirectionalInput(direction=x.direction, origin=x.origin, spectrum=x.spectrum)
+    with pytest.raises(AssertionError, match="translation"):
+        m.forward2volume(plain, torch.tensor([4, 4, 4]), spectra_bins=32)
+
+
+def test_relative_mode_disables_two_graph_split_but_default_keeps_it():
+    from radfield3dnn.models import ModelExporter
+    assert ModelExporter.supports_two_graph_split(_relative_model()) is False
+    assert ModelExporter.supports_two_graph_split(_build_model()) is True
+
+
+def test_relative_mode_config_roundtrip():
+    from radfield3dnn.models import ModelConstructor
+    m = _relative_model("FiLM")
+    stored = m.get_custom_parameters()["conditioning_params"]["translation_encoding"]
+    assert stored["type"] == "relative" and stored["n_frequencies"] == 6
+    # a fresh model built from the stored config has the identical parameter shapes
+    import json as _json
+    cfg = {"model_name": "TPBRFNet", "parameters": {**_model_kwargs(), "normalizer": "linear0_1",
+           "conditioning_params": m.get_custom_parameters()["conditioning_params"]}}
+    m2 = ModelConstructor.create_model_from_dict(cfg)()
+    sd1, sd2 = m.get_core_model().state_dict(), m2.get_core_model().state_dict()
+    assert set(sd1) == set(sd2)
+    assert all(sd1[k].shape == sd2[k].shape for k in sd1)
+
+
+@pytest.mark.slow
+def test_relative_mode_single_graph_export_carries_translation():
+    onnx = pytest.importorskip("onnx")
+    pytest.importorskip("onnxscript")
+    import tempfile, os
+    from radfield3dnn.models import ModelExporter
+    m = _relative_model().eval()
+    path = os.path.join(tempfile.mkdtemp(), "rel.onnx")
+    ModelExporter.onnx_export(m, path)
+    g = onnx.load(path).graph
+    assert "translation" in [i.name for i in g.input]
+    assert [o.name for o in g.output] == ["flux", "spectrum"]

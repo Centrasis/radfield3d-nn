@@ -224,6 +224,13 @@ class ModelExporter:
     @staticmethod
     def supports_two_graph_split(model: BaseNeuralRadFieldModel) -> bool:
         core = model.get_core_model()
+        # The split factors the model into beam->latent + (position, latent)->output. A model whose
+        # TRUNK consumes per-point inputs beyond the position (TPBRFNet's relative/dual-frame
+        # translation coordinate) does not fit that factorization — the trunk graph would need the
+        # translation as a third input, which the deploy runtime does not bind. Such models export
+        # as a single self-contained graph instead (translation is a named input there).
+        if getattr(core, "_relative_translation", False):
+            return False
         return hasattr(core, "encode_additional_parameters")
 
     @staticmethod

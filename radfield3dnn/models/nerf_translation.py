@@ -4,10 +4,7 @@ from torch import Tensor
 
 from .nerf import PBRFNet
 from .encoders.sinusoidal_encoding import SinusoidalFrequencyEncoding
-from radfield3dnn.rftypes import PositionalInput, positional_like
-# The patient translation (vec3, in metres) is loaded from field metadata by RadFiled3D's
-# RadField3DTranslationDataset, which yields this TranslationalInput.
-from RadFiled3D.pytorch.types import TranslationalInput
+from radfield3dnn.rftypes import PositionalInput, positional_like, TranslationalPositionalInput
 
 
 class TPBRFNet(PBRFNet):
@@ -32,6 +29,19 @@ class TPBRFNet(PBRFNet):
         {"type": "fourier", "n_frequencies": 6, "append_input": True}   (default)
         {"type": "mlp"}   — the pre-Fourier Linear/SiLU stack; set this in the stored config of
                             checkpoints trained before the Fourier default to keep them loadable.
+        {"type": "relative", "n_frequencies": 6, "append_input": True}
+            DUAL-FRAME mode. The physics: the field stays ISOCENTRIC (source/beam fixed in the
+            world frame); the translation moves the PATIENT, i.e. what changes is the
+            intersection of the fixed beam with the shifted geometry. The natural inductive bias
+            is therefore not "translation as a global beam parameter" but a second PER-POINT
+            coordinate: the trunk sees the world-frame position AND the patient-frame coordinate
+            ``position_xy − frame(translation_xy)`` (Fourier-encoded, appended to the location
+            features). ``frame`` is a learnable per-axis affine (init scale 1, shift −0.5) that
+            maps the [0,1]-normalized translation onto the position's coordinate scale — the two
+            normalizations use different physical ranges, so the alignment is learned. In this
+            mode the translation LEAVES the beam vector (the beam encoder is exactly PBRFNet's),
+            and the deploy package exports as a single graph (the split trunk would need the
+            translation as a third input, which the C++ runtime does not bind yet).
     Expects the translation NORMALIZED to [0, 1] (TranslationNormalization, built from the dataset
     definition file) so the frequency ladder 2^i·π·x spans the intended band.
     """
@@ -43,6 +53,25 @@ class TPBRFNet(PBRFNet):
             trans_enc_params = dict(self._conditioning_params.get(
                 "translation_encoding", {"type": "fourier", "n_frequencies": 6, "append_input": True}))
             enc_type = trans_enc_params.get("type", "fourier")
+            self._relative_translation = (enc_type == "relative")
+            if enc_type == "relative":
+                # DUAL-FRAME: patient-frame coordinate per query point, appended to the trunk's
+                # location features; the beam vector stays PBRFNet's (super() configured it).
+                self.translation_encoder = None
+                self.relative_translation_encoding = SinusoidalFrequencyEncoding(
+                    pos_enc_dim=int(trans_enc_params.get("n_frequencies", 6)),
+                    d_input=2,  # (x, y); z is constant across the dataset
+                    append_input=bool(trans_enc_params.get("append_input", True)),
+                )
+                # Learnable per-axis frame alignment: translation is [0,1]-normalized over its
+                # GENERATION range, the position over the FIELD extent — the mapping between the
+                # two scales is two affine coefficients per axis, learned (init: identity scale,
+                # −0.5 shift = center the normalized translation).
+                self.translation_frame_scale = nn.Parameter(torch.ones(2))
+                self.translation_frame_shift = nn.Parameter(torch.full((2,), -0.5))
+                self._translation_encoding_params = {"type": enc_type, **{k: v for k, v in trans_enc_params.items() if k != "type"}}
+                self._build_trunk_blocks(self.location_feature_dims)   # widen block1/block2
+                return
             if enc_type == "fourier":
                 fourier = SinusoidalFrequencyEncoding(
                     pos_enc_dim=int(trans_enc_params.get("n_frequencies", 6)),
@@ -64,7 +93,7 @@ class TPBRFNet(PBRFNet):
                     nn.SiLU(True)
                 )
             else:
-                raise ValueError(f"Unknown translation_encoding type: {enc_type!r}. Valid: 'fourier', 'mlp'.")
+                raise ValueError(f"Unknown translation_encoding type: {enc_type!r}. Valid: 'fourier', 'mlp', 'relative'.")
             self._translation_encoding_params = {"type": enc_type, **{k: v for k, v in trans_enc_params.items() if k != "type"}}
             # Same re-configure pattern as SPERFNet/PBRFNet: extend the beam vector by the new
             # encoder's width and rebuild the beam encoding/fusion for the wider input.
@@ -82,7 +111,40 @@ class TPBRFNet(PBRFNet):
                 token_component_dims=token_component_dims if self._token_attention else None,
             )
 
+        @property
+        def location_feature_dims(self) -> int:
+            base = super().location_feature_dims
+            if getattr(self, "_relative_translation", False):
+                return base + self.relative_translation_encoding.encoded_dims
+            return base
+
+        def encode_location(self, batch: PositionalInput, region_state: Tensor | None = None) -> Tensor:
+            base = super().encode_location(batch, region_state)
+            if not getattr(self, "_relative_translation", False):
+                return base
+            dtype = self._compute_dtype
+            translation = getattr(batch, "translation", None)
+            assert translation is not None, "TPBRFNet requires a TranslationalInput with a translation tensor."
+            if translation.ndim == 1:
+                translation = translation.unsqueeze(0)
+            t = translation[:, :2].to(dtype)
+            if t.shape[0] != batch.position.shape[0]:
+                assert t.shape[0] == 1, (
+                    f"translation rows ({t.shape[0]}) must match the query positions "
+                    f"({batch.position.shape[0]}) or be a single field")
+                t = t.expand(batch.position.shape[0], -1)
+            # patient-frame coordinate of the query point (learned frame alignment, see __init__)
+            rel = batch.position[:, :2].to(dtype) - (t * self.translation_frame_scale.to(dtype) + self.translation_frame_shift.to(dtype))
+            return torch.cat([base, self.relative_translation_encoding(rel)], dim=-1)
+
         def encode_additional_parameters(self, batch: PositionalInput) -> Tensor:
+            if getattr(self, "_relative_translation", False):
+                # translation is consumed per-point in encode_location; the beam vector is
+                # exactly PBRFNet's. Still require the translation up front so a wrong dataset
+                # fails at the beam-encoding stage, not mid-trunk.
+                assert getattr(batch, "translation", None) is not None, \
+                    "TPBRFNet requires a TranslationalInput with a translation tensor."
+                return super().encode_additional_parameters(batch)
             dtype = self._compute_dtype
             assert batch.origin.shape[-1] == 1, f"Origin must be a single distance value for TPBRFNet. Got shape: {batch.origin.shape}"
             translation = getattr(batch, "translation", None)
