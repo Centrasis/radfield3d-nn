@@ -198,7 +198,7 @@ class HyperparameterTuningTask(Task):
         for key, value in trial.params.items():
             print(f"    {key}: {value}")
 
-    def get_trainer_callbacks(self, model_name: str, logs_path: str, logger: LoggerBase, mu_tr_file: str, voxel_resolution: tuple[int, int, int], voxel_size_m: float, epochs: int) -> list[pl.Callback]:
+    def get_trainer_callbacks(self, model_name: str, logs_path: str, logger: LoggerBase, mu_tr_file: str, voxel_resolution: tuple[int, int, int], voxel_size_m: float, epochs: int, dataset_path: str) -> list[pl.Callback]:
         self.model_name = model_name
         self.logger = logger
         self.logs_path = logs_path
