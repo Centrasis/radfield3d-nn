@@ -55,6 +55,29 @@ class MCFloorCut(DataProcessing):
         self.use_error = bool(use_error)
         self.error_threshold = float(error_threshold)
 
+    @classmethod
+    def create_from_config(cls, config: dict) -> "MCFloorCut":
+        return MCFloorCut(
+            scatter_rel=config["scatter_rel"],
+            direct_rel=config["direct_rel"],
+            as_neginf=config["as_neginf"],
+            beam_rel=config["beam_rel"],
+            scatter_lo=config["scatter_lo"],
+            use_error=config["use_error"],
+            error_threshold=config["error_threshold"]
+        )
+
+    def get_parameters(self) -> dict[str, object]:
+        return {
+            "scatter_rel": self.scatter_rel,
+            "direct_rel": self.direct_rel,
+            "as_neginf": self.as_neginf,
+            "beam_rel": self.beam_rel,
+            "scatter_lo": self.scatter_lo,
+            "use_error": self.use_error,
+            "error_threshold": self.error_threshold
+        }
+
     def _cut(self, ch: RadiationFieldChannel, rel: float) -> RadiationFieldChannel:
         if ch is None or ch.flux is None:
             return ch
