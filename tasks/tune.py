@@ -15,6 +15,7 @@ from callbacks.plotter import ValidationPlotter
 from callbacks.warmup_early_stopping import WarmupEarlyStopping
 from radfield3dnn.models import ModelConstructor
 from lightning.pytorch.callbacks import ModelSummary
+from radfield3dnn.datasets.mc_floor_cut import MCFloorCut
 
 import optuna
 from optuna.integration import PyTorchLightningPruningCallback
