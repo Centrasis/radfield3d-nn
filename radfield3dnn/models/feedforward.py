@@ -1,176 +1,39 @@
-from .base import BaseNeuralRadFieldModel, ModuleBuilder, AngularSinusoidalFrequencyEncoding
+from .base import BaseNeuralRadFieldModel
 import torch
 from torch import Tensor
 from torch import nn
-from typing import Type
-import os
-from radfield3dnn.encodings.sinusoidal_encoding import SinusoidalFrequencyEncoding
-from radfield3dnn.rftypes import AirKermaField, RadiationField, PositionalInput, RadiationFieldChannel, DirectionalInput, PositionalInput
+from radfield3dnn.rftypes import AirKermaField, RadiationField, PositionalInput, RadiationFieldChannel, DirectionalInput, positional_like
 from typing import Union
-
-
-class Reduce(nn.Module):
-    """
-    Reduce the input tensor along the specified dimension.
-    For residual connections, the input and output dimensions have different sizes.
-    Uses summation to reduce the tensor. If the tensor input and output dimensions are not a multiple of each other, the remaining dimensions are just added
-    """
-    def __init__(self, axis: int, output_dim: int):
-        super(Reduce, self).__init__()
-        self.axis = axis
-        self.output_dim = output_dim
-
-    def forward(self, x: Tensor) -> Tensor:
-        input_dim = x.shape[self.axis]
-        group_size = input_dim // self.output_dim
-        remainder = input_dim % self.output_dim
-
-        # Calculate the number of elements to sum in each group
-        if group_size == 0:
-            group_size = 1
-            self.output_dim = input_dim
-
-        # Reshape the tensor to group elements
-        dims = list(x.shape)
-        dims.pop(self.axis)
-        summed_elements = torch.tensor(dims, dtype=torch.int32).prod() * self.output_dim * group_size
-        output = torch.zeros(*dims, self.output_dim, device=x.device)
-        output_sum = torch.sum(x.flatten()[:summed_elements].reshape(*dims, self.output_dim, group_size), dim=-1)
-        output_sum = output_sum / group_size
-
-        if remainder > 0:
-            sum_elements_embedded = torch.zeros_like(output)
-            output_slice = [slice(None, None) for _ in range(len(output.shape))]
-
-            output_slice[self.axis] = slice(0, x.shape[self.axis] - remainder)
-            sum_elements_embedded[*tuple(output_slice)] = output_sum
-            output = output + sum_elements_embedded
-
-            left_elements = x.flatten()[summed_elements:]
-            left_elements_shape = list(output.shape)
-            left_elements_shape[self.axis] = remainder
-            left_elements = left_elements.reshape(*left_elements_shape)
-
-            output_slice[self.axis] = slice(int(output.shape[self.axis] - remainder), None)
-            left_elements_embedded = torch.zeros_like(output)
-            left_elements_embedded[*tuple(output_slice)] = left_elements
-
-            output = output + left_elements_embedded
-        else:
-            output = output + output_sum
-        return output
-
-
-class LinearBlock(nn.Module):
-    def __init__(self, d_model: int, activation: Type[nn.Module] | None, normalization: Type[nn.Module] | None = nn.BatchNorm1d, num_layers: int = 1, d_model_out: int | None = None):
-        super(LinearBlock, self).__init__()
-        assert num_layers > 0, "Number of layers must be greater than 0."
-        if d_model_out is None:
-            d_model_out = d_model
-        layers = []
-
-        for i in range(num_layers):
-            layer_out = d_model_out if i == num_layers - 1 else d_model
-            layers += [
-                nn.Linear(d_model, layer_out),
-            ]
-            if normalization is not None:
-                layers += [
-                    normalization(layer_out)
-                ]
-            if activation is not None and i < num_layers - 1:
-                layers += [
-                    activation()
-                ]
-
-        self.model = nn.Sequential(
-            *layers
-        )
-        self.activation = activation() if activation is not None else nn.Identity()
-        self.reduction = nn.Identity() if d_model_out == d_model else Reduce(-1, d_model_out)
-
-    def forward(self, x: Tensor) -> Tensor:
-        return self.activation(self.model(x))
-
-
-class ResidualBlock(nn.Module):
-    def __init__(self, d_model: int):
-        super(ResidualBlock, self).__init__()
-        self.linear1 = nn.Linear(d_model, d_model)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.linear2 = nn.Linear(d_model, d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.activation = nn.SiLU(inplace=False)
-    
-    def forward(self, x: Tensor) -> Tensor:
-        residual = x
-        x = self.linear1(x)
-        x = self.norm1(x)
-        x = self.activation(x)
-        x = self.linear2(x)
-        x = self.norm2(x)
-        x = x + residual
-        x = self.activation(x)
-        return x
+from radfield3dnn.models.activations.HistogramNormalize import HistogramNormalize
+from radfield3dnn.utils.mean_sampling import resample_histogram_bilinear
 
 
 class FeedforwardPointwiseModel(BaseNeuralRadFieldModel):
-    def __init__(self, location_encoding_dims=10, direction_encoding_dims=10, d_model=256, learning_rate: float = 1e-3, randomize_voxel_location_in_training: bool = True, voxels_centered_around_origin: bool = True, normalizer=None):
+    def __init__(self, learning_rate: float = 1e-3, voxel_supersampling: int = 1, voxels_centered_around_origin: bool = True, normalizer=None):
         """
         Feedforward model that processes each voxel independently.
-        :param location_encoding_dims: Number of frequency bands for positional encoding of the location.
-        :param direction_encoding_dims: Number of frequency bands for positional encoding of the direction.
-        :param d_model: Dimension of the model.
         :param learning_rate: Learning rate for the optimizer.
-        :param randomize_voxel_location_in_training: Whether to randomize voxel centers during training within the voxel extent.
+        :param voxel_supersampling: K in-voxel samples per voxel during TRAINING; the K predictions
+            are AVERAGED per voxel before the loss, matching the voxel-averaged ground truth
+            (Monte-Carlo integral supervision; zip-NeRF-style multisampling). 1 = single node-grid
+            sample (no jitter). Supervision stays strictly per-voxel, so importance-sampling masks
+            compose freely (no neighbor voxels needed).
         :param voxels_centered_around_origin: Whether the voxel grid is centered around the origin ([-1, 1]) or starts from the origin ([0, 1]).
         """
-        super().__init__(location_encoding_dims, direction_encoding_dims, d_model, learning_rate=learning_rate, normalizer=normalizer)
-        self.randomize_voxel_location_in_training = randomize_voxel_location_in_training
+        super().__init__(learning_rate=learning_rate, normalizer=normalizer)
+        self.voxel_supersampling = max(int(voxel_supersampling), 1)
         self.voxels_centered_around_origin = voxels_centered_around_origin
         self.relevance_discriminator: "FeedforwardPointwiseModel" | None = None
         self._base_voxel_map = None
 
-    def forward(self, x: Union[DirectionalInput, PositionalInput], global_parameters: Tensor | None = None) -> RadiationField:
+    def forward(self, x: Union[DirectionalInput, PositionalInput], global_parameters: Tensor | None = None,
+                region_state: Tensor | None = None) -> RadiationField:
         raise NotImplementedError("This method must be implemented by the subclass.")
 
     def on_fit_start(self):
         if self.relevance_discriminator is not None:
             self.relevance_discriminator = self.relevance_discriminator.eval()
         super().on_fit_start()
-
-    def jacobian_norm(self, x: PositionalInput) -> Tensor:
-        x = PositionalInput(
-            position=x.position.clone().detach().requires_grad_(True),
-            direction=x.direction.clone().detach().requires_grad_(True),
-            spectrum=x.spectrum.clone().detach().requires_grad_(True),
-            geometry=x.geometry.clone().detach().requires_grad_(True) if x.geometry is not None else None,
-            origin=x.origin.clone().detach().requires_grad_(True) if x.origin is not None else None,
-            beam_shape_parameters=x.beam_shape_parameters.clone().detach().requires_grad_(True) if x.beam_shape_parameters is not None else None,
-            beam_shape_type=x.beam_shape_type.clone().detach().requires_grad_(True) if x.beam_shape_type is not None else None
-        )
-        field = self.forward(x)
-        y = torch.stack([field.scatter_field.flux, field.scatter_field.spectrum.sum(dim=-1)], dim=-1)
-        batch_size = y.size(0)
-        norms = torch.empty(batch_size, device=x.position.device)
-        for i in range(batch_size):
-            grads = torch.autograd.grad(
-                y[i].sum(), 
-                [
-                    x.position,
-                    x.direction,
-                    x.spectrum,
-                    x.geometry,
-                    x.origin,
-                    x.beam_shape_parameters,
-                    x.beam_shape_type
-                ],
-                create_graph=False, 
-                retain_graph=False,
-                allow_unused=True
-            )[0][i]
-            norms[i] = grads.norm()  # L2 norm of gradient row i
-        return norms.mean()
 
     @staticmethod
     def write_linear_output_to_volume(output: RadiationFieldChannel, target_volume: RadiationFieldChannel, indices: Tensor):
@@ -189,52 +52,136 @@ class FeedforwardPointwiseModel(BaseNeuralRadFieldModel):
     
     @property
     def base_voxel_map(self):
-        if self._base_voxel_map is not None:
-            if self._base_voxel_map.requires_grad != self.training:
-                self._base_voxel_map = None
-        
-        if self._base_voxel_map is None:
-            if self.training:
-                self._base_voxel_map = self.generate_voxelmap3d(self.voxel_counts, None, self.device)
-            else:
-                with torch.no_grad():
-                    self._base_voxel_map = self.generate_voxelmap3d(self.voxel_counts, None, self.device)
+        # The normalised voxel-coordinate grid depends only on the grid shape and
+        # device — never on grad (positions carry no gradient, and
+        # generate_voxelmap3d already builds it under torch.no_grad). Cache it
+        # and rebuild only when the shape or device changes. Per-step location
+        # randomisation happens on a clone in prepare_linear_input_batches, so
+        # caching the un-noised base map across steps is correct.
+        vc = self.voxel_counts
+        target_shape = (int(vc[0]), int(vc[1]), int(vc[2]))
+        if (self._base_voxel_map is None
+                or self._base_voxel_map.device != self.device
+                or tuple(self._base_voxel_map.shape[:3]) != target_shape):
+            self._base_voxel_map = self.generate_voxelmap3d(vc, None, self.device)
         return self._base_voxel_map
 
+    @property
+    def encoder_frame_extent(self) -> float:
+        """Extent of the coordinate frame the location encoder sees: [-1,1] -> 2, [0,1] -> 1.
+
+        The single source of this convention. One voxel of an N^3 grid is `extent / N` wide, which
+        is the region a region-aware encoder integrates over — so the deployed model carries this
+        number and the C++ runtime derives the voxel width for whatever grid it picks.
+        """
+        return 2.0 if self.voxels_centered_around_origin else 1.0
+
+    @property
+    def location_encoder(self):
+        """The encoder the queried POSITION goes through (None if the core has none)."""
+        return getattr(self.get_core_model(), "positional_location_encoding", None)
+
+    def voxel_width_in_encoder_frame(self, voxel_counts: Tensor) -> float:
+        """Width of ONE voxel in the coordinate frame the location encoder sees."""
+        n = float(torch.as_tensor(voxel_counts).float().mean())
+        return self.encoder_frame_extent / n
+
+    def estimate_step_activation_bytes(self, batch_size: int, voxel_counts) -> int:
+        """Rough activation memory ONE optimizer step retains for the backward pass, in bytes.
+
+        A whole-field step predicts every voxel of every field in the batch. forward2volume splits
+        that into chunks of ``max_inner_batch_size``, but all chunks belong to the SAME loss, so
+        every chunk's activations stay alive until backward: the retained memory scales with
+        batch_size x voxels, NOT with the chunk size. Lowering max_inner_batch_size therefore does
+        not fix an out-of-memory here — fewer voxels per step does (smaller batch_size, with
+        `effective_batch_size` restoring the effective batch via gradient accumulation; a smaller
+        voxel_resolution; or an importance sampler, which drops most voxels before the forward).
+
+        Counts one tensor per Linear output in the trunk and heads plus the encoded location and
+        the two skip/fusion tensors — an estimate, not an allocator-accurate figure.
+        """
+        core = self.get_core_model()
+        floats_per_point = 0
+        for name in ("block1", "block2", "spectra_decoder", "flux_decoder"):
+            module = getattr(core, name, None)
+            if module is not None:
+                floats_per_point += sum(m.out_features for m in module.modules() if isinstance(m, nn.Linear))
+        enc = getattr(core, "positional_location_encoding", None)
+        floats_per_point += int(getattr(enc, "encoded_dims", 0)) + 2 * int(getattr(core, "d_model", 0))
+
+        counts = [int(c) for c in (voxel_counts.tolist() if isinstance(voxel_counts, Tensor) else voxel_counts)]
+        voxels = 1
+        for c in counts:
+            voxels *= c
+        points = int(batch_size) * voxels * max(int(self.voxel_supersampling), 1)
+        bytes_per_float = 2 if getattr(self, "_precision", "fp32") == "fp16" else 4
+        return points * floats_per_point * bytes_per_float
+
+    def deploy_interface(self):
+        """The beam interface of the base, plus the two things only a per-voxel model can say:
+        that it is queried at POSITIONS, and — for a grid-resolution-aware location encoder — the
+        region-configuration vector that tells the encoder how wide the consumer's voxels are."""
+        inputs, outputs = super().deploy_interface()
+        # Normalized into the unit cube the field box spans; set_field_dimensions() records the box.
+        inputs["position"] = dict(semantic="position", unit="m", range=(0.0, 1.0))
+        # Per-GRID, not per-query: produced by the `encoding_config` graph whenever the consumer
+        # changes resolution, and constant for as long as that grid is.
+        inputs["region_state"] = dict(semantic="region_state", unit="")
+        inputs["region_width"] = dict(semantic="region_width", unit="m")
+        return inputs, outputs
+
+    def region_state_for_grid(self, voxel_counts: Tensor, device, dtype) -> Tensor | None:
+        """Region-configuration vector for the grid being queried, or None if the location encoder
+        is region-agnostic. Cached: recomputed only when the grid width actually changes."""
+        enc = self.location_encoder
+        if enc is None or enc.region_state_dims == 0:
+            return None
+        width = self.voxel_width_in_encoder_frame(voxel_counts)
+        if getattr(self, "_region_state_width", None) != width or getattr(self, "_region_state", None) is None:
+            self._region_state = enc.compute_region_state(torch.tensor(width, device=device, dtype=torch.float32))
+            self._region_state_width = width
+        return self._region_state.to(dtype)
+
+    def set_query_region(self, region_width: float | None):
+        """Announce the spatial extent each queried point represents to the location encoder.
+
+        Region-aware encoders (integrated/anti-aliased) prefilter their features with it; point
+        encoders ignore it. forward2volume calls this automatically for the grid it assembles;
+        callers that query the model DIRECTLY at single voxels / arbitrary positions must call it
+        themselves (e.g. ``model.set_query_region(model.voxel_width_in_encoder_frame(counts))``),
+        otherwise a region-aware encoder has no way to know the scale it is being asked about.
+        """
+        enc = getattr(self.get_core_model(), "positional_location_encoding", None)
+        if enc is not None:
+            enc.set_query_region(region_width)
+
     def prepare_linear_input_batches(self, x: DirectionalInput, voxel_counts: Tensor, mask: Tensor | None = None):
-        # Generate base voxel map once increase voxel_counts by 1 in each dimension to account for randomization
         batched_input = len(x.direction.shape) == 2
         
         if not batched_input:
-            x = DirectionalInput(
-                direction=x.direction.unsqueeze(0),
-                spectrum=x.spectrum.unsqueeze(0) if x.spectrum is not None else None,
-                geometry=x.geometry.unsqueeze(0) if x.geometry is not None else None,
-                origin=x.origin.unsqueeze(0) if x.origin is not None else None,
-                beam_shape_parameters=x.beam_shape_parameters.unsqueeze(0) if x.beam_shape_parameters is not None else None,
-                beam_shape_type=x.beam_shape_type.unsqueeze(0) if x.beam_shape_type is not None else None
-            )
+            # unsqueeze every tensor field; _replace keeps the concrete input type (e.g. TranslationalInput)
+            x = x._replace(**{f: v.unsqueeze(0) for f, v in zip(x._fields, x) if isinstance(v, Tensor)})
         batch_size = x.direction.shape[0]
 
         # Calculate total voxels per batch item
         total_voxels_per_batch = int(voxel_counts.prod().item())
 
+        # K in-voxel samples per voxel while TRAINING (their predictions are voxel-mean-reduced in
+        # forward2volume); eval always queries the single node-grid position.
+        k = self.voxel_supersampling if self.training else 1
+
         # Create voxel map for all batch items efficiently
-        if self.randomize_voxel_location_in_training and self.training:
-            # Add noise to each batch item separately
-            voxel_map = self.base_voxel_map.unsqueeze(0).expand(batch_size, -1, -1, -1, -1).clone()
+        voxel_map = self.base_voxel_map.unsqueeze(0).expand(batch_size, -1, -1, -1, -1)
+        if k > 1:
+            # Rescale the i/(N-1) node grid to voxel lower corners i/N so the always-positive
+            # in-voxel jitter (added per replica below) fills cell i = [i/N, (i+1)/N) without
+            # overflowing the box.
             voxel_extent = 1.0 / voxel_counts.float().view(1, 1, 1, 1, -1)
-            noise = torch.rand_like(voxel_map[..., :3]) * voxel_extent
-            voxel_map[..., :3] = voxel_map[..., :3] + noise
-        else:
-            voxel_map = self.base_voxel_map.unsqueeze(0).expand(batch_size, -1, -1, -1, -1)
+            voxel_map = voxel_map.clone()
+            voxel_map[..., :3] = voxel_map[..., :3] * (1.0 - voxel_extent)
 
         # allocate memory for the full voxel map an make it contiguous
-        voxel_map = voxel_map.clone().contiguous()
-
-        if self.voxels_centered_around_origin:
-            # map xyz from [0,1] to [-1,1] for the model
-            voxel_map[..., :3] = (voxel_map[..., :3] * 2.0) - 1.0
+        voxel_map = voxel_map.contiguous()
 
         # Flatten to (batch_size * total_voxels_per_batch, 4)
         voxel_list = voxel_map.reshape(-1, voxel_map.shape[-1])
@@ -252,6 +199,23 @@ class FeedforwardPointwiseModel(BaseNeuralRadFieldModel):
             direction_list = direction_list[keep]
             batch_indices = batch_indices[keep]
             linear_indices = linear_indices[keep]
+
+        if k > 1:
+            # Replicate AFTER the importance mask so every KEPT voxel gets exactly k in-voxel
+            # samples (supervision is per-voxel — no neighbor voxels are involved — so this
+            # composes with any voxel-dropping sampler). linear_indices keep the ORIGINAL voxel
+            # id per replica: forward2volume mean-reduces by these ids.
+            voxel_list = voxel_list.repeat_interleave(k, dim=0).clone()
+            direction_list = direction_list.repeat_interleave(k, dim=0)
+            batch_indices = batch_indices.repeat_interleave(k, dim=0)
+            linear_indices = linear_indices.repeat_interleave(k, dim=0)
+            voxel_extent_flat = (1.0 / voxel_counts.float()).to(voxel_list.device).view(1, -1)
+            voxel_list[:, :3] = voxel_list[:, :3] + torch.rand_like(voxel_list[:, :3]) * voxel_extent_flat
+
+        if self.voxels_centered_around_origin:
+            # map xyz from [0,1] to [-1,1] for the model
+            voxel_list = voxel_list.clone() if k == 1 else voxel_list
+            voxel_list[:, :3] = (voxel_list[:, :3] * 2.0) - 1.0
 
         # Create split iterators
         voxel_splits = torch.split(voxel_list, self.max_inner_batch_size)
@@ -271,11 +235,14 @@ class FeedforwardPointwiseModel(BaseNeuralRadFieldModel):
         """
         voxel_counts = torch.tensor(voxel_counts, dtype=torch.int32, device=x.direction.device) if not isinstance(voxel_counts, Tensor) else voxel_counts
         self.voxel_counts = voxel_counts
+        # Announce the query geometry: each assembled sample represents one voxel of this grid.
+        # Region-aware location encoders prefilter with it; point encoders ignore it.
+        self.set_query_region(self.voxel_width_in_encoder_frame(voxel_counts))
+        region_state = self.region_state_for_grid(voxel_counts, x.direction.device, torch.float32)
 
         if self.max_inner_batch_size is None:
             self.on_fit_start()
 
-        # Generate base voxel map once increase voxel_counts by 1 in each dimension to account for randomization
         batched_input = len(x.direction.shape) == 2
         batch_size = x.direction.shape[0] if batched_input else 1
         # Calculate total voxels per batch item
@@ -283,58 +250,160 @@ class FeedforwardPointwiseModel(BaseNeuralRadFieldModel):
         
         # Process in chunks respecting max_inner_batch_size
         full_field: RadiationField = None
+        # With voxel_supersampling k>1 (training only), every kept voxel contributes exactly k
+        # jittered rows sharing the SAME linear index; the scatters below become index_add_
+        # accumulations and the volume is divided by k afterwards (per-voxel mean prediction,
+        # matching the voxel-averaged ground truth).
+        k = self.voxel_supersampling if self.training else 1
+        written = None
         voxel_splits, direction_splits, batch_idx_splits, index_splits = self.prepare_linear_input_batches(x, voxel_counts, mask)
 
+        # Every chunk is padded to a CONSTANT row count (max_inner_batch_size). A variable
+        # input size (short last split, data-dependent mask filtering) makes the CUDA caching
+        # allocator hold a separate block per shape, so VRAM ratchets up across an epoch. One
+        # shape means one set of blocks, reused. Padded rows are sliced off (`[:n]`) before
+        # anything is scattered into full_field, so they never affect the result or the gradient.
+        fixed_chunk = self.max_inner_batch_size
         for voxels, directions, batch_idx, indices in zip(voxel_splits, direction_splits, batch_idx_splits, index_splits):
+            n = voxels.shape[0]
+            pad = fixed_chunk - n
+            if pad > 0:
+                voxels = nn.functional.pad(voxels, (0, 0, 0, pad))
+                directions = nn.functional.pad(directions, (0, 0, 0, pad))
+                # index 0 is always valid; these rows are discarded via [:n].
+                batch_idx = nn.functional.pad(batch_idx, (0, pad))
+
+            # positional_like (not a bare PositionalInput): the field-level input may carry beam
+            # parameters PositionalInput has no field for — TranslationalInput's patient
+            # translation — and dropping them here leaves the chunk unencodable by the model's own
+            # beam encoder whenever global_parameters is not precomputed.
+            _translation = getattr(x, "translation", None)
             pred_field = self.forward(
-                PositionalInput(
+                positional_like(
+                    x,
                     direction=directions,
                     position=voxels[:, 0:3],
                     spectrum=x.spectrum.index_select(0, batch_idx) if x.spectrum is not None else None,
                     geometry=x.geometry.index_select(0, batch_idx) if x.geometry is not None else None,
                     origin=x.origin.index_select(0, batch_idx) if x.origin is not None else None,
                     beam_shape_parameters=x.beam_shape_parameters.index_select(0, batch_idx) if x.beam_shape_parameters is not None else None,
-                    beam_shape_type=x.beam_shape_type.index_select(0, batch_idx) if x.beam_shape_type is not None else None
+                    beam_shape_type=x.beam_shape_type.index_select(0, batch_idx) if x.beam_shape_type is not None else None,
+                    translation=_translation.index_select(0, batch_idx) if _translation is not None else None,
                 ),
-                global_parameters=global_parameters.index_select(0, batch_idx) if global_parameters is not None else None
+                global_parameters=global_parameters.index_select(0, batch_idx) if global_parameters is not None else None,
+                region_state=region_state,
             )
 
+            # Drop the padded rows before they reach full_field. RadiationField
+            # / RadiationFieldChannel / AirKermaField are NamedTuples, so
+            # rebuild via _replace rather than mutating. Slicing keeps the
+            # autograd path for the real rows intact.
+            if pad > 0:
+                def _trim_channel(ch):
+                    if ch is None:
+                        return None
+                    return ch._replace(
+                        flux=ch.flux[:n],
+                        spectrum=ch.spectrum[:n] if ch.spectrum is not None else None
+                    )
+                if isinstance(pred_field, RadiationField):
+                    pred_field = pred_field._replace(
+                        scatter_field=_trim_channel(pred_field.scatter_field),
+                        direct_beam=_trim_channel(pred_field.direct_beam),
+                        geometry=pred_field.geometry[:n] if pred_field.geometry is not None else None
+                    )
+                elif isinstance(pred_field, AirKermaField):
+                    pred_field = pred_field._replace(
+                        air_kerma=pred_field.air_kerma[:n],
+                        geometry=pred_field.geometry[:n] if pred_field.geometry is not None else None
+                    )
+
             if full_field is None:
+                # Pre-fill prediction-side flux/spectrum slots with `-inf`
+                # so any positions NOT scatter-written below (because
+                # `ErrorbasedImportanceSampler` filtered them out of the
+                # forward via `prepare_linear_input_batches`'s mask) carry
+                # a known sentinel matching the target convention rather
+                # than `torch.empty`'s uninitialised garbage. Downstream
+                # `StdLossWeighted` / `HistogramLoss` mask both sides on
+                # `isfinite`, so consistent `-inf` here is what lets the
+                # loss-side mask exclude dropped voxels correctly. Geometry
+                # is carried-through metadata (no `-inf` convention) and
+                # stays as zero-init.
                 total_samples = batch_size * total_voxels_per_batch
+                _dev, _dt = x.direction.device, torch.float32
+                # k>1 accumulates via index_add_, so start from zero and re-apply the -inf
+                # sentinel to never-written (sampler-dropped) voxels after the loop.
+                neg_inf = 0.0 if k > 1 else float("-inf")
+                if k > 1:
+                    written = torch.zeros(total_samples, dtype=torch.bool, device=_dev)
                 if isinstance(pred_field, RadiationField):
                     full_field = RadiationField(
                         scatter_field=RadiationFieldChannel(
-                            spectrum=torch.empty(total_samples, spectra_bins, device=x.direction.device, dtype=torch.float32) if pred_field.scatter_field.spectrum is not None else None,
-                            flux=torch.empty(total_samples, device=x.direction.device, dtype=torch.float32)
+                            spectrum=torch.full((total_samples, spectra_bins), neg_inf, device=_dev, dtype=_dt) if pred_field.scatter_field.spectrum is not None else None,
+                            flux=torch.full((total_samples,), neg_inf, device=_dev, dtype=_dt)
                         ) if pred_field.scatter_field is not None else None,
                         direct_beam=RadiationFieldChannel(
-                            spectrum=torch.empty(total_samples, spectra_bins, device=x.direction.device, dtype=torch.float32) if pred_field.direct_beam.spectrum is not None else None,
-                            flux=torch.empty(total_samples, device=x.direction.device, dtype=torch.float32)
+                            spectrum=torch.full((total_samples, spectra_bins), neg_inf, device=_dev, dtype=_dt) if pred_field.direct_beam.spectrum is not None else None,
+                            flux=torch.full((total_samples,), neg_inf, device=_dev, dtype=_dt)
                         ) if pred_field.direct_beam is not None else None,
-                        geometry=torch.empty(total_samples, device=x.direction.device, dtype=torch.float32) if pred_field.geometry is not None else None
+                        geometry=torch.zeros(total_samples, device=_dev, dtype=_dt) if pred_field.geometry is not None else None
                     )
                 elif isinstance(pred_field, AirKermaField):
                     full_field = AirKermaField(
-                        air_kerma=torch.empty(total_samples, device=x.direction.device, dtype=torch.float32),
-                        geometry=torch.empty(total_samples, device=x.direction.device, dtype=torch.float32) if pred_field.geometry is not None else None
+                        air_kerma=torch.full((total_samples,), neg_inf, device=_dev, dtype=_dt),
+                        geometry=torch.zeros(total_samples, device=_dev, dtype=_dt) if pred_field.geometry is not None else None
                     )
+            def _write(dst: Tensor, src: Tensor):
+                src = src.to(torch.float32)
+                if k > 1:
+                    dst.index_add_(0, indices, src)
+                else:
+                    dst[indices] = src.unsqueeze(0) if (dst.dim() > 1 and src.dim() == 1) else src
+
             if isinstance(pred_field, RadiationField):
                 if pred_field.scatter_field is not None:
-                    full_field.scatter_field.flux[indices] = pred_field.scatter_field.flux.to(torch.float32).unsqueeze(0) if len(pred_field.scatter_field.flux.shape) == 1 else pred_field.scatter_field.flux
+                    _write(full_field.scatter_field.flux, pred_field.scatter_field.flux)
                     if pred_field.scatter_field.spectrum is not None:
-                        full_field.scatter_field.spectrum[indices] = pred_field.scatter_field.spectrum.to(torch.float32)
+                        _write(full_field.scatter_field.spectrum, pred_field.scatter_field.spectrum)
                 if pred_field.direct_beam is not None:
-                    full_field.direct_beam.flux[indices] = pred_field.direct_beam.flux.to(torch.float32).unsqueeze(0) if len(pred_field.direct_beam.flux.shape) == 1 else pred_field.direct_beam.flux
+                    _write(full_field.direct_beam.flux, pred_field.direct_beam.flux)
                     if pred_field.direct_beam.spectrum is not None:
-                        full_field.direct_beam.spectrum[indices] = pred_field.direct_beam.spectrum.to(torch.float32)
+                        _write(full_field.direct_beam.spectrum, pred_field.direct_beam.spectrum)
                 if pred_field.geometry is not None:
-                    full_field.geometry[indices] = pred_field.geometry.to(torch.float32).unsqueeze(0) if len(pred_field.geometry.shape) == 1 else pred_field.geometry
+                    _write(full_field.geometry, pred_field.geometry)
             elif isinstance(pred_field, AirKermaField):
-                full_field.air_kerma[indices] = pred_field.air_kerma.to(torch.float32).unsqueeze(0) if len(pred_field.air_kerma.shape) == 1 else pred_field.air_kerma
+                _write(full_field.air_kerma, pred_field.air_kerma)
                 if pred_field.geometry is not None:
-                    full_field.geometry[indices] = pred_field.geometry.to(torch.float32).unsqueeze(0) if len(pred_field.geometry.shape) == 1 else pred_field.geometry
+                    _write(full_field.geometry, pred_field.geometry)
             else:
                 raise ValueError("Unknown field type returned by the model.")
+            if k > 1:
+                written[indices] = True
+
+        if k > 1:
+            # per-voxel mean over the k replicas; sampler-dropped voxels get the -inf sentinel
+            def _finalize(t: Tensor):
+                if t is None:
+                    return None
+                t = t / k
+                t[~written] = float("-inf")
+                return t
+            if isinstance(full_field, RadiationField):
+                full_field = full_field._replace(
+                    scatter_field=full_field.scatter_field._replace(
+                        flux=_finalize(full_field.scatter_field.flux),
+                        spectrum=_finalize(full_field.scatter_field.spectrum)) if full_field.scatter_field is not None else None,
+                    direct_beam=full_field.direct_beam._replace(
+                        flux=_finalize(full_field.direct_beam.flux),
+                        spectrum=_finalize(full_field.direct_beam.spectrum)) if full_field.direct_beam is not None else None,
+                    geometry=(full_field.geometry / k) if full_field.geometry is not None else None,
+                )
+            elif isinstance(full_field, AirKermaField):
+                full_field = full_field._replace(
+                    air_kerma=_finalize(full_field.air_kerma),
+                    geometry=(full_field.geometry / k) if full_field.geometry is not None else None,
+                )
 
         # Reshape to final volume dimensions
         if batched_input:
@@ -356,25 +425,12 @@ class FeedforwardPointwiseModel(BaseNeuralRadFieldModel):
                 ) if full_field.direct_beam is not None else None,
                 geometry=full_field.geometry.view(*target_flux_shape) if full_field.geometry is not None else None
             )
-            if mask is not None and mask.any():
-                if full_field.scatter_field is not None and full_field.scatter_field.flux is not None:
-                    full_field.scatter_field.flux[mask] = -torch.inf
-                    spec_mask = mask.expand_as(full_field.scatter_field.spectrum) if full_field.scatter_field.spectrum is not None else None
-                    if spec_mask is not None:
-                        full_field.scatter_field.spectrum[spec_mask] = -torch.inf
-                if full_field.direct_beam is not None and full_field.direct_beam.flux is not None:
-                    full_field.direct_beam.flux[mask] = -torch.inf
-                    spec_mask = mask.expand_as(full_field.direct_beam.spectrum) if full_field.direct_beam.spectrum is not None else None
-                    if spec_mask is not None:
-                        full_field.direct_beam.spectrum[spec_mask] = -torch.inf
+            # masked voxels were never forwarded (keep = ~mask), so they already hold the -inf pre-fill.
         elif isinstance(full_field, AirKermaField):
             full_field: AirKermaField = AirKermaField(
                 air_kerma=full_field.air_kerma.view(*target_flux_shape) if full_field.air_kerma is not None else None,
                 geometry=full_field.geometry.view(*target_flux_shape) if full_field.geometry is not None else None
             )
-            if mask is not None and mask.any():
-                if full_field.air_kerma is not None:
-                    full_field.air_kerma[mask] = -torch.inf
         else:
             raise ValueError("Unknown field type returned by the model.")
         
@@ -384,82 +440,3 @@ class FeedforwardPointwiseModel(BaseNeuralRadFieldModel):
         optimizer = torch.optim.Adam(self.parameters(), lr=self._lr, weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
         return [optimizer], [scheduler]
-
-
-class ParametricFeedforwardModel(FeedforwardPointwiseModel):
-    __model_name__ = "ParametricFeedforwardModel"
-
-    def __init__(self, location_encoding_dims=10, direction_encoding_dims=4, d_model=256, num_layers=5, out_spectra_dims: int = 32, activation_fn: str = "ReLU", spectra_loss_fn = "L1Loss", flux_loss_fn = "L1Loss", position_encoding_type: str = "SinusoidalFrequency", layer_normalization: str | None = "LayerNorm", use_residuals: bool = True):
-        super().__init__(location_encoding_dims, direction_encoding_dims, d_model)
-        self.num_layers = num_layers
-        self.activation_fn_name = activation_fn
-        self.spectra_loss_fn_name = spectra_loss_fn
-        self.flux_loss_fn_name = flux_loss_fn
-        self.position_encoding_type = position_encoding_type
-        self.num_layers = num_layers
-        self.out_spectra_dims = out_spectra_dims
-        self.use_residuals = use_residuals
-        self.layer_normalization_name = layer_normalization
-        self.activation_fn = ModuleBuilder.ConstructActivation_fn(activation_fn)
-        self.spectra_loss_fn = ModuleBuilder.ConstructLoss_fn(spectra_loss_fn)
-        self.flux_loss_fn = ModuleBuilder.ConstructLoss_fn(flux_loss_fn)
-        self.layer_normalization = ModuleBuilder.ConstructNormalization_fn(layer_normalization) if layer_normalization is not None else None
-        self.positional_location_encoding = None
-        if position_encoding_type == "SinusoidalFrequency":
-            self.preprocess_location = nn.Identity()
-            self.preprocess_direction = nn.Identity()
-            self.positional_location_encoding = SinusoidalFrequencyEncoding(location_encoding_dims, 3, append_input=True)
-            self.positional_direction_encoding = AngularSinusoidalFrequencyEncoding(direction_encoding_dims, append_input=True)
-        else:
-            raise ValueError(f"Unknown position encoding type: {position_encoding_type}")
-
-        self.hidden_layers_and_output = [
-            ResidualBlock(d_model, self.activation_fn, self.layer_normalization) if use_residuals else LinearBlock(d_model, self.activation_fn, self.layer_normalization)
-            for _ in range(num_layers - 1)
-        ] + [
-            ResidualBlock(d_model, self.activation_fn, self.layer_normalization, d_model_out=d_model//2) if use_residuals else LinearBlock(d_model, self.activation_fn, self.layer_normalization, d_model_out=d_model//2)
-        ]
-
-        self.model = nn.Sequential(
-            nn.Linear(self.positional_location_encoding.encoded_dims + self.positional_direction_encoding.encoded_dims, d_model),
-            *self.hidden_layers_and_output
-        )
-
-        self.flux_activation = nn.Sigmoid()
-        self.spectra_activation = nn.Softmax(dim=1)
-
-    def forward(self, x: PositionalInput) -> RadiationField:
-        loc = self.preprocess_location(x.position)
-        loc_enc = self.positional_location_encoding(loc)
-        dir = self.preprocess_direction(x.direction)
-        dir_enc = self.positional_direction_encoding(dir)
-        x = torch.cat((loc_enc, dir_enc), dim=-1)
-        x = self.model(x)
-        flux = self.flux_activation(x[:, -1])
-        spectra = self.spectra_activation(x[:, :self.out_spectra_dims])
-        return RadiationField(
-            scatter_field=RadiationFieldChannel(
-                flux=flux,
-                spectrum=spectra
-            ),
-            direct_beam=None
-        )
-
-    def get_custom_parameters(self):
-        params = {
-            "location_encoding_dims": self.positional_location_encoding.encoded_dims,
-            "direction_encoding_dims": self.positional_direction_encoding.encoded_dims,
-            "d_model": self.d_model,
-            "num_layers": self.num_layers,
-            "out_spectra_dims": self.out_spectra_dims,
-            "activation_fn": self.activation_fn_name,
-            "spectra_loss_fn": self.spectra_loss_fn_name,
-            "flux_loss_fn": self.flux_loss_fn_name,
-            "position_encoding_type": self.position_encoding_type,
-            "layer_normalization": self.layer_normalization_name,
-            "use_residuals": self.use_residuals,
-        }
-        seed = os.environ.get("PL_GLOBAL_SEED", None)
-        if seed is not None:
-            params["training_seed"] = int(seed)
-        return params

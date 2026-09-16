@@ -3,7 +3,7 @@ from lightning.pytorch.trainer import Trainer
 from loggers.logger import LoggerBase
 import torch
 import random
-from radfield3dnn import AirKermaField, TrainingInputData, RadiationField, PositionalInput
+from radfield3dnn.rftypes import AirKermaField, TrainingInputData, RadiationField, PositionalInput, positional_like
 from torch import Tensor
 import plotly.graph_objects as go
 from rich import print
@@ -16,14 +16,15 @@ from visualizers.sliced_plotter import SlicedAirkermaPlotter
 
 
 class ValidationPlotter(Callback):
-    def __init__(self, logger: LoggerBase, mu_tr_path: str, max_energy_eV: float = 1.5e+5, voxel_size: float = 0.025, voxel_resolution: tuple = (50, 50, 50), plot_spectra: bool = True, plot_volume: bool = True):
+    def __init__(self, logger: LoggerBase, mu_tr_path: str, max_energy_eV: float = 1.5e+5, voxel_size: float = 0.025, voxel_resolution: tuple = (50, 50, 50), plot_spectra: bool = True, plot_volume: bool = True, spectra_bins: int = 32):
         super().__init__()
         self.logger = logger
         self.voxel_resolution = torch.tensor(voxel_resolution, dtype=torch.int32)
+        self.spectra_bins = spectra_bins
         self.join_channels: ChannelsJoin = ChannelsJoin()
         self.plot_spectra = plot_spectra
         self.plot_volume = plot_volume
-        self.spectra_plotter = SpectrumPlotter(bins=32, max_energy_eV=max_energy_eV, used_unit="keV", bar_opacity=0.6)
+        self.spectra_plotter = SpectrumPlotter(bins=spectra_bins, max_energy_eV=max_energy_eV, used_unit="keV", bar_opacity=0.6)
         self.airkerma_plotter = AirkermaPlotter(
             mutr_path=mu_tr_path,
             max_energy_eV=max_energy_eV,
@@ -51,7 +52,7 @@ class ValidationPlotter(Callback):
                 batch,
                 pl_module,
                 voxel_resolution=self.voxel_resolution,
-                spectra_bins=32
+                spectra_bins=self.spectra_bins
             )
 
             with torch.no_grad():
@@ -91,12 +92,12 @@ class ValidationPlotter(Callback):
                     print(f"[yellow]Warning: Predicted flux is all zeros for item {idx} in validation batch.[/yellow]")
 
                 if self.plot_volume and idx == 0:
-                    vidx = int(torch.randint(0, batch_size - 1, size=(1,)).item()) if batch_size > 1 else 0
+                    vidx = int(torch.randint(0, batch_size, size=(1,)).item()) if batch_size > 1 else 0
                     self.airkerma_plotter.add_airkerma_to_figure(
                         fig=fig_volume,
                         field=pred_field,
                         batch_idx=vidx,
-                        name=f"Predicted flux {vidx}"
+                        name=f"Predicted Flux {vidx}"
                     )
 
                 # Optional target for blending (normalize independently to ensure visibility)
@@ -163,7 +164,7 @@ class ValidationPlotter(Callback):
                         col=idx + 1
                     )
 
-            rendered_measurand = "Air Kerma" if isinstance(pred_field, AirKermaField) else "flux"
+            rendered_measurand = "Air Kerma" if isinstance(pred_field, AirKermaField) else "Flux"
             fig.update_layout(
                 title_text=f"Predicted vs Target {rendered_measurand} (Red=Pred, Blue=Target, Purple=Overlap) - Batch",
                 showlegend=False,
@@ -297,14 +298,21 @@ class ValidationDepthIntesityPlotter(Callback):
             steps = torch.arange(0, length, step).unsqueeze(1).to(direction.device)
             steps: Tensor = steps * direction + origin_point
 
-            net_in = PositionalInput(
+            # positional_like: this input goes to forward() WITHOUT precomputed global_parameters,
+            # so it must carry every beam parameter the model's encoder reads — including the
+            # patient translation of a TranslationalInput batch (repeated per ray step, like the
+            # other per-sample fields).
+            _translation = getattr(inputs, "translation", None)
+            net_in = positional_like(
+                inputs,
                 direction=direction.repeat(steps.shape[0], 1),
                 spectrum=spectrum.repeat(steps.shape[0], 1),
                 position=steps,
                 origin=origin_point.repeat(steps.shape[0], 1),
                 geometry=inputs.geometry[idx].unsqueeze(0).repeat(steps.shape[0], 1) if inputs.geometry is not None else None,
                 beam_shape_parameters=inputs.beam_shape_parameters[idx].unsqueeze(0).repeat(steps.shape[0], 1) if inputs.beam_shape_parameters is not None else None,
-                beam_shape_type=inputs.beam_shape_type[idx].unsqueeze(0).repeat(steps.shape[0], 1) if inputs.beam_shape_type is not None else None
+                beam_shape_type=inputs.beam_shape_type[idx].unsqueeze(0).repeat(steps.shape[0], 1) if inputs.beam_shape_type is not None else None,
+                translation=_translation[idx].unsqueeze(0).repeat(steps.shape[0], 1) if _translation is not None else None,
             )
 
             field: RadiationField = pl_module.forward(net_in)
@@ -322,6 +330,6 @@ class ValidationDepthIntesityPlotter(Callback):
             ]
 
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=[d[0] for d in data], y=[d[1] for d in data], mode='lines', name='flux'))
+            fig.add_trace(go.Scatter(x=[d[0] for d in data], y=[d[1] for d in data], mode='lines', name='Flux'))
             fig.update_layout(title='Flux vs Depth', xaxis_title='Depth', yaxis_title='Flux', plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)')
             self.logger.log_plot("Flux vs Depth", fig)

@@ -1,5 +1,5 @@
 import plotly.graph_objects as go
-from radfield3dnn import RadiationFieldChannel, RadiationField, AirKermaField
+from radfield3dnn.rftypes import RadiationFieldChannel, RadiationField, AirKermaField
 import torch
 from radfield3dnn.preprocessing.airkerma import Airkerma
 from radfield3dnn.datasets.channel_join import ChannelsJoin

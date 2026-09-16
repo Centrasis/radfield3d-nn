@@ -23,6 +23,15 @@ class LoggerBase(object):
         self.project_name = project_name
         self.logs_dir = logs_dir
 
+    def export_init_kwargs(self) -> dict:
+        """The constructor kwargs that rebuild an equivalent logger in ANOTHER PROCESS.
+
+        The tuning task runs one trial per subprocess and cannot pickle a live logger (open run,
+        sockets, file handles), so it rebuilds one from this. Subclasses that add constructor
+        arguments must extend it, or their trials log to a differently-configured tracker.
+        """
+        return {"project_name": self.project_name, "logs_dir": self.logs_dir}
+
     def setup_experiment(self, experiment_name: str, settings: TrainingSettings):
         """
         Sets up the experiment with the given name and training settings.

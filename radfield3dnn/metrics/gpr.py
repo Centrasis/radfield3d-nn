@@ -6,26 +6,47 @@ import math
 
 
 class GammaPassingRate(MetricBase):
-    def __init__(self, layer_name: str = None, reduction: Union[Literal['mean'], Literal['median'], Literal['none']] = 'mean', weight_with_error: bool = False, keep_dim: bool = False, voxel_size_m: float = 0.01, rel_dose_diff: float = 0.03, dist_crit_mm: float = 3.0, dose_threshold: float = 1e-5):
+    def __init__(self, layer_name: str = None, reduction: Union[Literal['mean'], Literal['median'], Literal['none']] = 'mean', weight_with_error: bool = False, keep_dim: bool = False, voxel_size_m: float = 0.01, rel_dose_diff: float = 0.03, dist_crit_mm: float = 3.0, dose_threshold: float = 1e-5, normalization: Union[Literal['global'], Literal['local']] = 'global'):
         super().__init__(layer_name=layer_name, reduction=reduction, weight_with_error=weight_with_error, eps=1e-9)
+        if normalization not in ('global', 'local'):
+            raise ValueError(f"normalization must be 'global' or 'local', got {normalization!r}.")
         self.keep_dim = keep_dim
         self.voxel_size_mm = (voxel_size_m * 1000.0, voxel_size_m * 1000.0, voxel_size_m * 1000.0)
         self.rel_dose_diff = rel_dose_diff
         self.dist_crit_mm = dist_crit_mm
         self.dose_threshold = dose_threshold
+        self.normalization = normalization
 
     @staticmethod
     @torch.no_grad()
-    def gamma_index(pred: Tensor, tgt: Tensor, rel_dose_diff=0.03, dist_crit_mm=3.0, voxel_size_mm=(1.0, 1.0, 1.0), dose_threshold=1e-5):
+    def gamma_index(pred: Tensor, tgt: Tensor, rel_dose_diff=0.03, dist_crit_mm=3.0, voxel_size_mm=(1.0, 1.0, 1.0), dose_threshold=1e-5, normalization='global'):
         B, C, D, H, W = tgt.shape
         device = tgt.device
 
-        # normalization (global, per-batch, per-channel) and threshold mask
+        # EXCLUDED voxels: a non-finite prediction voxel (geometry exclusion, masking) must never
+        # act as an agreement CANDIDATE in the neighborhood search — normalize every non-finite
+        # value to +inf, the same sentinel the out-of-bounds shift uses, so its dose term is
+        # infinite and the candidate can never win the minimum. (A bare -inf already behaves that
+        # way through the squared difference; NaN would poison torch.minimum instead.)
+        pred = torch.where(torch.isfinite(pred), pred, torch.full_like(pred, torch.inf))
+
+        # normalization (global, per-batch, per-channel) and threshold mask.
+        # `tgt >= threshold*max` is False for -inf, so excluded REFERENCE voxels drop out here;
+        # a reference voxel whose entire candidate neighborhood is excluded/out-of-bounds keeps
+        # gamma == inf and is dropped by the isfinite(gamma_map) filter below — skipped, not
+        # failed (relevant for large dist_crit reaching into masked regions).
         max_tgt = tgt.amax(dim=(2, 3, 4), keepdim=True)  # shape: (B,C,1,1,1)
         mask = tgt >= (dose_threshold * max_tgt)
 
-        # denominator for dose difference (global-relative gamma)
-        dose_den = torch.clamp(rel_dose_diff * max_tgt, min=1e-12)
+        # Denominator of the dose-difference term. 'global' measures the criterion against the
+        # field peak, so a voxel far below the peak passes on almost any prediction; 'local'
+        # measures it against the voxel's own dose, keeping the criterion meaningful across the
+        # six decades of a radiation field. The local denominator is floored at 1e-9 of the peak
+        # so a target of exactly zero cannot divide by zero.
+        if normalization == 'local':
+            dose_den = torch.clamp(rel_dose_diff * tgt, min=1e-9 * rel_dose_diff * max_tgt.clamp_min(1e-12))
+        else:
+            dose_den = torch.clamp(rel_dose_diff * max_tgt, min=1e-12)
 
         # compute search offsets in voxels (ceil to avoid missing candidates), then keep only inside sphere
         dz_max = int(math.ceil(dist_crit_mm / voxel_size_mm[0]))
@@ -77,8 +98,13 @@ class GammaPassingRate(MetricBase):
 
         valid_count = valid.view(B, -1).sum(dim=1)
         pass_count = pass_map.view(B, -1).sum(dim=1)
-        # avoid division by zero if no valid voxels
-        pass_rate = torch.where(valid_count > 0, pass_count.float() / valid_count.float(), torch.zeros_like(pass_count, dtype=torch.float32))
+        # A field with NO valid reference voxel (everything below the dose threshold, or fully
+        # excluded) carries no information for this criterion: report NaN so the metric pipeline
+        # SKIPS it (MetricBase filters non-finite entries; an all-NaN batch returns empty and the
+        # epoch accumulator skips the batch). The previous 0.0 scored such fields as total
+        # failures and dragged the epoch mean down.
+        pass_rate = torch.where(valid_count > 0, pass_count.float() / valid_count.float(),
+                                torch.full_like(pass_count, torch.nan, dtype=torch.float32))
         return pass_rate, pass_map
 
     @torch.no_grad()
@@ -90,6 +116,7 @@ class GammaPassingRate(MetricBase):
             dist_crit_mm=self.dist_crit_mm,
             rel_dose_diff=self.rel_dose_diff,
             dose_threshold=self.dose_threshold,
+            normalization=self.normalization,
         )
 
         if self.keep_dim:

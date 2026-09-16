@@ -52,4 +52,6 @@ class ModelCheckpoint(LightningModelCheckpoint):
         if os.path.exists(config_path):
             os.remove(config_path)
         with open(config_path, "w") as f:
-            json.dump(trainer.model.get_model_config(), f)
+            # trainer.lightning_module unwraps any DDP/strategy wrapper (trainer.model can be the
+            # wrapper, which has no get_model_config()).
+            json.dump(trainer.lightning_module.get_model_config(), f)

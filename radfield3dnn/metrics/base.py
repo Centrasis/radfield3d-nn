@@ -1,7 +1,7 @@
 from torch import nn
 from torch import Tensor
 import torch
-from radfield3dnn import TrainingInputData, RadiationField, RadiationFieldChannel
+from radfield3dnn.rftypes import TrainingInputData, RadiationField, RadiationFieldChannel
 from typing import Union, Literal
 
 
@@ -17,7 +17,20 @@ def weight_field_by_statistical_error(tensor: Tensor, input: TrainingInputData, 
     :return: The weighted tensor.
     """
     if isinstance(input.ground_truth, RadiationField):
-        confidence = torch.clamp(1.0 - ((input.ground_truth.scatter_field.error + input.ground_truth.direct_beam.error) / 2.0), min=0.0, max=1.0)
+        gt = input.ground_truth
+        # direct_beam is None for a joined / single-channel RadiationField (e.g. after ChannelsJoin):
+        # average the per-channel errors only over the channels that actually exist.
+        sf_err = gt.scatter_field.error if gt.scatter_field is not None else None
+        db_err = gt.direct_beam.error if gt.direct_beam is not None else None
+        if sf_err is not None and db_err is not None:
+            error = (sf_err + db_err) / 2.0
+        elif sf_err is not None:
+            error = sf_err
+        elif db_err is not None:
+            error = db_err
+        else:
+            raise ValueError("RadiationField ground truth has no error field to weight by.")
+        confidence = torch.clamp(1.0 - error, min=0.0, max=1.0)
     elif isinstance(input.ground_truth, RadiationFieldChannel):
         confidence = torch.clamp(1.0 - input.ground_truth.error, min=0.0, max=1.0)
     else:
@@ -96,14 +109,19 @@ class MetricBase(nn.Module):
         if self.weight_with_error and input is not None:
             metric = self.weight_by_statistical_error(metric, input=input)
 
-        if len(metric.shape) > 1 or (len(metric.shape) > 0 and metric.shape[0] > 1):
+        if len(metric.shape) > 0 and metric.numel() > 0:
+            # Reduce EVERY non-scalar result, including shape (1,) — batch size 1 is the common
+            # full-volume case, and skipping the finite-filter there let a single NaN/-inf voxel
+            # value pass straight into the epoch accumulator.
             metric = metric.view(-1)
             valid_mask = torch.isfinite(metric)
             if valid_mask.any():
                 metric = metric[valid_mask]
                 metric = self.reduction_fn(metric)
             else:
-                metric = torch.tensor(torch.nan, device=metric.device, dtype=metric.dtype)
+                # nothing valid in this batch: return EMPTY so the accumulator skips it —
+                # a NaN here poisoned the accumulated epoch metric permanently.
+                metric = torch.zeros(0, device=metric.device, dtype=metric.dtype)
         return metric
 
     def weight_by_statistical_error(self, tensor: Tensor, input: TrainingInputData) -> Tensor:

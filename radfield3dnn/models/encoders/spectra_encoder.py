@@ -7,6 +7,7 @@ class SimpleSpectraEncoder(nn.Module):
     def __init__(self, in_spectra_dim: int, encoded_spectra_dims: int):
         super().__init__()
         self.in_spectra_dim = in_spectra_dim
+        self.encoded_dims = encoded_spectra_dims
         self.encoder = nn.Sequential(
             nn.Linear(in_spectra_dim, encoded_spectra_dims),
             nn.LayerNorm(encoded_spectra_dims),
@@ -26,6 +27,7 @@ class SpectraProjector(nn.Module):
         super().__init__()
         self.in_spectra_dim = in_spectra_dim
         self.out_spectra_dim = out_spectra_dim
+        self.encoded_dims = out_spectra_dim
         self.spectra_conv_project = nn.Linear(in_spectra_dim, out_spectra_dim)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -38,6 +40,7 @@ class SpectraEncoder(nn.Module):
     def __init__(self, in_spectra_dim: int, encoded_spectra_dims: int):
         super().__init__()
         self.in_spectra_dim = in_spectra_dim
+        self.encoded_dims = encoded_spectra_dims
         self.activation = nn.SiLU()
         self.conv = nn.Sequential(
             nn.Conv1d(1, 16, kernel_size=3, padding=1, bias=False),

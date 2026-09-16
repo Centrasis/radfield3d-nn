@@ -9,6 +9,7 @@ __pycache__/
 # Distribution / packaging
 .Python
 build/
+build_deploy/
 develop-eggs/
 dist/
 downloads/
@@ -99,6 +100,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+.vs/
 
 # Spyder project settings
 .spyderproject
@@ -125,3 +127,5 @@ dmypy.json
 cython_debug/
 
 .vscode/
+# test_model_io round-trip artifact (written into the source tree at test time)
+tests/cxx/data/roundtrip.rf3m

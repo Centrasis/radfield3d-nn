@@ -1,212 +1,496 @@
-from radfield3dnn.normalizations.base import Normalizer
-from .base import BaseNeuralRadFieldModel
-from .cnn import *
-from .nerf import *
-from .feedforward import *
-from typing import Literal, Union, Type, List
 import json
-from radfield3dnn.rftypes import PositionalInput
 import os
-from rich import print
-from enum import Enum
+from typing import Literal, NamedTuple, Union, Type, List
+
+import torch
+
+from radfield3dnn.preprocessing.normalizations import NormalizerConstructor
+from .base import BaseNeuralRadFieldModel
+from .nerf import *
+from .nerf_translation import *
+from .nerf_physics import *
+from .feedforward import *
+from .field_unet import *
+from radfield3dnn.models.encoders.base import EncodingBase
+from radfield3dnn.rftypes import PositionalInput, positional_like
+from RadFiled3D.nn.torch_export import export_to_onnx
+
+
+def _field_output_tensors(out):
+    """Flatten a model output into a plain tuple of TENSORS for the ONNX export.
+
+    The models return NamedTuples whose unused members are None
+    (``RadiationField(scatter_field=RadiationFieldChannel(spectrum, flux, error=None),
+    direct_beam=None, geometry=None)`` flattens to ``(spectrum, flux, None, None, None)``).
+    torch.onnx's converter walks the returned pytree and asks every leaf for its ``.name`` —
+    a None leaf aborts the conversion with "'NoneType' object has no attribute 'name'"
+    (step 3/3). Returning only the real tensors also fixes the output ORDER contract: the deploy
+    runtime identifies them structurally (the one whose trailing dim is the bin count is the
+    spectrum), so (flux, spectrum) is unambiguous.
+    """
+    from radfield3dnn.rftypes import AirKermaField, RadiationField, rf3RadiationField
+    from RadFiled3D.pytorch.types import RadiationFieldChannel
+
+    def channel(ch):
+        return tuple(t for t in (ch.flux, ch.spectrum) if t is not None)
+
+    if isinstance(out, (RadiationField, rf3RadiationField)):
+        tensors = channel(out.scatter_field) if out.scatter_field is not None else ()
+        if out.direct_beam is not None:
+            tensors = tensors + channel(out.direct_beam)
+        return tensors
+    if isinstance(out, RadiationFieldChannel):
+        return channel(out)
+    if isinstance(out, AirKermaField):
+        return (out.air_kerma,)
+    if isinstance(out, torch.Tensor):
+        return (out,)
+    # unknown structure: keep every tensor leaf, drop the Nones
+    return tuple(t for t in out if isinstance(t, torch.Tensor))
+
+
+def _output_names_for(out) -> list:
+    """Names matching _field_output_tensors' order (informational: the deploy runtime binds
+    outputs structurally, not by name)."""
+    n = len(_field_output_tensors(out))
+    base = ["flux", "spectrum", "direct_flux", "direct_spectrum"]
+    return base[:n] if n <= len(base) else [f"output_{i}" for i in range(n)]
+
+
+def _export_batch_dim():
+    """Dynamic batch dim for the ONNX exports — the deploy module's own, never a second copy."""
+    from RadFiled3D.nn.torch_export import batch_dim
+    return batch_dim()
 
 
 class ModelConstructor:
     @staticmethod
     def get_subclasses(cls) -> List[Type[BaseNeuralRadFieldModel]]:
-        list_of_subclasses = []
-        for subclass in cls.__subclasses__():
-            list_of_subclasses.append(subclass)
-            list_of_subclasses += ModelConstructor.get_subclasses(subclass)
-        return list_of_subclasses
+        result = []
+        for sub in cls.__subclasses__():
+            result.append(sub)
+            result += ModelConstructor.get_subclasses(sub)
+        return result
 
     @staticmethod
     def construct(name: str, **kwargs):
-        model = None
-        
         for cls in ModelConstructor.get_subclasses(BaseNeuralRadFieldModel):
             if "__model_name__" in cls.__dict__ and cls.__model_name__ == name:
-                model = cls(**kwargs)
-                break
+                return cls(**kwargs)
+        raise ValueError(f"Model '{name}' not found.")
 
-        if model is None:
-            raise ValueError(f"Model {name} not found.")
-        return model
-        
-    @staticmethod
-    def get_model_names() -> list[str]:
-        names = []
-        for cls in BaseNeuralRadFieldModel.__subclasses__():
-            names.append(cls.__model_name__)
-        return names
-    
     @staticmethod
     def get_dataset_type_for_model(name: str) -> Union[Literal["Voxelwise"], Literal["Layerwise"]]:
-        # currently always use Layerwise
         return "Layerwise"
 
     @staticmethod
     def create_model_with_defaults(name: str, **kwargs) -> Type[BaseNeuralRadFieldModel]:
         base_model = ModelConstructor.construct(name, **kwargs)
-        
+
         class DerivedModel(type(base_model)):
             def __init__(self, **init_kwargs):
-                defaults = {**kwargs, **init_kwargs}
-                super().__init__(**defaults)
+                super().__init__(**{**kwargs, **init_kwargs})
                 self.__class__.__name__ = base_model.__class__.__name__
-        
+
         return DerivedModel
 
     @staticmethod
-    def create_model_from_config(config_path: str, normalizer: Normalizer) -> Type[BaseNeuralRadFieldModel]:
-        with open(config_path, "r") as f:
-            config = json.load(f)
-        config["parameters"]["normalizer"] = normalizer
-        return ModelConstructor.create_model_from_dict(config)
-    
+    def _resolve_normalizer(params: dict) -> dict:
+        """Replace a normalizer name (or {"type": ..., knobs} dict) in params with an instance."""
+        norm = params.get("normalizer")
+        if isinstance(norm, (str, dict)):
+            params = dict(params)
+            params["normalizer"] = NormalizerConstructor.construct_by_name(norm)
+        return params
+
     @staticmethod
-    def create_model_from_dict(config: dict, normalizer: Normalizer = None) -> Type[BaseNeuralRadFieldModel]:
-        if normalizer is not None and "normalizer" not in config["parameters"]:
-            config["parameters"]["normalizer"] = normalizer
-        return ModelConstructor.create_model_with_defaults(config["model_name"], **config["parameters"])
+    def create_model_from_config(config_path: str) -> Type[BaseNeuralRadFieldModel]:
+        with open(config_path) as f:
+            config = json.load(f)
+        return ModelConstructor.create_model_from_dict(config)
+
+    @staticmethod
+    def create_model_from_dict(config: dict) -> Type[BaseNeuralRadFieldModel]:
+        params = ModelConstructor._resolve_normalizer(dict(config.get("parameters", {})))
+        return ModelConstructor.create_model_with_defaults(config["model_name"], **params)
 
     @staticmethod
     def load_model_from(path: str) -> BaseNeuralRadFieldModel:
         if not os.path.exists(path):
-            raise ValueError(f"Could not find model file: {path}")
+            raise ValueError(f"Model file not found: {path}")
 
-        ext = os.path.splitext(path)[1]
-        if ext.lower() == ".json":
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".json":
             config_path = path
             weight_path = os.path.splitext(path)[0] + ".pt"
             if not os.path.exists(weight_path):
                 weight_path = os.path.splitext(path)[0] + ".ckpt"
-            if not os.path.exists(weight_path):
-                raise ValueError(f"Could not find weights file corresponding to given config file: {path}")
-        elif ext.lower() in [".pt", ".ckpt"]:
+        elif ext in (".pt", ".ckpt"):
             weight_path = path
             config_path = os.path.splitext(path)[0] + ".json"
-            if not os.path.exists(config_path):
-                raise ValueError(f"Could not find config file corresponding to given weights file: {path}")
         else:
-            raise ValueError(f"Unknown extension ({ext}) for loading model from: {path}")
-        
-        model_config = json.load(open(config_path, "r"))
-        model_cls = ModelConstructor.create_model_from_dict(
-            model_config if "parameters" in model_config else {
-                "parameters": model_config["hyper_parameters"],
-                "model_name": model_config["model_name"]
-            }
-        )
+            raise ValueError(f"Unknown extension '{ext}' for: {path}")
 
+        if not os.path.exists(config_path):
+            raise ValueError(f"Config not found: {config_path}")
+        if not os.path.exists(weight_path):
+            raise ValueError(f"Weights not found: {weight_path}")
+
+        config = json.load(open(config_path))
+        if "parameters" not in config and "hyper_parameters" in config:
+            config = {"parameters": config["hyper_parameters"], "model_name": config["model_name"]}
+
+        model_cls = ModelConstructor.create_model_from_dict(config)
         model = model_cls()
-        core_model = model.get_core_model()
+        core = model.get_core_model()
         try:
-            core_model.load_state_dict(torch.load(weight_path))
-        except:
-            # Try loading with a known pure python encoding and restore intended encoding afterwards
-            from radfield3dnn.encodings.sinusoidal_encoding import SinusoidalFrequencyEncoding
-            pen = core_model.positional_location_encoding
-            core_model.positional_location_encoding = SinusoidalFrequencyEncoding(
-                pos_enc_dim=pen.pos_enc_dim,
-                d_input=pen.d_input,
-                append_input=pen.append_input,
-                dim=-1,
-                use_tcnn=False
+            core.load_state_dict(torch.load(weight_path))
+        except Exception:
+            from radfield3dnn.models.encoders.sinusoidal_encoding import SinusoidalFrequencyEncoding
+            pen = core.positional_location_encoding
+            core.positional_location_encoding = SinusoidalFrequencyEncoding(
+                pos_enc_dim=pen.pos_enc_dim, d_input=pen.d_input,
+                append_input=pen.append_input, dim=-1,
             )
-            core_model.load_state_dict(torch.load(weight_path))
-            core_model.positional_location_encoding = pen
+            core.load_state_dict(torch.load(weight_path))
+            core.positional_location_encoding = pen
         return model
 
 
-class ModelFormat(Enum):
-    ONNX = 0
-    TORCH_SCRIPT = 1
-    TENSOR_RT = 2
+class ExportedGraph(NamedTuple):
+    """One ONNX graph plus the tensor names it actually carries.
+
+    The names travel WITH the bytes because the RF3M runtime binds by name: a package that
+    declares `beam_dir` while the graph declares `beam_direction` loads and then cannot be driven.
+    Returning them together is what lets the packager declare exactly what it shipped.
+    """
+    onnx: bytes
+    input_names: list
+    output_names: list
+
+
+def relay_name(tensor: str) -> str:
+    """The name a relayed tensor leaves its producing graph under.
+
+    One ONNX namespace covers a graph's inputs and outputs, so a tensor passed straight through
+    cannot keep its name. The buffer it lands in carries the same suffix, so the wiring reads the
+    same on both sides.
+    """
+    return f"{tensor}_relay"
+
+
+class StagedEncoder(NamedTuple):
+    """An encoder that ships as its own RF3M stage, and where it lives on the model."""
+    stage: str            # the stage name, and the name its blocks are added under (unique per encoder)
+    owner: object         # the module holding it
+    attribute: str        # the attribute on that owner
+    encoder: object       # the encoder itself
+    tensor: str           # the trunk graph input its features arrive on
+
+
+def staged_encoders(model) -> list:
+    """Every encoder in `model` that announces a deploy stage.
+
+    Found by asking each encoder (`EncodingBase.deploy_stage`), never by testing its type, so a
+    second kernel-backed encoding needs no change here.
+    """
+    found = []
+    for owner in model.modules():
+        for attribute, child in vars(owner).get("_modules", {}).items():
+            stage = getattr(child, "deploy_stage", lambda: None)()
+            if stage is not None:
+                # Named after the ATTRIBUTE, not the stage: a model may hold two grids
+                # (`beam_frame_encoding` and `patient_frame_encoding` are both encoder sites) and
+                # one name for both would wire the second one's features to the first one's buffer.
+                found.append(StagedEncoder(f"{stage}_{attribute}", owner, attribute, child,
+                                           f"{attribute}_features"))
+    return found
+
+
+class _StagedEncodingShim(EncodingBase):
+    """Stands in for a staged encoder while the trunk is traced.
+
+    The features arrive as a graph INPUT instead of being computed: the encoder is a CUDA custom op
+    the exporter cannot lower, and in the package a separate stage computes it into a buffer that
+    feeds this tensor. Holding it on the instance rather than threading it through `forward` leaves
+    the model's call site untouched — it still calls an encoder with a coordinate — so one
+    `encode_location` serves both training and export.
+    """
+
+    def __init__(self, dims: int):
+        super().__init__()
+        self._dims = dims
+        self.features = None
+
+    def calc_encoded_dim(self) -> int:
+        return self._dims
+
+    def forward(self, x, region_state=None):
+        if self.features is None:
+            raise RuntimeError("the staged encoder's features were never supplied to the trace")
+        return self.features
+
+
+def _traced_module(names, call):
+    """A traceable module whose forward takes exactly ``names`` as positional parameters.
+
+    The signature is BUILT from the name list rather than fixed, for two reasons that each bite on
+    their own. Which beam parameters a model consumes is configuration (collimation, patient
+    translation), so a fixed signature binds the translation to the beam-shape slot whenever an
+    earlier optional input is absent — silent, and fatal at deployment, because the runtime binds
+    by name. And a ``*args`` forward cannot be traced with a dynamic batch axis: torch.export
+    matches ``dynamic_shapes`` against the signature and sees the whole pack as one entry
+    ("inputs has 1 elements, but dynamic_shapes has 5").
+
+    ``call`` receives the traced tensors as a {name: tensor} mapping and returns the module output.
+    """
+    src = ("def forward(self, %s):\n    return self._call({%s})\n"
+           % (", ".join(names), ", ".join("%r: %s" % (n, n) for n in names)))
+    ns = {}
+    exec(src, ns)
+    cls = type("_Traced", (BaseNeuralRadFieldModel,),
+               {"forward": ns["forward"], "_call": staticmethod(call)})
+    return cls()
 
 
 class ModelExporter:
     @staticmethod
-    def export(model: BaseNeuralRadFieldModel, path: str, format: ModelFormat = ModelFormat.ONNX):
-        if format == ModelFormat.ONNX:
-            ModelExporter.onnx_export(model, path)
-        elif format == ModelFormat.TORCH_SCRIPT:
-            ModelExporter.ts_export(model, path)
-        elif format == ModelFormat.TENSOR_RT:
-            ModelExporter.rt_export(model, path)
-        else:
-            raise ValueError(f"Unknown format to exprot model: {format}")
+    def onnx_export(model: BaseNeuralRadFieldModel) -> ExportedGraph:
+        """Export the whole model as one self-contained graph: beam parameters + position -> field."""
+        inp = model._generate_random_input(model.device)
+        inp = getattr(inp, "input", inp)   # _generate_random_input may return a PositionalInput directly
+        core = model.get_core_model()
+        # An encoder that ships as its own stage is replaced, for the trace, by a shim taking its
+        # features as a graph input — the package computes them in a separate stage and a buffer
+        # carries them here. Swapped in BEFORE the model is run for its output names: the export
+        # runs on CPU and the encoder being replaced is exactly the one that cannot.
+        staged = staged_encoders(model)
+        for entry in staged:
+            # Refused BEFORE the shim goes in. Without a source graph the package could not feed
+            # the stage, and tracing anyway would emit a graph in which the encoder is dead code —
+            # complete-looking, silently missing the encoder, which is the worst outcome available.
+            if core.deploy_stage_source(entry.encoder) is None:
+                raise ValueError(
+                    f"{type(core).__name__} holds a `{entry.stage}` stage encoder at "
+                    f"`{entry.attribute}` but does not implement deploy_stage_source(), so nothing "
+                    f"can compute that stage's input. The package would carry a stage that cannot "
+                    f"run.")
+        shims, examples = {}, {}
+
+        def _call(kw):
+            for tensor, shim in shims.items():
+                shim.features = kw[tensor]
+            # tensors only — a None in the returned pytree kills the ONNX conversion
+            return _field_output_tensors(core.forward(positional_like(
+                inp,
+                direction=kw["beam_direction"], position=kw["position"],
+                spectrum=kw["tube_spectrum"], origin=kw["source_distance"],
+                beam_shape_parameters=kw.get("beam_collimation"),
+                beam_shape_type=kw.get("beam_collimation_kind"),
+                geometry=kw.get("geometry_map"),
+                translation=kw.get("patient_translation"),
+            )))
+
+        # Everything from the first swap to the last trace sits in ONE try/finally: a failure in
+        # between would otherwise leave the model's encoder permanently replaced by a shim, and the
+        # export callback swallows exceptions, so nothing would say so.
+        try:
+            for entry in staged:
+                shim = _StagedEncodingShim(entry.encoder.encoded_dims).to(model.device)
+                examples[entry.tensor] = torch.zeros(
+                    inp.position.shape[0], entry.encoder.encoded_dims,
+                    device=model.device, dtype=inp.position.dtype)
+                shim.features = examples[entry.tensor]
+                shims[entry.tensor] = shim
+                setattr(entry.owner, entry.attribute, shim)
+            with torch.no_grad():
+                output_names = _output_names_for(core.forward(inp))
+            # The tube spectrum is named `tube_spectrum`, never `spectrum`: an ONNX graph has ONE
+            # namespace for inputs and outputs, and this export puts the tube spectrum and the
+            # PREDICTED spectrum in the same graph — a shared name writes fine and is then rejected
+            # by every consumer with "Duplicate definition of name (spectrum)".
+            # Tensor names are the deploy module's own semantic vocabulary (`Semantic::get_name`),
+            # not this model's python argument names: the runtime binds by name, and every package
+            # in the corpus — including the migrated historical ones — speaks that vocabulary.
+            candidates = [("beam_direction", inp.direction), ("position", inp.position),
+                          ("tube_spectrum", inp.spectrum), ("source_distance", inp.origin),
+                          ("beam_collimation", inp.beam_shape_parameters),
+                          ("beam_collimation_kind", inp.beam_shape_type),
+                          ("geometry_map", inp.geometry),
+                          ("patient_translation", getattr(inp, "translation", None))]
+            for entry in staged:
+                candidates.append((entry.tensor, examples[entry.tensor]))
+            named = [(n, t) for n, t in candidates if t is not None]
+            names = [n for n, _ in named]
+            onnx = export_to_onnx(_traced_module(names, _call).eval(), tuple(t for _, t in named),
+                                  input_names=names, output_names=output_names)
+            return ExportedGraph(onnx, names, output_names)
+        finally:
+            for entry in staged:
+                setattr(entry.owner, entry.attribute, entry.encoder)
 
     @staticmethod
-    def rt_export(model: BaseNeuralRadFieldModel, path: str):
-        raise NotImplementedError()
+    def onnx_export_stage_source(model: BaseNeuralRadFieldModel, staged,
+                                 relay: list = ()) -> ExportedGraph:
+        """Export the graph that computes a staged encoder's input.
+
+        A kernel stage has no caller-bound tensors: what it reads comes from a buffer an earlier
+        stage wrote. This is that earlier stage — it takes the caller's beam parameters and writes
+        the coordinate the encoder is queried at.
+
+        It also RELAYS `relay`: the tensors the trunk needs and this graph already takes. A tensor
+        cannot be a caller-bound input of two stages — the runtime refuses the bind as ambiguous,
+        because a caller naming it could mean either — so the shared ones are bound here once and
+        reach the trunk through buffers. A relayed tensor leaves under a different name: an ONNX
+        graph has one namespace for inputs and outputs, so passing `position` straight through as
+        `position` would collide.
+        """
+        core = model.get_core_model()
+        source = core.deploy_stage_source(staged.encoder)
+        if source is None:
+            raise ValueError(
+                f"{type(core).__name__} holds a `{staged.stage}` stage encoder at "
+                f"`{staged.attribute}` but does not implement deploy_stage_source(), so nothing "
+                f"can compute that stage's input. The package would carry a stage that cannot run.")
+        module, names = source
+        names = list(names)
+        relay = [n for n in relay if n in names]
+        inp = model._generate_random_input(model.device)
+        inp = getattr(inp, "input", inp)
+        available = {
+            "position": inp.position, "beam_direction": inp.direction,
+            "source_distance": inp.origin, "beam_collimation": inp.beam_shape_parameters,
+            "beam_collimation_kind": inp.beam_shape_type,
+            "patient_translation": getattr(inp, "translation", None),
+        }
+        coordinate = f"{staged.stage}_coordinate"
+        out_names = [coordinate] + [relay_name(n) for n in relay]
+
+        def _call(kw):
+            tensors = [module(*(kw[n] for n in names))]
+            # `+ 0` so a relayed tensor is a distinct graph value: returning an input unchanged
+            # makes the exporter alias it to the input name and the output vanishes.
+            tensors += [kw[n] + 0 for n in relay]
+            return tuple(tensors)
+
+        onnx = export_to_onnx(_traced_module(names, _call).eval(),
+                              tuple(available[n] for n in names),
+                              input_names=names, output_names=out_names)
+        return ExportedGraph(onnx, names, out_names)
+
+    # ── Two-graph export (beam-encoder + trunk) ───────────────────────────────
+    # Per-voxel NeRF models (RFBackboneModel subclasses) factor into a beam encoder
+    # (beam parameters -> a d_model latent) and a position trunk that consumes that latent
+    # via forward(batch, global_parameters=latent). Exporting them as two ONNX graphs lets the
+    # deploy runtime encode the beam ONCE and reuse the latent across every voxel query.
+    @staticmethod
+    def supports_two_graph_split(model: BaseNeuralRadFieldModel) -> bool:
+        core = model.get_core_model()
+        # The split factors the model into beam->latent + (position, latent)->output. A model whose
+        # TRUNK consumes per-point inputs beyond the position (TPBRFNet's relative/dual-frame
+        # translation coordinate, the beam_geometry block's beam/patient-frame coordinates) does not
+        # fit that factorization — the trunk graph would need the beam inputs as further inputs,
+        # which the deploy runtime does not bind. Such models export as a single self-contained
+        # graph instead (every beam parameter is a named input there).
+        if getattr(core, "trunk_consumes_beam_inputs", False):
+            return False
+        return hasattr(core, "encode_additional_parameters")
 
     @staticmethod
-    def ts_export(model: BaseNeuralRadFieldModel, path: str):
-        scripted = torch.jit.script(model.get_core_model())
-        scripted.save(path)
+    def onnx_export_beam_encoder(model: BaseNeuralRadFieldModel) -> ExportedGraph:
+        """Export the beam encoder: (beam_direction, source_distance, tube_spectrum [, ...]) -> latent."""
+        core = model.get_core_model()
+        inp = model._generate_random_input(model.device)
+        inp = getattr(inp, "input", inp)
+
+        def _call(kw):
+            return core.encode_additional_parameters(positional_like(
+                inp,
+                direction=kw["beam_direction"], origin=kw["source_distance"],
+                spectrum=kw["tube_spectrum"],
+                position=torch.zeros_like(kw["beam_direction"]),   # unused by the beam encoder
+                beam_shape_parameters=kw.get("beam_collimation"),
+                translation=kw.get("patient_translation")))
+
+        candidates = [("beam_direction", inp.direction), ("source_distance", inp.origin),
+                      ("tube_spectrum", inp.spectrum)]
+        if bool(getattr(core, "use_beam_shape", False)):
+            candidates.append(("beam_collimation", inp.beam_shape_parameters))
+        translation = getattr(inp, "translation", None)
+        if translation is not None:
+            candidates.append(("patient_translation", translation))
+        names = [n for n, _ in candidates]
+        onnx = export_to_onnx(_traced_module(names, _call).eval(), tuple(t for _, t in candidates),
+                              input_names=names, output_names=["latent"])
+        return ExportedGraph(onnx, names, ["latent"])
 
     @staticmethod
-    def onnx_export(model: BaseNeuralRadFieldModel, path: str):
-        class ModelONNXDectorator(BaseNeuralRadFieldModel):
-            def __init__(self, decoratee: BaseNeuralRadFieldModel):
+    def onnx_export_encoding_config(model: BaseNeuralRadFieldModel) -> ExportedGraph:
+        """Export the region-configuration graph: (region_width) -> region_state.
+
+        Only meaningful for grid-resolution-aware location encoders (region_state_dims > 0). The
+        deploy-side runs this ONCE whenever the queried grid resolution changes (LOD) and feeds the
+        cached vector to every trunk call for that grid, so the resolution can change per inference
+        without re-exporting and without the consumer knowing the encoder's maths. ``region_width``
+        is one voxel of the queried grid in the model's coordinate frame (see
+        ``FeedforwardPointwiseModel.voxel_width_in_encoder_frame``).
+        """
+        enc = model.get_core_model().positional_location_encoding
+
+        class _RegionConfig(BaseNeuralRadFieldModel):
+            def __init__(self, e):
                 super().__init__()
-                self._decoratee = decoratee
+                self._e = e
 
-            def forward(self, direction: Tensor, position: Tensor, spectrum: Tensor, origin: Tensor, beam_shape_parameters: Tensor, beam_shape_type: Tensor, geometry: Tensor):
-                return self._decoratee.forward(
-                    PositionalInput(
-                        direction=direction,
-                        beam_shape_parameters=beam_shape_parameters,
-                        beam_shape_type=beam_shape_type,
-                        position=position,
-                        origin=origin,
-                        geometry=geometry,
-                        spectrum=spectrum
-                    )
-                )
-            
-            def forward2volume(self, x, voxel_counts, spectra_bins = 32, mask = None):
-                return self._decoratee.forward2volume(x, voxel_counts, spectra_bins, mask)
-            
-            def forward2volume_from_training_input(self, batch, voxel_counts = None, spectra_bins = 32):
-                return self._decoratee.forward2volume_from_training_input(batch, voxel_counts, spectra_bins)
-            
-            def evaluate_forward(self, batch: TrainingInputData):
-                return self._decoratee.evaluate_forward(batch)
-            
-            def get_model_config(self) -> dict:
-                return self._decoratee.get_model_config()
+            def forward(self, region_width):
+                return self._e.compute_region_state(region_width)
 
-            def get_custom_parameters(self) -> dict:
-                return self._decoratee.get_custom_parameters()
-            
-            lr = property(lambda x: x._decoratee.get_lr(), lambda x, v: x._decoratee.set_lr(v))
-            learning_rate = property(lambda x: x._decoratee.get_lr(), lambda x, v: x._decoratee.set_lr(v))
+        example = torch.tensor(2.0 / 64, device=model.device, dtype=torch.float32)
+        # Per-GRID, not per-query: the one graph here carries no batch axis.
+        onnx = export_to_onnx(_RegionConfig(enc).eval(), (example,),
+                              input_names=["region_width"], output_names=["region_state"],
+                              dynamic_batch=False)
+        return ExportedGraph(onnx, ["region_width"], ["region_state"])
 
-        input_tuple: PositionalInput = model._generate_random_input(model.device)
+    @staticmethod
+    def onnx_export_trunk(model: BaseNeuralRadFieldModel) -> ExportedGraph:
+        """Export the trunk: (position, latent [, region_state]) -> flux + spectrum.
 
-        model = ModelONNXDectorator(model.get_core_model())
-        torch.onnx.export(
-            model=model,
-            args=(
-                input_tuple.direction,
-                input_tuple.position,
-                input_tuple.spectrum,
-                input_tuple.origin,
-                input_tuple.beam_shape_parameters,
-                input_tuple.beam_shape_type,
-                input_tuple.geometry
-            ),
-            input_names=[
-                "direction",
-                "position",
-                "spectrum",
-                "origin",
-                "beam_shape_parameters",
-                "beam_shape_type",
-                "geometry"
-            ],
-            f=path,
-            dynamo=True
-        )
+        ``region_state`` is present only for grid-resolution-aware location encoders; it comes from
+        the encoding-config graph and stays constant for as long as the queried grid does.
+        """
+        core = model.get_core_model()
+        inp = model._generate_random_input(model.device)
+        inp = getattr(inp, "input", inp)
+        with torch.no_grad():
+            latent = core.encode_additional_parameters(inp)  # example [B, d_model]
+        enc = core.positional_location_encoding
+        state_dims = int(getattr(enc, "region_state_dims", 0) or 0)
+
+        def _call(kw):
+            position = kw["position"]
+            # tensors only — see _field_output_tensors
+            return _field_output_tensors(core.forward(PositionalInput(
+                direction=torch.zeros_like(position), origin=position[..., :1] * 0,
+                spectrum=position[..., :1] * 0, position=position),
+                global_parameters=kw["latent"], region_state=kw.get("region_state")))
+
+        # Dynamic batch on the per-voxel inputs: position rows vary per inner batch at deploy time,
+        # and the latent is broadcast to the same row count by the caller. region_state is per-GRID
+        # (not per-row), so it carries no batch axis.
+        batch = _export_batch_dim()
+        args = (inp.position, latent)
+        names = ["position", "latent"]
+        dyn = ({0: batch}, {0: batch})
+        if state_dims > 0:
+            with torch.no_grad():
+                state = enc.compute_region_state(
+                    torch.tensor(2.0 / 64, device=model.device, dtype=torch.float32))
+            args = args + (state,)
+            names = names + ["region_state"]
+            dyn = dyn + (None,)
+        with torch.no_grad():
+            out_names = _output_names_for(core.forward(inp, global_parameters=latent))
+        onnx = export_to_onnx(_traced_module(names, _call).eval(), args, input_names=names,
+                              output_names=out_names, dynamic_shapes=dyn)
+        return ExportedGraph(onnx, names, out_names)

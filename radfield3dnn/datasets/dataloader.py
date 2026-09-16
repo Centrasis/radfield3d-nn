@@ -2,15 +2,23 @@ import lightning.pytorch as pl
 from RadFiled3D.pytorch.radiationfieldloader import DataLoaderBuilder
 from RadFiled3D.pytorch.datasets.radfield3d import RadField3DDataset
 from typing import Type
-from radfield3dnn import TrainingInputData, RadiationField, rf3RadiationField
+from radfield3dnn.rftypes import TrainingInputData, RadiationField, rf3RadiationField
 from RadFiled3D.pytorch.datasets.processing import DataProcessing
-from threading import Lock
+from radfield3dnn.preprocessing.augmentations.augmentation_limit import LimitedAugmentation
+from radfield3dnn.datasets.prefetcher import CudaStreamPrefetcher
 
 
 class RadiationFieldDataModule(pl.LightningDataModule):
-    def __init__(self, zip_directory, dataset_cls: Type[RadField3DDataset], batch_size=32, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, num_workers=None, data_processings: list[DataProcessing]=None):
+    def __init__(self, zip_directory, dataset_cls: Type[RadField3DDataset], batch_size=32, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, num_workers=None, data_processings: list[DataProcessing]=None, prefetch_to_device: bool = True, max_fields: int = None, cache_to_ram: bool = False, cache_ram_gb: float = None, exclude_files: set = None):
         super().__init__()
         self.zip_directory = zip_directory
+        # Overlap the H2D upload + GPU preprocessing of the next batch with the current step's
+        # compute via a side CUDA stream (see prefetcher.py). Only engages when a CUDA device is
+        # attached; _prefetch_active flips true once we actually wrap a dataloader, telling the
+        # transfer hooks below to short-circuit (the prefetcher already did their work).
+        self._prefetch_to_device = prefetch_to_device
+        self._prefetch_active = False
+        self._live_loaders = []   # every built loader/prefetcher, for deterministic shutdown
         self.batch_size = batch_size
         self.train_ratio = train_ratio
         self.val_ratio = val_ratio
@@ -19,20 +27,105 @@ class RadiationFieldDataModule(pl.LightningDataModule):
         self._max_hits_per_voxel_per_file_per_stage = {}
         self._current_stage_creation = None
         self._dataset_cls = dataset_cls
-        self.max_log_flux = 1.0
-        self.is_prepared = False
         self._fields_count = 0
         self._train_count = 0
         self.data_processings: list[DataProcessing] = data_processings
         self.uploaded_processings = False
         self._dataloader_builder = None
-        self._lock = Lock()
         self._train_dataset = None
         self._val_dataset = None
         self._test_dataset = None
+        self._construction_spec = None
 
-    def setup(self, stage=None):
-        pass
+        def set_augmentations(dataset: RadField3DDataset):
+            dataset.data_processings = self.data_processings
+
+        self._dataloader_builder = DataLoaderBuilder(
+            self.zip_directory,
+            train_ratio=self.train_ratio,
+            val_ratio=self.val_ratio,
+            test_ratio=self.test_ratio,
+            dataset_class=self._dataset_cls,
+            on_dataset_created=set_augmentations
+        )
+
+        # Drop unusable fields (e.g. missing the patient_translation metadata a translation dataset
+        # needs) BEFORE the split, so no split contains a field that would kill a worker mid-epoch.
+        if exclude_files:
+            from torch.utils.data import random_split
+            keep = [f for f in self._dataloader_builder.file_paths if f not in exclude_files]
+            dropped = len(self._dataloader_builder.file_paths) - len(keep)
+            if dropped:
+                if not keep:
+                    raise ValueError("Every field was excluded — nothing left to train on.")
+                self._dataloader_builder.file_paths = keep
+                self._dataloader_builder.train_files, self._dataloader_builder.val_files, self._dataloader_builder.test_files = \
+                    random_split(keep, [self.train_ratio, self.val_ratio, self.test_ratio])
+                print(f"[yellow]Excluded {dropped} unusable field(s); {len(keep)} remain.[/yellow]")
+
+        # Optional field-count cap for fast iteration. Subsample the file list
+        # (seeded deterministically by the run's global seed) and re-split into train/val/test, so a
+        # reduced run still has held-out fields drawn from the same beam-parameter coverage.
+        if max_fields is not None and max_fields < len(self._dataloader_builder.file_paths):
+            import random
+            import torch
+            from torch.utils.data import random_split
+            fp = list(self._dataloader_builder.file_paths)
+            random.Random(torch.initial_seed()).shuffle(fp)   # follow the global seed
+            fp = fp[:int(max_fields)]
+            self._dataloader_builder.file_paths = fp
+            self._dataloader_builder.train_files, self._dataloader_builder.val_files, self._dataloader_builder.test_files = \
+                random_split(fp, [self.train_ratio, self.val_ratio, self.test_ratio])
+            print(f"[yellow]max_fields={max_fields}: using {len(fp)} of the available fields "
+                  f"(train≈{int(self.train_ratio*len(fp))}).[/yellow]")
+
+        self._fields_count = len(self._dataloader_builder.file_paths)
+        self._train_count = int(self.train_ratio * self._fields_count)
+
+        self._train_dataset = self.dataloader_builder.build_train_dataset()
+        self._val_dataset = self.dataloader_builder.build_val_dataset()
+        self._test_dataset = self.dataloader_builder.build_test_dataset()
+
+        # Optional RAM cache of the RAW decoded fields (the expensive deterministic decode). The
+        # per-epoch stochastic augmentations still run fresh downstream in on_after_batch_transfer.
+        if cache_to_ram:
+            import psutil
+            from radfield3dnn.datasets.ram_cache import RamCachedDataset, compute_ram_budget
+            # ONE shared pool (preloaded in this parent process, inherited copy-on-write by the forked
+            # workers), so the budget is the whole safe RAM envelope — NOT divided by num_workers.
+            total = compute_ram_budget(override_gb=cache_ram_gb)
+            try:
+                # keep a generous floor free for the training process itself (model, pinned buffers,
+                # workers, prefetch) which loads AFTER the preload — undersizing this is what swaps.
+                min_free = int(0.35 * psutil.virtual_memory().total)
+            except Exception:
+                min_free = 0
+            train_bytes, val_bytes = total * 0.8, total * 0.2
+            self._train_dataset = RamCachedDataset(self._train_dataset, max_bytes=train_bytes, min_free_bytes=min_free).preload()
+            self._val_dataset = RamCachedDataset(self._val_dataset, max_bytes=val_bytes, min_free_bytes=min_free).preload()
+            print(f"[green]RAM cache enabled (shared COW pool): budget ~{total/1e9:.1f} GB, "
+                  f"floor {min_free/1e9:.1f} GB free. Fields decoded once in the parent and shared "
+                  f"across workers; overflow streams from disk.[/green]")
+
+    def set_construction_spec(self, spec: dict):
+        """Record the ``construct_datamodule`` call that produced this datamodule.
+
+        The spec is the module's own knowledge of how it was built; a caller that needs an
+        identical datamodule in a fresh PROCESS (the Optuna tuner forks one per trial) replays it
+        instead of re-deriving the dataset class, the input decorators and the derived processings
+        from scratch — a copy that silently drops one of them trains a different model.
+        """
+        self._construction_spec = dict(spec)
+
+    def construction_spec(self) -> dict:
+        """The recorded ``construct_datamodule`` kwargs. Raises if this datamodule was built by
+        hand, because a replay would then be a guess."""
+        if self._construction_spec is None:
+            raise RuntimeError(
+                "This RadiationFieldDataModule was not built by construct_datamodule, so it cannot "
+                "be rebuilt in another process. Construct it via radfield3dnn.datasets."
+                "construct_datamodule.")
+        return dict(self._construction_spec)
 
     def __len__(self):
         return self._fields_count
@@ -40,31 +133,11 @@ class RadiationFieldDataModule(pl.LightningDataModule):
     def get_train_count(self):
         return self._train_count
 
-    def prepare_data(self) -> None:
-        with self._lock:
-            if self.is_prepared:
-                return
+    def setup(self, stage) -> None:
+        pass
 
-            def set_augmentations(dataset: RadField3DDataset):
-                dataset.data_processings = self.data_processings
-
-            self._dataloader_builder = DataLoaderBuilder(
-                self.zip_directory,
-                train_ratio=self.train_ratio,
-                val_ratio=self.val_ratio,
-                test_ratio=self.test_ratio,
-                dataset_class=self._dataset_cls,
-                on_dataset_created=set_augmentations
-            )
-
-            self._fields_count = len(self._dataloader_builder.file_paths)
-            self._train_count = int(self.train_ratio * self._fields_count)
-
-            self._train_dataset = self.dataloader_builder.build_train_dataset()
-            self._val_dataset = self.dataloader_builder.build_val_dataset()
-            self._test_dataset = self.dataloader_builder.build_test_dataset()
-
-            self.is_prepared = True
+    def prepare_dataset(self) -> None:
+        pass
 
     @property
     def train_dataset(self):
@@ -90,19 +163,79 @@ class RadiationFieldDataModule(pl.LightningDataModule):
             self.prepare_data()
         return self._dataloader_builder
 
+    def _resolve_device(self):
+        """The CUDA device the trainer runs on, or None when there is no CUDA trainer attached
+        (CPU tests / manual datamodule use → prefetcher disabled, original path runs)."""
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return None
+        try:
+            device = trainer.strategy.root_device
+        except (AttributeError, RuntimeError):
+            return None
+        return device if device.type == "cuda" else None
+
+    def _maybe_wrap(self, dl, is_training: bool):
+        """Wrap a dataloader in the side-stream prefetcher when prefetch is enabled and a CUDA
+        device is available; otherwise return it untouched. ``is_training`` is propagated to the
+        processings so train-only augmentations/samplers are skipped on the val/test loaders."""
+        if not self._prefetch_to_device:
+            self._live_loaders.append(dl)
+            return dl
+        device = self._resolve_device()
+        if device is None:
+            self._live_loaders.append(dl)
+            return dl
+        self._prefetch_active = True
+        prefetcher = CudaStreamPrefetcher(dl, device, self.data_processings, is_training=is_training)
+        self._live_loaders.append(prefetcher)
+        return prefetcher
+
+    def shutdown_dataloaders(self):
+        """Deterministically shut down every loader/prefetcher this datamodule handed out.
+
+        build_dataloader uses persistent_workers, and the CudaStreamPrefetcher wrapper hides the
+        DataLoader from Lightning's teardown — without this, the worker processes, pin-memory
+        threads and the prefetcher's in-flight CUDA batch live until interpreter exit, whose
+        cleanup order can deadlock (a finished run that never terminates). Called by
+        run_network_task after logging is finalized; safe to call twice."""
+        loaders, self._live_loaders = self._live_loaders, []
+        for loader in loaders:
+            try:
+                if hasattr(loader, "shutdown"):          # CudaStreamPrefetcher
+                    loader.shutdown()
+                else:                                    # plain DataLoader: close persistent workers
+                    it = getattr(loader, "_iterator", None)
+                    if it is not None and hasattr(it, "_shutdown_workers"):
+                        it._shutdown_workers()
+                    loader._iterator = None
+            except Exception:
+                pass
+
     def train_dataloader(self):
         dl = self.dataloader_builder.build_dataloader(self.train_dataset, batch_size=self.batch_size, shuffle=True, worker_count=self.cpu_count)
-        return dl
+        return self._maybe_wrap(dl, is_training=True)
 
     def val_dataloader(self):
         dl = self.dataloader_builder.build_dataloader(self.val_dataset, batch_size=self.batch_size, shuffle=False, worker_count=self.cpu_count)
-        return dl
+        return self._maybe_wrap(dl, is_training=False)
 
     def test_dataloader(self):
         dl = self.dataloader_builder.build_dataloader(self.test_dataset, batch_size=self.batch_size, shuffle=False, worker_count=self.cpu_count)
-        return dl
+        return self._maybe_wrap(dl, is_training=False)
+
+    def transfer_batch_to_device(self, batch, device, dataloader_idx):
+        # When the prefetcher is active the batch is already resident on the target device; skip
+        # Lightning's redundant move (this is what removes the ~22% batch_to_device cost).
+        if self._prefetch_active:
+            return batch
+        return super().transfer_batch_to_device(batch, device, dataloader_idx)
 
     def on_after_batch_transfer(self, batch: TrainingInputData, dataloader_idx):
+        # The prefetcher already ran the processings (and the one-time .to(device) upload) on the
+        # side stream, so this becomes a pass-through when active.
+        if self._prefetch_active:
+            return batch
         if not self.uploaded_processings:
             for i in range(len(self.data_processings)):
                 if isinstance(batch.ground_truth, RadiationField) or isinstance(batch.ground_truth, rf3RadiationField):
@@ -111,6 +244,11 @@ class RadiationFieldDataModule(pl.LightningDataModule):
                     self.data_processings[i] = self.data_processings[i].to(batch.ground_truth.flux.device)
             self.uploaded_processings = True
 
+        # Non-prefetch path: propagate the trainer's train/val state to each processing (same role
+        # as CudaStreamPrefetcher.is_training) so train-only augmentations/samplers self-gate off
+        # during validation, then apply.
+        is_training = (self.trainer is None) or self.trainer.training
         for process in self.data_processings:
+            process.train(is_training)
             batch = process(batch)
         return batch

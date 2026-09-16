@@ -1,4 +1,4 @@
-from radfield3dnn import RadiationFieldChannel, RadiationField, TrainingInputData, DirectionalInput, rf3TrainingInputData, rf3RadiationField
+from radfield3dnn.rftypes import RadiationFieldChannel, RadiationField, TrainingInputData, DirectionalInput, rf3TrainingInputData, rf3RadiationField
 from typing import Union
 from RadFiled3D.pytorch.datasets.processing import DataProcessing
 from torch import Tensor
@@ -24,9 +24,16 @@ class CropDataset(DataProcessing):
         Returns:
             Tensor: Cropped tensor of shape (C, crop_size[0], crop_size[1], crop_size[2]).
         """
+        if tensor.ndim < 4:   # non-spatial tensors (e.g. (2,) split-relative geometry) pass through
+            return tensor
         batch_size = tensor.shape[0] if tensor.ndim == 5 else 0
         field_shape = tensor.shape[1:] if tensor.ndim == 5 else tensor.shape
         C, D, H, W = field_shape
+        if any(c > s for c, s in zip(self.crop_size, (D, H, W))):
+            raise ValueError(
+                f"crop_size {self.crop_size} exceeds the field spatial dimensions {(D, H, W)} — "
+                f"cropping cannot enlarge a field."
+            )
         diff_D = D - self.crop_size[0]
         diff_H = H - self.crop_size[1]
         diff_W = W - self.crop_size[2]
@@ -73,22 +80,18 @@ class CropDataset(DataProcessing):
     
     def crop_input_data(self, input_data: DirectionalInput) -> DirectionalInput:
         if input_data.geometry is not None:
-            return DirectionalInput(
-                direction=input_data.direction,
-                spectrum=input_data.spectrum,
-                geometry=self.crop_tensor(input_data.geometry) if input_data.geometry is not None else None,
-                origin=input_data.origin if input_data.origin is not None else None,
-                beam_shape_parameters=input_data.beam_shape_parameters if input_data.beam_shape_parameters is not None else None,
-                beam_shape_type=input_data.beam_shape_type if input_data.beam_shape_type is not None else None
-            )
+            return input_data._replace(geometry=self.crop_tensor(input_data.geometry))
         return input_data
     
     def forward(self, x: Union[TrainingInputData, RadiationField]) -> Union[TrainingInputData, RadiationFieldChannel]:
         if isinstance(x, TrainingInputData) or isinstance(x, rf3TrainingInputData):
+            ogt = None
+            if hasattr(x, "original_ground_truth"):
+                ogt = self.forward(x.original_ground_truth) if x.original_ground_truth is not None else None
             return TrainingInputData(
                 input=self.crop_input_data(x.input),
                 ground_truth=self.forward(x.ground_truth),
-                original_ground_truth=self.forward(x.original_ground_truth) if x.original_ground_truth is not None else None
+                original_ground_truth=ogt
             )
         elif isinstance(x, RadiationField) or isinstance(x, rf3RadiationField):
             return self.crop_radiation_field(x)
