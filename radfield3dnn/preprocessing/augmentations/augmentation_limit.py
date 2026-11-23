@@ -1,4 +1,4 @@
-from RadFiled3D.pytorch.datasets.processing import DataProcessing
+from radfiled3d.pytorch.datasets.processing import DataProcessing
 from lightning.pytorch import LightningModule
 from lightning.pytorch import Trainer
 from typing import Any

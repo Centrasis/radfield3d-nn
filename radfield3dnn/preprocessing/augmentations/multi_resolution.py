@@ -1,7 +1,7 @@
 import random
 import torch
 import torch.nn.functional as F
-from RadFiled3D.pytorch.datasets.processing import DataProcessing
+from radfiled3d.pytorch.datasets.processing import DataProcessing
 from radfield3dnn.rftypes import TrainingInputData, RadiationField, rf3RadiationField, RadiationFieldChannel, AirKermaField
 
 

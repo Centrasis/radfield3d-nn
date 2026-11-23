@@ -23,7 +23,7 @@ contract.
 
 from typing import Union
 import torch
-from RadFiled3D.pytorch.datasets.processing import DataProcessing
+from radfiled3d.pytorch.datasets.processing import DataProcessing
 from radfield3dnn.rftypes import (
     RadiationField, TrainingInputData, RadiationFieldChannel,
     rf3RadiationField, rf3TrainingInputData,

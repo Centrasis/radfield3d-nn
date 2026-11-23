@@ -256,7 +256,7 @@ class HyperparameterTuningTask(Task):
         # have no separate direct_beam to isolate. Probed once here (same check as the train task)
         # and passed to every trial: metrics/factory.py is the single source of the metric set.
         import glob as _glob
-        from RadFiled3D.utils import FieldStore as _FieldStore
+        from radfiled3d.store import FieldStore as _FieldStore
         _probe = sorted(_glob.glob(os.path.join(dataset_path, "fields", "*.rf3")))
         self.joined_dataset = bool(_probe) and not all(
             c in _FieldStore.load(_probe[0]).get_channel_names() for c in ("scatter_field", "direct_beam"))

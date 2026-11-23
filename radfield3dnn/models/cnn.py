@@ -7,7 +7,7 @@ from typing import Type
 from radfield3dnn.rftypes import RadiationField, RadiationFieldChannel, TrainingInputData
 from radfield3dnn.models.base import BaseNeuralRadFieldModel
 from radfield3dnn.models.activations.HistogramNormalize import HistogramNormalize
-from RadFiled3D.pytorch.types import PositionalInput
+from radfiled3d.pytorch.types import PositionalInput
 from radfield3dnn.models.activations.flux_activations import GradientConservingClamping
 from radfield3dnn.models.encoders.spectra_encoder import SimpleSpectraEncoder
 from radfield3dnn.models.layers.fusions.film import FiLM

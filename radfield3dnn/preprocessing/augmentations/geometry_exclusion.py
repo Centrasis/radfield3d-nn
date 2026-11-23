@@ -17,7 +17,7 @@ TRAINING-ONLY by design: validation/test deliberately score the whole, unmasked 
 convention), and the eval paths do not interpret the -inf sentinel.
 """
 import torch
-from RadFiled3D.pytorch.datasets.processing import DataProcessing
+from radfiled3d.pytorch.datasets.processing import DataProcessing
 
 from radfield3dnn.rftypes import (AirKermaField, RadiationField, RadiationFieldChannel,
                                   TrainingInputData, rf3RadiationField)

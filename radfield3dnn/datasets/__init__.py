@@ -1,11 +1,11 @@
 import json
 from pathlib import Path
 import torch
-from RadFiled3D.pytorch.datasets.radfield3d import RadField3DDataset, RadField3DDatasetWithGeometry, RadField3DTranslationDataset
-from RadFiled3D.utils import FieldStore
-from RadFiled3D.RadFiled3D import CartesianRadiationField
+from radfiled3d.pytorch.datasets.radfield3d import RadField3DDataset, RadField3DDatasetWithGeometry, RadField3DTranslationDataset
+from radfiled3d.store import FieldStore
+from radfiled3d import CartesianRadiationField
 from enum import Enum
-from RadFiled3D.pytorch.datasets.processing import DataProcessing
+from radfiled3d.pytorch.datasets.processing import DataProcessing
 from .crop_dataset import CropDataset
 from .mc_floor_cut import MCFloorCut
 from radfield3dnn.rftypes import TrainingInputData, rf3TrainingInputData, RadiationField, rf3RadiationField, RadiationFieldChannel, AirKermaField
@@ -78,7 +78,10 @@ class OriginalGroundTruthPreservation(DataProcessing):
             return TrainingInputData(
                 input=x.input,
                 ground_truth=gt,
-                original_ground_truth=self.clone(gt)
+                original_ground_truth=self.clone(gt),
+                # The directional target rides beside the channel (rftypes); rebuilding the tuple
+                # here must not drop it, and a foreign item simply has none.
+                lobes=getattr(x, "lobes", None),
             )
         else:
             raise ValueError("Input must be of type TrainingInputData")
@@ -159,7 +162,7 @@ def get_dataset_dimensions_and_voxel_size(dataset: str | RadiationFieldDataModul
     return (field_dim.x, field_dim.y, field_dim.z), vx_size_x
 
 
-def construct_datamodule(dataset_path: str, batch_size: int, num_workers: int, use_geometry: bool, use_beam_parameters: bool, dataprocessings: list[DataProcessing] = None, voxel_resolution: tuple[int, int, int] = None, prefetch_to_device: bool = True, max_fields: int = None, cache_to_ram: bool = False, cache_ram_gb: float = None, use_translation: bool = False, dataset_definition: str | dict = None, scan_translation_metadata: bool = True, skip_fields_without_translation: bool = False, attach_geometry_mask: bool = False, exclude_files: set = None) -> RadiationFieldDataModule:
+def construct_datamodule(dataset_path: str, batch_size: int, num_workers: int, use_geometry: bool, use_beam_parameters: bool, dataprocessings: list[DataProcessing] = None, voxel_resolution: tuple[int, int, int] = None, prefetch_to_device: bool = True, max_fields: int = None, cache_to_ram: bool = False, cache_ram_gb: float = None, use_translation: bool = False, dataset_definition: str | dict = None, scan_translation_metadata: bool = True, skip_fields_without_translation: bool = False, attach_geometry_mask: bool = False, exclude_files: set = None, use_lobes: bool = False, translation_output_range: tuple = (0.0, 1.0), split: dict = None, geometry_layers: tuple = ("density",)) -> RadiationFieldDataModule:
     """dataset_definition: optional path to (or parsed dict of) the dataset definition JSON the
     dataset was GENERATED with (training config: ``dataset: definition_file``). When given, it is
     the authoritative source for the beam-parameter ranges (instead of statistics.json) and for
@@ -167,7 +170,16 @@ def construct_datamodule(dataset_path: str, batch_size: int, num_workers: int, u
 
     exclude_files: fields to drop before the train/val/test split. Normally computed here by the
     translation-metadata preflight; passing it (together with scan_translation_metadata=False)
-    replays a previous scan's verdict instead of re-reading every field's metadata."""
+    replays a previous scan's verdict instead of re-reading every field's metadata.
+
+    use_lobes: also load the radiation channel's von Mises-Fisher lobes onto every item
+    (`TrainingInputData.lobes`) — the directional target, for a model with a lobe head.
+
+    split: a fixed {"train", "val", "test"} assignment of dataset-relative field paths instead of
+    the random split; fields it does not list are not used.
+
+    geometry_layers: the geometry-channel layers use_geometry / attach_geometry_mask read, stacked
+    channel-first onto ``input.geometry`` (default: the ``density`` layer only)."""
     if dataprocessings is None:
         dataprocessings = []
     # The datamodule carries the recipe that built it (see RadiationFieldDataModule.construction_spec)
@@ -182,7 +194,9 @@ def construct_datamodule(dataset_path: str, batch_size: int, num_workers: int, u
                  use_translation=use_translation, dataset_definition=dataset_definition,
                  scan_translation_metadata=scan_translation_metadata,
                  skip_fields_without_translation=skip_fields_without_translation,
-                 attach_geometry_mask=attach_geometry_mask, exclude_files=exclude_files)
+                 attach_geometry_mask=attach_geometry_mask, exclude_files=exclude_files,
+                 use_lobes=use_lobes, translation_output_range=translation_output_range, split=split,
+                 geometry_layers=tuple(geometry_layers))
     if dataset_definition is not None and not isinstance(dataset_definition, dict):
         definition_path = dataset_definition
         assert os.path.exists(definition_path), f"dataset definition file not found: {definition_path}"
@@ -200,12 +214,19 @@ def construct_datamodule(dataset_path: str, batch_size: int, num_workers: int, u
     if use_geometry or attach_geometry_mask:
         print("[yellow]Input decorator: geometry occupancy mask (binary, from the geometry channel).")
 
+    from radfield3dnn.datasets.lobes import LobedFieldDataset, PerFileAccessorDataset
+    if use_lobes:
+        print("[yellow]Loading the directional lobes (vmf_lobes) as a training target.")
+
     def dataset_cls(file_paths: list[str] = None, zip_file: str = None, data_processings: list["DataProcessing"] = None):
-        ds = RadField3DDataset(file_paths=file_paths, zip_file=zip_file, data_processings=data_processings)
+        # Per-file accessor always: identical output on a dataset with one byte layout, and the
+        # only correct read of one whose generator wrote some metadata only for some fields.
+        base = LobedFieldDataset if use_lobes else PerFileAccessorDataset
+        ds = base(file_paths=file_paths, zip_file=zip_file, data_processings=data_processings)
         if use_translation:
             ds = TranslationInputDecorator(ds)
         if use_geometry or attach_geometry_mask:
-            ds = GeometryInputDecorator(ds, binary=True)
+            ds = GeometryInputDecorator(ds, binary=True, layers=geometry_layers)
         return ds
 
     stats = {}
@@ -273,7 +294,8 @@ def construct_datamodule(dataset_path: str, batch_size: int, num_workers: int, u
         # (previous behavior), which trains but couples the checkpoint to the dataset's extent.
         from radfield3dnn.preprocessing.normalizations.translation import TranslationNormalization
         if dataset_definition is not None and "GeometryTransformations" in dataset_definition:
-            translation_normalizer = TranslationNormalization.from_dataset_definition(dataset_definition)
+            translation_normalizer = TranslationNormalization.from_dataset_definition(
+                dataset_definition, output_range=translation_output_range)
             print(f"[yellow]Using translation normalization: {translation_normalizer.get_parameters()['translation_ranges_m']}")
             dataprocessings.append(translation_normalizer)
         else:
@@ -326,6 +348,7 @@ def construct_datamodule(dataset_path: str, batch_size: int, num_workers: int, u
         cache_to_ram=cache_to_ram,
         cache_ram_gb=cache_ram_gb,
         exclude_files=exclude_files,
+        split=split,
     )
     # A replay resolves the definition to the parsed dict above; store THAT, so the second replay
     # does not re-read the file (and works when only the parsed ranges are still reachable).

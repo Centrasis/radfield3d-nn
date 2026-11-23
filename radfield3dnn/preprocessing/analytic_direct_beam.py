@@ -98,7 +98,7 @@ def analytic_direct_beam(
 def from_field_file(fp: str, shadow_samples: int = 64):
     """Convenience: build the analytic direct beam from a `.rf3` file's metadata +
     density channel (for validation / training-time replacement of the sim direct)."""
-    from RadFiled3D.RadFiled3D import FieldStore
+    from radfiled3d.store import FieldStore
     f = FieldStore.load(fp)
     md = FieldStore.load_metadata(fp)
     tube = md.get_header().simulation.tube

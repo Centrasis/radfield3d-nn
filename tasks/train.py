@@ -49,10 +49,17 @@ class TrainTask(Task):
             ModelCheckpoint(
                 dirpath=os.path.join(logs_path, "models"),
                 filename=f"{model_name}-{{epoch}}-{{{monitor}:.3f}}",
-                save_last=True,
                 save_top_k=1,
                 monitor=monitor,
                 mode="max",
+            ),
+            # The final epoch's weights, every epoch. Lightning's save_last writes only on the steps
+            # where the monitored checkpoint also saves, so it would hold the best epoch instead.
+            ModelCheckpoint(
+                dirpath=os.path.join(logs_path, "models"),
+                filename="last",
+                save_top_k=1,
+                monitor=None,
             ),
             ValidationPlotter(
                 logger,

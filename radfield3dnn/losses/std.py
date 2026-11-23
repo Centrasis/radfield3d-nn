@@ -92,6 +92,32 @@ class PlainL1Loss(Loss):
         return reduce_per_sample(per_voxel, valid_mask if not all_valid else None)
 
 
+class PlainLogLoss(Loss):
+    """Unweighted mean of ``|log10((p + eps) / (t + eps))|`` over the valid voxels, clamped to 6 decades.
+
+    The core of ``SMAPEBalancedLogRatio`` without its regions or noise hinge, so every voxel counts
+    once and the ~92 % of a field that is bulk decides the objective. Pair with
+    ``LinearNormalizer(0,1)``; ``eps`` sits below the lowest flux that is to be fitted.
+    """
+
+    def __init__(self, eps: float = 1e-7):
+        super().__init__()
+        self.eps = float(eps)
+
+    def forward(self, target: Tensor, prediction: Tensor, input: TrainingInputData) -> Tensor:
+        if prediction.shape != target.shape:
+            if prediction.ndim == target.ndim + 1 and prediction.shape[-1] == 1:
+                prediction = prediction.squeeze(-1)
+            elif target.ndim == prediction.ndim + 1 and target.shape[-1] == 1:
+                target = target.squeeze(-1)
+        valid = torch.isfinite(target) & torch.isfinite(prediction)
+        t = target.masked_fill(~valid, 0.0)
+        p = prediction.masked_fill(~valid, 0.0)
+        per_voxel = (torch.log10(p.abs() + self.eps) - torch.log10(t.abs() + self.eps)).abs().clamp(max=6.0)
+        per_voxel = torch.nan_to_num(per_voxel, nan=0.0, posinf=0.0, neginf=0.0)
+        return reduce_per_sample(per_voxel, valid)
+
+
 class RawNeRFLoss(Loss):
     """RawNeRF HDR loss (Mildenhall et al., CVPR 2022, "NeRF in the Dark"): linear-space L2 weighted
     by a stop-gradient relative factor, ``((p − t) / (sg(p) + eps))²``. Behaves like a relative error

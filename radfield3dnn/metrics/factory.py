@@ -3,12 +3,14 @@ from radfield3dnn.metrics.airkerma_accuracy import (
     AirkermaAccuracy, AirkermaScatterAccuracy, AirkermaBeamAccuracy,
     AirkermaSphereAccuracy, AirkermaSupervoxelScatterAccuracy, AirkermaAccuracyEnergyWeighted,
 )
+from radfield3dnn.metrics.patient_shadow import PatientShadowAccuracy
 from radfield3dnn.metrics.ssim import AirkermaSSIM
 from radfield3dnn.metrics import HistogramOverlapAccuracy, SpectrumROIAccuracy
 
 
 def build_airkerma_metrics(mu_tr_file: str, voxel_size_m: float, spectra_bins: int = 32,
-                           max_energy_eV: float = 1.5e+5, joined: bool = False) -> dict:
+                           max_energy_eV: float = 1.5e+5, joined: bool = False,
+                           definition_file: str = None) -> dict:
     """Validation/test air-kerma metric set. On a JOINED dataset (single 'radiation' channel,
     no separate direct_beam) the scatter/beam-isolation metrics cannot be computed — they need the
     direct beam to separate scatter from beam — so they are omitted; the whole-field air-kerma,
@@ -27,6 +29,12 @@ def build_airkerma_metrics(mu_tr_file: str, voxel_size_m: float, spectra_bins: i
         'airkerma_onsphere_accuracy_radius25cm': AirkermaSphereAccuracy(mu_tr_file=mu_tr_file, spectra_bins=spectra_bins, max_energy_eV=max_energy_eV, sphere_radius_m=0.25, voxel_size_m=vx),
         'top95_energy_weighted_airkerma_accuracy': AirkermaAccuracyEnergyWeighted(mu_tr_file=mu_tr_file, spectra_bins=spectra_bins, max_energy_eV=max_energy_eV, importance_threshold=0.05),
         'spectrum_accuracy': HistogramOverlapAccuracy(),
+        # Does the field follow the PATIENT? Every entry above is dominated by the bright beam and
+        # scores a model that ignores the body almost as well as one that does not. These two both
+        # return None when the dataset carries no occupancy map or the phantom is out of the beam,
+        # so they simply do not appear rather than reporting a zero nothing measured.
+        'patient_shadow_attenuation': PatientShadowAccuracy(mu_tr_file=mu_tr_file, spectra_bins=spectra_bins, max_energy_eV=max_energy_eV, mode='attenuation'),
+        'patient_shadow_boundary': PatientShadowAccuracy(mu_tr_file=mu_tr_file, spectra_bins=spectra_bins, max_energy_eV=max_energy_eV, mode='boundary'),
         'spectrum_accuracy_top90': SpectrumROIAccuracy(roi='top90', mu_tr_file=mu_tr_file, spectra_bins=spectra_bins, max_energy_eV=max_energy_eV, top_threshold=0.1),
         'global_airkerma_gamma_3pct_4cm_cut1pct': ak(metric_type='gpr', voxel_size_m=vx, rel_dose_diff=0.03, dist_crit_mm=40.0, dose_threshold=0.01),
         'global_airkerma_gamma_3pct_2cm': ak(metric_type='gpr', voxel_size_m=vx, rel_dose_diff=0.03, dist_crit_mm=20.0),
@@ -53,6 +61,12 @@ def build_airkerma_metrics(mu_tr_file: str, voxel_size_m: float, spectra_bins: i
         'global_airkerma_gamma_10pct_4cm': ak(metric_type='gpr', voxel_size_m=vx, rel_dose_diff=0.1, dist_crit_mm=40.0),
         'global_airkerma_gamma_10pct_6cm': ak(metric_type='gpr', voxel_size_m=vx, rel_dose_diff=0.1, dist_crit_mm=60.0),
     }
+    if definition_file:
+        # The analytic beam has to be the one the fields were generated with, so this entry appears
+        # only when the training config named a dataset definition (`dataset.definition_file`).
+        metrics['patient_shadow_onset'] = PatientShadowAccuracy(
+            mu_tr_file=mu_tr_file, spectra_bins=spectra_bins, max_energy_eV=max_energy_eV,
+            mode='onset', definition_file=definition_file)
     if not joined:
         # scatter/beam-isolation metrics require the separate direct_beam + scatter_field channels
         metrics.update({

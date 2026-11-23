@@ -322,6 +322,17 @@ class RFBackboneModel(nn.Module):
 
     def forward(self, batch: PositionalInput, global_parameters: Union[Tensor, None, list] = None,
                 region_state: Union[Tensor, None] = None):
+        features, params_enc, geometry = self.trunk_features(batch, global_parameters, region_state)
+        return self.decode_results(features, beam_latent=params_enc, geometry=geometry)
+
+    def trunk_features(self, batch: PositionalInput, global_parameters: Union[Tensor, None, list] = None,
+                       region_state: Union[Tensor, None] = None):
+        """The trunk's per-point features, before any output head: ``(features, beam_latent, geometry)``.
+
+        Every head reads these. Factored out of `forward` so a head that does not belong in the
+        field output — the directional lobes — can share the trunk without riding through
+        `decode_results`, whose return type has no slot for it.
+        """
         # region_state describes the spatial extent each queried point represents (from the
         # location encoder's compute_region_state); point encoders ignore it.
         geometry = self.point_geometry(batch)
@@ -347,7 +358,7 @@ class RFBackboneModel(nn.Module):
 
         # Terminal additive skip connection.
         x2_1 = x2 + x1
-        return self.decode_results(x2_1, beam_latent=params_enc, geometry=geometry)
+        return x2_1, params_enc, geometry
 
 
 class SRBFNet(RFNetBase):
@@ -608,7 +619,7 @@ class PBRFNet(SPERFNet):
         # Default per-point encoders of the beam-frame and patient-frame coordinates (3-D each)
         _GEOMETRY_ENCODING_DEFAULT = {"type": "sinusoidal", "pos_enc_dim": 6, "append_input": True}
         _BEAM_GEOMETRY_KEYS = frozenset({"definition_file", "physics", "penumbra_m", "source_clamp_m", "reference_area_m2",
-                                         "beam_frame", "patient_frame", "ray_features", "direct_prior"})
+                                         "translation_output_range", "beam_frame", "patient_frame", "ray_features", "direct_prior"})
 
         def __init__(self, d_model=256, out_spectra_dim=32, normalizer=None, scalar_encoding_dims=16, precision: Literal["fp32", "fp16"] = "fp32", flux_activation: Literal["clamp", "softclip", "sigmoid", "softplus", "exp", "none"] = "clamp",
                      location_encoding_params: dict = None, direction_encoding_params: dict = None,
@@ -714,6 +725,8 @@ class PBRFNet(SPERFNet):
                 {"definition_file": <dataset definition JSON>   physical ranges the inputs were normalised with
                  "physics": {...}                               the resolved ranges (persisted; replaces definition_file)
                  "penumbra_m" | "source_clamp_m" | "reference_area_m2"   prior constants (only with definition_file)
+                 "translation_output_range": [lo, hi]          where the translation was normalised to; injected by
+                                                                run_network_task from dataset.translation_output_range
                  "beam_frame":    encoder dict | false          per-point (depth, lateral) coordinate; default sinusoidal
                  "patient_frame": encoder dict | false          per-point x − t; default sinusoidal when a translation exists
                  "ray_features":  bool                          ray-vs-patient beam component; default = translation exists
@@ -737,7 +750,8 @@ class PBRFNet(SPERFNet):
             if not (self.use_beam_shape and self.beam_shape_param_dims == 2):
                 raise ValueError("beam_geometry requires rectangle collimation: conditioning_params.use_beam_shape true with beam_shape_param_dims 2")
 
-            prior_knobs = {k: spec[k] for k in ("penumbra_m", "source_clamp_m", "reference_area_m2") if k in spec}
+            prior_knobs = {k: spec[k] for k in ("penumbra_m", "source_clamp_m", "reference_area_m2", "translation_output_range")
+                           if k in spec}
             if "physics" in spec:
                 if prior_knobs:
                     raise ValueError(f"beam_geometry: {sorted(prior_knobs)} are already fixed by 'physics'; edit that block instead")

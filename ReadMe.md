@@ -250,7 +250,7 @@ to run and interpret the model without the training stack.
 
 The container, the inference runtime and the graphics interop are the separate
 **[`radfiled3d-nn`](https://github.com/Centrasis/radfiled3d-nn)** module (`pip install
-radfiled3d-nn`, `from RadFiled3D import nn`). This repo writes packages and never parses or executes
+radfiled3d-nn`, `from radfiled3d import nn`). This repo writes packages and never parses or executes
 one. What it contributes is the half only the training stack can: the graphs, and the declaration
 of what each of their tensors means.
 
@@ -267,7 +267,7 @@ ModelPackager(model, datamodule, trainer.callback_metrics,
 ```
 
 The model declares its own tensors through `deploy_interface()` — the *meaning* of each graph
-tensor (semantic, unit, normalizer); tracing decides which of them exist. Input shapes are read
+tensor (semantic, unit); tracing decides which of them exist. Input shapes are read
 back off the traced graph, ranges come from the dataset's `statistics.json`, and the package is
 read back after writing, so a declaration that does not match the graphs never reaches disk.
 Tensors are named with the deploy module's own semantic vocabulary (`beam_direction`,
@@ -276,15 +276,15 @@ Tensors are named with the deploy module's own semantic vocabulary (`beam_direct
 ### Reading one back
 
 ```python
-from RadFiled3D.nn import deploy, inference
+from radfiled3d.nn import deploy, inference
 
-meta = deploy.read_metadata("model.rf3m")      # header only: no graph decoded, no session, no GPU
+meta = deploy.ModelStore.load_metadata("model.rf3m")      # header only: no graph decoded, no session, no GPU
 print(meta["tensors"])                        # what to bind, and what it means
 
-session = inference.load_rf3m("model.rf3m", backend="cuda", device=0)
+session = inference.Session(deploy.ModelStore.load("model.rf3m"), backend="cuda", device=0)
 session.set_voxel_grid([64, 64, 64])          # CLEARS every binding — bind after, never before
 session.bind_input("position", positions)     # caller-owned, bound by pointer; no copy
-session.bind_input("beam_direction", d)        # METRIC values: the session applies the normalizer
+session.bind_input("beam_direction", d)        # METRIC values: the network normalizes its own inputs
 session.bind_output("flux", flux)             # nothing is allocated for you
 session.infer()                               # names EVERY missing binding at once
 ```

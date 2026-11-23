@@ -71,6 +71,17 @@ class TPBRFNet(PBRFNet):
                 "translation_encoding", {"type": "fourier", "n_frequencies": 6, "append_input": True}))
             enc_type = trans_enc_params.get("type", "fourier")
             self._relative_translation = (enc_type == "relative")
+            # Which components of the vec3 translation the beam vector carries. Two by default —
+            # DS04 never varied the couch height, so z there is a constant that would only cost an
+            # input. A dataset that moves the patient on all three axes (DS04-Angio-ArtisQ: across,
+            # height AND along the table) needs all three, or the model is blind to one of them.
+            self._translation_axes = int(self._conditioning_params.get("translation_axes", 2))
+            if self._translation_axes not in (2, 3):
+                raise ValueError(f"translation_axes must be 2 or 3, got {self._translation_axes}")
+            if self._translation_axes != 2 and enc_type == "relative":
+                # 'relative' derives its patient-frame coordinate from the in-plane position, a
+                # two-axis construction. beam_geometry subtracts the full vec3 in field units.
+                raise ValueError("translation_axes=3 is not supported with the 'relative' translation encoding")
             if enc_type == "relative":
                 if self.beam_geometry is not None:
                     raise ValueError("translation_encoding 'relative' and beam_geometry both derive the patient-frame "
@@ -94,7 +105,7 @@ class TPBRFNet(PBRFNet):
             if enc_type == "fourier":
                 fourier = SinusoidalFrequencyEncoding(
                     pos_enc_dim=int(trans_enc_params.get("n_frequencies", 6)),
-                    d_input=2,  # (x, y) of the vec3 translation; z is constant
+                    d_input=self._translation_axes,
                     append_input=bool(trans_enc_params.get("append_input", True)),
                 )
                 self.translation_encoder = nn.Sequential(
@@ -106,7 +117,7 @@ class TPBRFNet(PBRFNet):
                 )
             elif enc_type == "mlp":
                 self.translation_encoder = nn.Sequential(
-                    nn.Linear(2, self.scalar_encoding_dims),  # (x, y) of the vec3 translation; z is constant
+                    nn.Linear(self._translation_axes, self.scalar_encoding_dims),
                     nn.SiLU(True),
                     nn.Linear(self.scalar_encoding_dims, self.scalar_encoding_dims),
                     nn.SiLU(True)
@@ -140,7 +151,8 @@ class TPBRFNet(PBRFNet):
             translation = self._translation_rows(batch)
             enc = super()._beam_components(batch)
             if getattr(self, "translation_encoder", None) is not None:
-                enc.append(self.translation_encoder(translation[:, :2].to(self._compute_dtype)))  # (x, y) only
+                enc.append(self.translation_encoder(
+                    translation[:, :self._translation_axes].to(self._compute_dtype)))
             return enc
 
         @property
@@ -186,6 +198,15 @@ class TPBRFNet(PBRFNet):
             rel = batch.position[:, :2].to(dtype) - (t * self.translation_frame_scale.to(dtype) + self.translation_frame_shift.to(dtype))
             return torch.cat([base, self.relative_translation_encoding(rel)], dim=-1)
 
+    _DIRECTION_KEYS = ("direction_lobes", "lobe_samples", "lobe_hidden")
+
+    def __init__(self, *args, **kwargs):
+        stale = [k for k in self._DIRECTION_KEYS if k in kwargs]
+        if stale:
+            raise ValueError(f"{stale} configure a directional head, which TPBRFNet does not have: "
+                             f"use model_name \"TDPBRFNet\" (TPBRFNet learns flux and spectrum only).")
+        super().__init__(*args, **kwargs)
+
     def _augment_random_input(self, x, device, batch_size: int):
         """Random inputs must carry a translation: every consumer of them (batch-size search,
         ONNX export, plot callbacks) runs encode_additional_parameters directly. Sampled in the
@@ -206,5 +227,22 @@ class TPBRFNet(PBRFNet):
         """PBRFNet's interface plus the one input this model adds."""
         inputs, outputs = super().deploy_interface()
         # Metres in the field frame; the model encodes x/y only (z is constant across the dataset).
-        inputs["patient_translation"] = dict(semantic="patient_translation", unit="m")
+        inputs["patient_translation"] = dict(semantic="patient_translation", unit="m",
+                                             range=self._translation_range_m())
         return inputs, outputs
+
+    def _translation_range_m(self):
+        """How far the patient travels, per axis, in metres.
+
+        Declared as a MAP rather than one interval because the axes differ — across the table and
+        along it are not the same distance — and a single (min, max) over a vector that decomposes
+        would overstate one axis and understate the other. The numbers are the dataset's own
+        generation ranges, which reach the model through `BeamPatientGeometry`; no statistics file
+        carries them, and without them in the header a consumer cannot place the patient at all.
+        Returns None when this model was built without the geometry block and so does not know.
+        """
+        geometry = getattr(self.get_core_model(), "beam_geometry", None)
+        ranges = getattr(geometry, "translation_ranges_m", None) if geometry is not None else None
+        if not ranges:
+            return None
+        return {axis.lower(): (float(lo), float(hi)) for axis, (lo, hi) in ranges.items()}

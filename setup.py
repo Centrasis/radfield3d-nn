@@ -47,7 +47,10 @@ setup(
     python_requires=">=3.12",
     install_requires=[
         "rich>=15.0.0",
-        "RadFiled3D>=1.3.6",
+        # The `.rf3` data model and the pytorch dataset layer, imported as `radfiled3d`
+        # (`radfiled3d.store` for FieldStore, `radfiled3d.pytorch` for the datasets). The
+        # distribution keeps its RadFiled3D name; only the import package is lower case.
+        "RadFiled3D>=1.4.0",
         "torch>=2.10.0",
         "numpy>=2.4.6",
         "pyyaml>=6.0.3",
@@ -60,8 +63,12 @@ setup(
         "onnx>=1.21.0",
         "onnxscript>=0.7.0",
         "onnxconverter-common>=1.14.0",   # fp16 ONNX conversion for export_fp16 packaging
-        # The .rf3m container + inference runtime, imported as `RadFiled3D.nn` — 1.4 is where that
-        # layout (nn.deploy / nn.inference / nn.memory) replaced the flat `radfiled3d_nn` module.
+        # The .rf3m container + inference runtime, imported as `radfiled3d.nn` (nn.deploy /
+        # nn.inference / nn.memory / nn.torch_export). Its wheel writes `radfiled3d/nn/` into the
+        # package directory the base library above owns, so the two share one import root.
+        # THE FLOOR BELOW PREDATES THAT IMPORT ROOT: wheels up to 1.4.2 install `RadFiled3D/nn`,
+        # which this repo no longer imports. Raise it to whatever release first ships
+        # `python/radfiled3d`.
         # A LOCAL branch build of that repo reports 0.0.0 by design and does not satisfy this, so a
         # `pip install -e .` here would replace it with a released wheel. Install this repo with
         # --no-deps while developing the two together.

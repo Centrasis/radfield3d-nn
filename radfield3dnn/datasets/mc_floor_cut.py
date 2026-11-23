@@ -18,7 +18,7 @@ where the flux is, so air-kerma there is exactly zero (matching how the metric m
 flux).
 """
 import torch
-from RadFiled3D.pytorch.datasets.processing import DataProcessing
+from radfiled3d.pytorch.datasets.processing import DataProcessing
 from radfield3dnn.rftypes import RadiationField, RadiationFieldChannel, rf3RadiationField
 from radfield3dnn.roi import compute_roi_masks, BEAM_REL_DEFAULT, SCATTER_LO_DEFAULT
 
@@ -142,22 +142,35 @@ class MCFloorCut(DataProcessing):
         _, _, floor = compute_roi_masks(direct_for_beam, joined, self.beam_rel, self.scatter_lo)
         if not bool(floor.any()):
             return gt
+        return gt._replace(scatter_field=self._mask_channel(scatter, floor),
+                           direct_beam=self._mask_channel(direct, floor))
 
-        def _mask(ch):
-            if ch is None or ch.flux is None:
-                return ch
-            neg = torch.full_like(ch.flux, -torch.inf)
-            new_flux = torch.where(floor, neg, ch.flux)
-            new_spec = ch.spectrum
-            if ch.spectrum is not None:
-                fm = floor.expand_as(ch.spectrum)
-                new_spec = torch.where(fm, torch.full_like(ch.spectrum, -torch.inf), ch.spectrum)
-            return ch._replace(flux=new_flux, spectrum=new_spec)
+    def _mask_joined_channel_neginf(self, ch):
+        """The joined dataset's single channel: the floor is everything below scatter_lo of its own
+        peak (the beam lies far above it, so no beam test is needed)."""
+        _, _, floor = compute_roi_masks(ch.flux, ch.flux, self.beam_rel, self.scatter_lo)
+        return self._mask_channel(ch, floor) if bool(floor.any()) else ch
 
-        return gt._replace(scatter_field=_mask(scatter), direct_beam=_mask(direct))
+    @staticmethod
+    def _mask_channel(ch, floor):
+        if ch is None or ch.flux is None:
+            return ch
+        new_flux = torch.where(floor, torch.full_like(ch.flux, -torch.inf), ch.flux)
+        new_spec = ch.spectrum
+        if ch.spectrum is not None:
+            fm = floor.expand_as(ch.spectrum)
+            new_spec = torch.where(fm, torch.full_like(ch.spectrum, -torch.inf), ch.spectrum)
+        return ch._replace(flux=new_flux, spectrum=new_spec)
 
     def forward(self, x):
         gt = x.ground_truth
+        if isinstance(gt, RadiationFieldChannel):
+            if not self.as_neginf:
+                raise ValueError("MCFloorCut on a joined (single-channel) dataset supports only the masking mode "
+                                 "(augmentations.mc_floor_cut: {mask: true, scatter_lo: ...})")
+            if not self.training:
+                return x
+            return x._replace(ground_truth=self._mask_joined_channel_neginf(gt))
         if not isinstance(gt, (RadiationField, rf3RadiationField)):
             return x
         if self.as_neginf:

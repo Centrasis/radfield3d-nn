@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 import random
 from radfield3dnn.rftypes import TrainingInputData, RadiationFieldChannel, RadiationField, rf3RadiationField
-from RadFiled3D.pytorch.datasets.processing import DataProcessing
+from radfiled3d.pytorch.datasets.processing import DataProcessing
 
 
 class GaussianSmoothing(DataProcessing):

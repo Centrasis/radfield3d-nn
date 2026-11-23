@@ -1,7 +1,7 @@
 from typing import Union
 from radfield3dnn.rftypes import RadiationField, TrainingInputData, RadiationFieldChannel, AirKermaField
-from RadFiled3D.pytorch.types import TrainingInputData as rf3TrainingInputData, RadiationField as rf3RadiationField
-from RadFiled3D.pytorch.datasets.processing import DataProcessing
+from radfiled3d.pytorch.types import TrainingInputData as rf3TrainingInputData, RadiationField as rf3RadiationField
+from radfiled3d.pytorch.datasets.processing import DataProcessing
 from torch import Tensor
 
 
@@ -21,7 +21,9 @@ class Normalizer(DataProcessing):
             return TrainingInputData(
                 input=x.input,
                 ground_truth=self.forward(x.ground_truth, respect_to.ground_truth if respect_to is not None else None),
-                original_ground_truth=x.original_ground_truth if hasattr(x, "original_ground_truth") else None
+                original_ground_truth=x.original_ground_truth if hasattr(x, "original_ground_truth") else None,
+                # Unit weights and unit means: a field normalizer has nothing to rescale here.
+                lobes=getattr(x, "lobes", None),
             )
         elif isinstance(x, (RadiationField, rf3RadiationField)):
             return RadiationField(
@@ -55,7 +57,8 @@ class Normalizer(DataProcessing):
             return TrainingInputData(
                 input=x.input,
                 ground_truth=self.inverse(x.ground_truth, respect_to.ground_truth if respect_to is not None else None),
-                original_ground_truth=x.original_ground_truth if hasattr(x, "original_ground_truth") else None
+                original_ground_truth=x.original_ground_truth if hasattr(x, "original_ground_truth") else None,
+                lobes=getattr(x, "lobes", None),
             )
         elif isinstance(x, (RadiationField, rf3RadiationField)):
             return RadiationField(

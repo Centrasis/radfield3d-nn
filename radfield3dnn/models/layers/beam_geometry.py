@@ -30,6 +30,8 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+from radfield3dnn.preprocessing.normalizations.translation import TranslationNormalization
+
 
 _AXES = ("X", "Y", "Z")
 
@@ -87,11 +89,15 @@ class BeamPatientGeometry(nn.Module):
                  translation_ranges_m: dict[str, tuple[float, float]] | None,
                  position_frame_extent: float,
                  penumbra_m: float = 0.01, source_clamp_m: float = 0.02,
-                 reference_area_m2: float = 0.01):
+                 reference_area_m2: float = 0.01,
+                 translation_output_range: tuple[float, float] = (0.0, 1.0)):
         super().__init__()
         assert field_size_m > 0, f"field_size_m must be positive, got {field_size_m}"
         lo, hi = (float(v) for v in distance_range_m)
-        assert hi > lo >= 0, f"distance_range_m must be an increasing non-negative range, got {distance_range_m}"
+        # hi == lo is a fixed tube distance: the normalised input is then a constant and SID == lo
+        assert hi >= lo >= 0, f"distance_range_m must be a non-decreasing non-negative range, got {distance_range_m}"
+        t_lo, t_hi = (float(v) for v in translation_output_range)
+        assert t_hi > t_lo, f"translation_output_range must increase, got {translation_output_range}"
         assert position_frame_extent in (1.0, 2.0), \
             f"position_frame_extent must be 1.0 ([0,1] grid) or 2.0 ([-1,1] grid), got {position_frame_extent}"
         self.field_size_m = float(field_size_m)
@@ -103,17 +109,19 @@ class BeamPatientGeometry(nn.Module):
         self.penumbra_m = float(penumbra_m)
         self.source_clamp_m = float(source_clamp_m)
         self.reference_area_m2 = float(reference_area_m2)
+        self.translation_output_range = (t_lo, t_hi)
 
         f = self.field_size_m
         # distance: normalised od ∈ [0,1] → SID = lo + od·(hi−lo), in field units
         self.register_buffer("_dist_lo", torch.tensor(lo / f), persistent=False)
         self.register_buffer("_dist_span", torch.tensor((hi - lo) / f), persistent=False)
-        # translation: normalised [0,1] per axis over the generation range; constant axes are 0
+        # translation: normalised per axis over the generation range into translation_output_range
+        # (TranslationNormalization); constant axes sit at its low end and carry span 0
         lows, spans = [], []
         for axis in _AXES:
             a, b = (self.translation_ranges_m or {}).get(axis, (0.0, 0.0))
-            lows.append(a / f)
-            spans.append((b - a) / f)
+            lows.append(a / f - t_lo * (b - a) / (f * (t_hi - t_lo)))
+            spans.append((b - a) / (f * (t_hi - t_lo)))
         self.register_buffer("_trans_lo", torch.tensor(lows), persistent=False)
         self.register_buffer("_trans_span", torch.tensor(spans), persistent=False)
         self.register_buffer("_source_clamp", torch.tensor(self.source_clamp_m / f), persistent=False)
@@ -126,7 +134,8 @@ class BeamPatientGeometry(nn.Module):
                                 with_translation: bool, **kwargs) -> "BeamPatientGeometry":
         """Physical ranges from the dataset definition JSON the data was generated with
         (``Metaparameters.WorldDim``, ``Parameters.source_distance``,
-        ``GeometryTransformations.patient.Translation``)."""
+        ``GeometryTransformations.<translated object>.Translation``). A fixed ``source_distance``
+        (``value`` instead of ``range``) yields the degenerate range (v, v)."""
         if not isinstance(definition, dict):
             with open(definition, "r") as fh:
                 definition = json.load(fh)
@@ -134,16 +143,15 @@ class BeamPatientGeometry(nn.Module):
         assert world_dim, "Dataset definition lacks Metaparameters.WorldDim"
         field_size_m = float(max(world_dim))
         params = {p["name"]: p for p in definition.get("Parameters", [])}
-        assert "source_distance" in params and "range" in params["source_distance"], \
-            "Dataset definition lacks a source_distance range"
-        distance_range_m = tuple(float(v) for v in params["source_distance"]["range"])
+        distance = params.get("source_distance", {})
+        if "range" in distance:
+            distance_range_m = tuple(float(v) for v in distance["range"])
+        else:
+            assert "value" in distance, "Dataset definition lacks a source_distance range or value"
+            distance_range_m = (float(distance["value"]), float(distance["value"]))
         translation_ranges_m = None
         if with_translation:
-            transforms = definition.get("GeometryTransformations", {})
-            assert "patient" in transforms and transforms["patient"].get("Translation"), \
-                "Dataset definition has no GeometryTransformations.patient.Translation ranges"
-            translation_ranges_m = {axis: (float(r[0]), float(r[1]))
-                                    for axis, r in transforms["patient"]["Translation"].items()}
+            translation_ranges_m = TranslationNormalization.from_dataset_definition(definition).translation_ranges
         return cls(field_size_m, distance_range_m, translation_ranges_m, position_frame_extent, **kwargs)
 
     def get_parameters(self) -> dict:
@@ -157,6 +165,7 @@ class BeamPatientGeometry(nn.Module):
             "penumbra_m": self.penumbra_m,
             "source_clamp_m": self.source_clamp_m,
             "reference_area_m2": self.reference_area_m2,
+            "translation_output_range": list(self.translation_output_range),
         }
 
     @classmethod
@@ -170,6 +179,7 @@ class BeamPatientGeometry(nn.Module):
             penumbra_m=params.get("penumbra_m", 0.01),
             source_clamp_m=params.get("source_clamp_m", 0.02),
             reference_area_m2=params.get("reference_area_m2", 0.01),
+            translation_output_range=tuple(params.get("translation_output_range", (0.0, 1.0))),
         )
 
     @property
@@ -241,7 +251,7 @@ class BeamPatientGeometry(nn.Module):
         """Per-point geometry. ``position`` (N,3) in the encoder frame; the beam inputs NORMALISED
         as the model receives them, with N rows or a single field row: ``direction`` (·,3),
         ``origin_distance`` (·,1) in [0,1], ``rect`` (·,2) = (w, h)/field extent, ``translation``
-        (·,3) in [0,1] or None."""
+        (·,3) in ``translation_output_range`` or None."""
         n = position.shape[0]
         x = self.position_to_field(position.float())
         d, source, sid, rect, e1, e2 = self._beam(direction, origin_distance, rect, n)

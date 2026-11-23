@@ -159,28 +159,36 @@ class TranslationInputDecorator(FieldInputDecorator):
 
 
 class GeometryInputDecorator(FieldInputDecorator):
-    """Initializes ``geometry``: the phantom geometry channel's density layer, (1, D, W, H).
+    """Initializes ``geometry``: the phantom geometry channel's ``layers`` stacked channel-first,
+    (C, D, W, H); the default single layer ``density`` gives (1, D, W, H).
 
-    binary=True (default) turns it into the occupancy mask (density > 0) — what both the
+    binary=True (default) turns it into the occupancy mask (value > 0) — what both the
     geometry-voxel exclusion and the old use_geometry pipeline consumed. normalize applies
-    z-score normalization to the raw density instead (mirrors RadField3DDatasetWithGeometry).
-    Fields without a geometry channel yield None (member stays unset).
+    z-score normalization to the raw density instead (mirrors RadField3DDatasetWithGeometry; one
+    layer only). ``layers`` names the geometry layers to read, in channel order: a dataset whose
+    geometry channel has no ``density`` layer (DS04-Angio: patient, table, imagedetector) lists its
+    own. Fields without a geometry channel yield None (member stays unset).
     """
 
     member_name = "geometry"
 
-    def __init__(self, inner, binary: bool = True, normalize: bool = False):
+    def __init__(self, inner, binary: bool = True, normalize: bool = False, layers=("density",)):
         super().__init__(inner)
         assert not (binary and normalize), "binary mask and z-score normalization are exclusive"
+        layers = tuple(layers)
+        assert layers, "at least one geometry layer is required"
+        assert not normalize or len(layers) == 1, "z-score normalization applies to a single layer"
         self._own("_binary", bool(binary))
         self._own("_normalize", bool(normalize))
+        self._own("_layers", layers)
 
     def compute_member(self, file_idx: int):
         inner = object.__getattribute__(self, "_inner")
         if not inner.has_geometry:
             return None
-        arrays = inner._access_field_arrays(file_idx, ["geometry"], ["density"])
-        geometry = torch.from_numpy(arrays["geometry"]["density"]).to(torch.float32)
+        layers = object.__getattribute__(self, "_layers")
+        arrays = inner._access_field_arrays(file_idx, ["geometry"], list(layers))
+        geometry = torch.cat([torch.from_numpy(arrays["geometry"][layer]).to(torch.float32) for layer in layers], dim=0)
         if object.__getattribute__(self, "_binary"):
             geometry = (geometry > 0.0).to(torch.float32)
         elif object.__getattribute__(self, "_normalize"):

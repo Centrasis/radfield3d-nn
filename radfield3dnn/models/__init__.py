@@ -8,12 +8,13 @@ from radfield3dnn.preprocessing.normalizations import NormalizerConstructor
 from .base import BaseNeuralRadFieldModel
 from .nerf import *
 from .nerf_translation import *
+from .nerf_translation_direction import *
 from .nerf_physics import *
 from .feedforward import *
 from .field_unet import *
 from radfield3dnn.models.encoders.base import EncodingBase
 from radfield3dnn.rftypes import PositionalInput, positional_like
-from RadFiled3D.nn.torch_export import export_to_onnx
+from radfiled3d.nn.torch_export import export_to_onnx
 
 
 def _field_output_tensors(out):
@@ -29,7 +30,7 @@ def _field_output_tensors(out):
     spectrum), so (flux, spectrum) is unambiguous.
     """
     from radfield3dnn.rftypes import AirKermaField, RadiationField, rf3RadiationField
-    from RadFiled3D.pytorch.types import RadiationFieldChannel
+    from radfiled3d.pytorch.types import RadiationFieldChannel
 
     def channel(ch):
         return tuple(t for t in (ch.flux, ch.spectrum) if t is not None)
@@ -49,17 +50,38 @@ def _field_output_tensors(out):
     return tuple(t for t in out if isinstance(t, torch.Tensor))
 
 
-def _output_names_for(out) -> list:
-    """Names matching _field_output_tensors' order (informational: the deploy runtime binds
-    outputs structurally, not by name)."""
-    n = len(_field_output_tensors(out))
+def in_final_units(model, tensors: tuple) -> tuple:
+    """The exported outputs, with every flux taken back to the dataset's own units INSIDE the graph.
+
+    A deployed model emits final units itself; nothing outside its graph converts them. That is
+    possible only when the target normalizer has ONE constant for the whole dataset (a
+    `dataset_scale`): its inverse needs no reference field, so it is traced into the graph here.
+    A normalizer fitted per field has no such constant — each field was divided by its own maximum
+    — so its flux stays relative, and the package says so in the output's unit (ModelPackager).
+    The spectrum is a per-voxel distribution the normalizer never touches; it passes unchanged.
+    """
+    normalizer = getattr(model, "_normalizer", None)
+    if getattr(normalizer, "dataset_scale", None) is None:
+        return tensors
+    names = _output_names_from_count(len(tensors))
+    return tuple(normalizer.apply_inverse_transformation(t, None) if n.endswith("flux") else t
+                 for t, n in zip(tensors, names))
+
+
+def _output_names_from_count(n: int) -> list:
     base = ["flux", "spectrum", "direct_flux", "direct_spectrum"]
     return base[:n] if n <= len(base) else [f"output_{i}" for i in range(n)]
 
 
+def _output_names_for(out) -> list:
+    """Names matching _field_output_tensors' order (informational: the deploy runtime binds
+    outputs structurally, not by name)."""
+    return _output_names_from_count(len(_field_output_tensors(out)))
+
+
 def _export_batch_dim():
     """Dynamic batch dim for the ONNX exports — the deploy module's own, never a second copy."""
-    from RadFiled3D.nn.torch_export import batch_dim
+    from radfiled3d.nn.torch_export import batch_dim
     return batch_dim()
 
 
@@ -167,6 +189,68 @@ class ExportedGraph(NamedTuple):
     onnx: bytes
     input_names: list
     output_names: list
+
+
+# The beam conditioning is a property of the FIELD, not of the voxel: one row describes the whole
+# query grid. The graph therefore takes these at `[1, k]` and expands inside itself, so a caller
+# binds one row instead of materialising N identical ones — 168 MB of them at 64³, 1.3 GB at 128³,
+# on a device whose free memory is what decides the grid size in the first place.
+PER_FIELD_INPUTS = frozenset({
+    "beam_direction", "tube_spectrum", "source_distance",
+    "beam_collimation", "beam_collimation_kind", "patient_translation",
+})
+
+
+def per_field_inputs(model) -> frozenset:
+    """Which of this model's graph inputs travel as ONE row rather than one per query.
+
+    A tensor a stage-source graph consumes is excluded: it reaches the trunk through a buffer, and
+    a buffer is sized by the row count of the stage that writes it — which runs per query. Such a
+    tensor stays per-query on both sides, so the saving applies to everything else (on a hash-grid
+    model that is still `tube_spectrum`, 150 of the 163 floats a query would otherwise carry).
+    """
+    core = model.get_core_model()
+    relayed = set()
+    for entry in staged_encoders(model):
+        source = core.deploy_stage_source(entry.encoder)
+        if source is not None:
+            relayed.update(source[1])
+    relayed.discard("position")
+    return PER_FIELD_INPUTS - relayed
+
+
+def encoder_frame_position(position, extent: float):
+    """Map the deployed `[0, 1]` position onto the frame the location encoder was trained in.
+
+    THE GRAPH DOES THIS, not the consumer. A model trained with
+    `voxels_centered_around_origin` queries `[-1, 1]` with the isocentre at 0, but that is an
+    internal convention: a package that asked a consumer to know it would have every renderer
+    branching on which model it loaded, and one that forgot would sample an octant of the domain and
+    put the beam against a face. One interface, `[0, 1]`, for every model; the conversion travels
+    inside the graph where it cannot be forgotten.
+    """
+    return position * float(extent) - (float(extent) / 2.0 - 0.5) * 2.0 if extent != 1.0 else position
+
+
+def _dynamic_shapes(names, per_field):
+    """A dynamic batch axis for the per-query inputs; none for the per-field ones."""
+    from radfiled3d.nn.torch_export import batch_dim
+    batch = batch_dim()
+    return tuple({} if n in per_field else {0: batch} for n in names)
+
+
+def _per_field_example(name, tensor, per_field):
+    """The example the trace sees: one row for a per-field input, unchanged otherwise."""
+    return tensor[:1] if name in per_field and tensor.dim() > 1 else tensor
+
+
+def _broadcast_per_field(kw: dict, per_field) -> dict:
+    """Expand each per-field row to the query count, INSIDE the graph."""
+    if "position" not in kw:
+        return dict(kw)
+    rows = kw["position"].shape[0]
+    return {n: (t.expand(rows, *t.shape[1:]) if n in per_field and t.dim() > 1 else t)
+            for n, t in kw.items()}
 
 
 def relay_name(tensor: str) -> str:
@@ -277,11 +361,17 @@ class ModelExporter:
                     f"run.")
         shims, examples = {}, {}
 
+        per_field = per_field_inputs(model)
+
+        extent = float(getattr(model, "encoder_frame_extent", 1.0))
+
         def _call(kw):
+            kw = _broadcast_per_field(kw, per_field)
+            kw = dict(kw, position=encoder_frame_position(kw["position"], extent))
             for tensor, shim in shims.items():
                 shim.features = kw[tensor]
             # tensors only — a None in the returned pytree kills the ONNX conversion
-            return _field_output_tensors(core.forward(positional_like(
+            return in_final_units(model, _field_output_tensors(core.forward(positional_like(
                 inp,
                 direction=kw["beam_direction"], position=kw["position"],
                 spectrum=kw["tube_spectrum"], origin=kw["source_distance"],
@@ -289,7 +379,7 @@ class ModelExporter:
                 beam_shape_type=kw.get("beam_collimation_kind"),
                 geometry=kw.get("geometry_map"),
                 translation=kw.get("patient_translation"),
-            )))
+            ))))
 
         # Everything from the first swap to the last trace sits in ONE try/finally: a failure in
         # between would otherwise leave the model's encoder permanently replaced by a shim, and the
@@ -320,10 +410,14 @@ class ModelExporter:
                           ("patient_translation", getattr(inp, "translation", None))]
             for entry in staged:
                 candidates.append((entry.tensor, examples[entry.tensor]))
-            named = [(n, t) for n, t in candidates if t is not None]
+            named = [(n, _per_field_example(n, t, per_field)) for n, t in candidates if t is not None]
             names = [n for n, _ in named]
+            # Only the per-QUERY inputs carry the dynamic batch axis. A per-field input is traced at
+            # a static 1, which is what makes the runtime bind it as one row: the ONNX backend reads
+            # each bound shape off the graph and substitutes the query count for dynamic dims only.
             onnx = export_to_onnx(_traced_module(names, _call).eval(), tuple(t for _, t in named),
-                                  input_names=names, output_names=output_names)
+                                  input_names=names, output_names=output_names,
+                                  dynamic_shapes=_dynamic_shapes(names, per_field))
             return ExportedGraph(onnx, names, output_names)
         finally:
             for entry in staged:
@@ -363,19 +457,27 @@ class ModelExporter:
             "beam_collimation_kind": inp.beam_shape_type,
             "patient_translation": getattr(inp, "translation", None),
         }
+        per_field = per_field_inputs(model)
+        extent = float(getattr(model, "encoder_frame_extent", 1.0))
         coordinate = f"{staged.stage}_coordinate"
         out_names = [coordinate] + [relay_name(n) for n in relay]
 
         def _call(kw):
-            tensors = [module(*(kw[n] for n in names))]
+            # The coordinate is per query, so the beam row is expanded for the module — but the
+            # RELAY passes the row through unexpanded, because the trunk takes it per field too.
+            # Relaying the expanded copy would push N rows through the buffer and defeat the point.
+            dense = _broadcast_per_field(kw, per_field)
+            dense["position"] = encoder_frame_position(dense["position"], extent)
+            tensors = [module(*(dense[n] for n in names))]
             # `+ 0` so a relayed tensor is a distinct graph value: returning an input unchanged
             # makes the exporter alias it to the input name and the output vanishes.
             tensors += [kw[n] + 0 for n in relay]
             return tuple(tensors)
 
         onnx = export_to_onnx(_traced_module(names, _call).eval(),
-                              tuple(available[n] for n in names),
-                              input_names=names, output_names=out_names)
+                              tuple(_per_field_example(n, available[n], per_field) for n in names),
+                              input_names=names, output_names=out_names,
+                              dynamic_shapes=_dynamic_shapes(names, per_field))
         return ExportedGraph(onnx, names, out_names)
 
     # ── Two-graph export (beam-encoder + trunk) ───────────────────────────────
@@ -470,10 +572,10 @@ class ModelExporter:
         def _call(kw):
             position = kw["position"]
             # tensors only — see _field_output_tensors
-            return _field_output_tensors(core.forward(PositionalInput(
+            return in_final_units(model, _field_output_tensors(core.forward(PositionalInput(
                 direction=torch.zeros_like(position), origin=position[..., :1] * 0,
                 spectrum=position[..., :1] * 0, position=position),
-                global_parameters=kw["latent"], region_state=kw.get("region_state")))
+                global_parameters=kw["latent"], region_state=kw.get("region_state"))))
 
         # Dynamic batch on the per-voxel inputs: position rows vary per inner batch at deploy time,
         # and the latent is broadcast to the same row count by the caller. region_state is per-GRID

@@ -7,7 +7,7 @@ from radfield3dnn.rftypes import (
     rf3RadiationField,
     rf3TrainingInputData,
 )
-from RadFiled3D.pytorch.datasets.processing import DataProcessing
+from radfiled3d.pytorch.datasets.processing import DataProcessing
 from torch import nn
 from typing import Union
 

@@ -1,4 +1,4 @@
-from RadFiled3D.pytorch.types import RadiationField as rf3RadiationField, RadiationFieldChannel, TrainingInputData as rf3TrainingInputData, DirectionalInput as DirectionalInput, PositionalInput as PositionalInput, TranslationalInput as TranslationalInput
+from radfiled3d.pytorch.types import RadiationField as rf3RadiationField, RadiationFieldChannel, TrainingInputData as rf3TrainingInputData, DirectionalInput as DirectionalInput, PositionalInput as PositionalInput, TranslationalInput as TranslationalInput
 from typing import NamedTuple, Union
 from torch import Tensor
 
@@ -96,3 +96,10 @@ class TrainingInputData(NamedTuple):
     input: Union[DirectionalInput, PositionalInput, TranslationalPositionalInput, Tensor]
     ground_truth: Union[rf3RadiationField, RadiationFieldChannel, RadiationField, AirKermaField]
     original_ground_truth: Union[rf3RadiationField, RadiationFieldChannel, RadiationField, AirKermaField, None] = None  # Optional original ground truth for reference
+    # The DIRECTIONAL ground truth: (..., L, 5) von Mises-Fisher lobes, each row [weight, mx, my, mz, kappa],
+    # weights summing to 1 over the lobes and the means unit-norm.
+    #
+    # Carried BESIDE the channel rather than inside it: RadFiled3D's RadiationFieldChannel is a
+    # fixed NamedTuple (spectrum, flux, error) that ~10 modules dispatch on by identity, so adding
+    # a member there would change a foreign type every one of those checks depends on.
+    lobes: Union[Tensor, None] = None

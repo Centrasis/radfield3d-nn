@@ -1,3 +1,3 @@
 from .base import Loss
-from .std import L1LossWeighted, PlainL1Loss, WassersteinLossWeighted, StructuralSimilarity3DLoss, RawNeRFLoss
+from .std import L1LossWeighted, PlainL1Loss, PlainLogLoss, WassersteinLossWeighted, StructuralSimilarity3DLoss, RawNeRFLoss
 from .combinations import HistogramLoss, SMAPERegionBalancedLoss, TwoROIGammaLoss

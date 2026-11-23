@@ -12,7 +12,7 @@ fields and which ones are missing the entry.
 import os
 from typing import Iterable
 
-from RadFiled3D.utils import FieldStore
+from radfiled3d.store import FieldStore
 
 
 def field_has_translation(path: str) -> bool:

@@ -22,9 +22,24 @@ class FeedforwardPointwiseModel(BaseNeuralRadFieldModel):
         """
         super().__init__(learning_rate=learning_rate, normalizer=normalizer)
         self.voxel_supersampling = max(int(voxel_supersampling), 1)
+        self._eval_cell_samples = 1
         self.voxels_centered_around_origin = voxels_centered_around_origin
         self.relevance_discriminator: "FeedforwardPointwiseModel" | None = None
         self._base_voxel_map = None
+
+    def set_eval_cell_samples(self, k: int) -> None:
+        """Outside training, average each voxel over k points of its cell instead of querying the
+        node grid: the regular sub-grid's cell centres, so k must be a cube (8 = 2x2x2). A model
+        trained with voxel_supersampling learned the CELL MEAN, which the node-grid point does not
+        estimate where the field varies inside a voxel — this scores it on what it was fit to."""
+        k = int(k)
+        m = round(k ** (1.0 / 3.0))
+        if k < 1 or m ** 3 != k:
+            raise ValueError(f"eval cell samples must be a cube (1, 8, 27, ...), got {k}")
+        self._eval_cell_samples = k
+
+    def _cell_samples(self) -> int:
+        return self.voxel_supersampling if self.training else self._eval_cell_samples
 
     def forward(self, x: Union[DirectionalInput, PositionalInput], global_parameters: Tensor | None = None,
                 region_state: Tensor | None = None) -> RadiationField:
@@ -122,7 +137,10 @@ class FeedforwardPointwiseModel(BaseNeuralRadFieldModel):
         that it is queried at POSITIONS, and — for a grid-resolution-aware location encoder — the
         region-configuration vector that tells the encoder how wide the consumer's voxels are."""
         inputs, outputs = super().deploy_interface()
-        # Normalized into the unit cube the field box spans; set_field_dimensions() records the box.
+        # ALWAYS the unit cube. A model whose location encoder was trained over [-1, 1]
+        # (`voxels_centered_around_origin`) converts on the way in — `encoder_frame_position` puts
+        # that inside the exported graph — so the deployed interface is the same for every model and
+        # a consumer never has to know which frame the encoder used.
         inputs["position"] = dict(semantic="position", unit="m", range=(0.0, 1.0))
         # Per-GRID, not per-query: produced by the `encoding_config` graph whenever the consumer
         # changes resolution, and constant for as long as that grid is.
@@ -166,9 +184,10 @@ class FeedforwardPointwiseModel(BaseNeuralRadFieldModel):
         # Calculate total voxels per batch item
         total_voxels_per_batch = int(voxel_counts.prod().item())
 
-        # K in-voxel samples per voxel while TRAINING (their predictions are voxel-mean-reduced in
-        # forward2volume); eval always queries the single node-grid position.
-        k = self.voxel_supersampling if self.training else 1
+        # K in-voxel samples per voxel (their predictions are voxel-mean-reduced in forward2volume):
+        # random while training, the regular sub-grid outside it (set_eval_cell_samples); 1 is the
+        # single node-grid position.
+        k = self._cell_samples()
 
         # Create voxel map for all batch items efficiently
         voxel_map = self.base_voxel_map.unsqueeze(0).expand(batch_size, -1, -1, -1, -1)
@@ -210,7 +229,14 @@ class FeedforwardPointwiseModel(BaseNeuralRadFieldModel):
             batch_indices = batch_indices.repeat_interleave(k, dim=0)
             linear_indices = linear_indices.repeat_interleave(k, dim=0)
             voxel_extent_flat = (1.0 / voxel_counts.float()).to(voxel_list.device).view(1, -1)
-            voxel_list[:, :3] = voxel_list[:, :3] + torch.rand_like(voxel_list[:, :3]) * voxel_extent_flat
+            if self.training:
+                offsets = torch.rand_like(voxel_list[:, :3])
+            else:
+                m = round(k ** (1.0 / 3.0))
+                centres = (torch.arange(m, device=voxel_list.device, dtype=voxel_list.dtype) + 0.5) / m
+                grid = torch.stack(torch.meshgrid(centres, centres, centres, indexing="ij"), -1).reshape(k, 3)
+                offsets = grid.repeat(voxel_list.shape[0] // k, 1)
+            voxel_list[:, :3] = voxel_list[:, :3] + offsets * voxel_extent_flat
 
         if self.voxels_centered_around_origin:
             # map xyz from [0,1] to [-1,1] for the model
@@ -250,11 +276,11 @@ class FeedforwardPointwiseModel(BaseNeuralRadFieldModel):
         
         # Process in chunks respecting max_inner_batch_size
         full_field: RadiationField = None
-        # With voxel_supersampling k>1 (training only), every kept voxel contributes exactly k
-        # jittered rows sharing the SAME linear index; the scatters below become index_add_
+        # With k>1 cell samples (voxel_supersampling while training, set_eval_cell_samples outside
+        # it), every kept voxel contributes exactly k rows sharing the SAME linear index; the scatters below become index_add_
         # accumulations and the volume is divided by k afterwards (per-voxel mean prediction,
         # matching the voxel-averaged ground truth).
-        k = self.voxel_supersampling if self.training else 1
+        k = self._cell_samples()
         written = None
         voxel_splits, direction_splits, batch_idx_splits, index_splits = self.prepare_linear_input_batches(x, voxel_counts, mask)
 

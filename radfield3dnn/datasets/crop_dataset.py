@@ -1,6 +1,6 @@
 from radfield3dnn.rftypes import RadiationFieldChannel, RadiationField, TrainingInputData, DirectionalInput, rf3TrainingInputData, rf3RadiationField
 from typing import Union
-from RadFiled3D.pytorch.datasets.processing import DataProcessing
+from radfiled3d.pytorch.datasets.processing import DataProcessing
 from torch import Tensor
 
 

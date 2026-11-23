@@ -33,8 +33,13 @@ class ModuleBuilder:
         if isinstance(loss_fn_name, dict):
             spec = dict(loss_fn_name)
             kind = spec.pop("type", None)
+            if kind == "LogPlain":
+                unknown = set(spec) - {"eps"}
+                if unknown:
+                    raise ValueError(f"LogPlain: unknown keys {sorted(unknown)}; valid: ['eps']")
+                return std.PlainLogLoss(**spec)
             if kind not in ("SMAPEBalanced", "SMAPEBalancedLogRatio"):
-                raise ValueError(f"flux_loss dict form needs 'type' SMAPEBalanced or SMAPEBalancedLogRatio, got {kind!r}")
+                raise ValueError(f"flux_loss dict form needs 'type' SMAPEBalanced, SMAPEBalancedLogRatio or LogPlain, got {kind!r}")
             unknown = set(spec) - ModuleBuilder._BALANCED_LOSS_KNOBS
             if unknown:
                 raise ValueError(f"{kind}: unknown keys {sorted(unknown)}; valid: {sorted(ModuleBuilder._BALANCED_LOSS_KNOBS)}")
@@ -44,6 +49,9 @@ class ModuleBuilder:
         elif loss_fn_name == "L1Plain":
             # Plain physical-space L1 for LinearNormalizer(0,1) targets.
             return std.PlainL1Loss(weight_with_error=False)
+        elif loss_fn_name == "LogPlain":
+            # Unweighted |log10(p/t)| over all valid voxels; eps via the dict form.
+            return std.PlainLogLoss()
         elif loss_fn_name == "SMAPEBalanced":
             # Metric-targeted region-balanced SMAPE: trains the metric's own functional with equal
             # gradient mass on beam / bright-ring / reliable-bulk regions and MC-noise voxels masked
@@ -139,6 +147,12 @@ class ModuleBuilder:
 
 class BaseNeuralRadFieldModel(pl.LightningModule):
     __model_name__: str = None
+    # Whether the model learns the dataset's von Mises-Fisher lobes, which then have to be loaded
+    # (`dataset: use_lobes`) and arrive on every batch. Callers ask the model instead of its type.
+    learns_lobes: bool = False
+    # Name prefixes of the parameters this model has beyond the network a warm start comes from (a head the
+    # subclass adds); they keep their fresh initialisation. See models/warm_start.py.
+    warm_start_new_parameters: tuple = ()
 
     lr = property(lambda x: x.get_lr(), lambda x, v: x.set_lr(v))
     learning_rate = property(lambda x: x.get_lr(), lambda x, v: x.set_lr(v))
@@ -199,7 +213,7 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
         # Keep the declared shape TYPE consistent with the parameter width (1 = cone, 2 = the
         # rectangle's (w, h)); the beam normalizer and any shape-dependent branch key off it.
         try:
-            from RadFiled3D.RadFiled3D import FieldShape
+            from radfiled3d import FieldShape
             shape_id = float(int(FieldShape.RECTANGLE if beam_shape_dims == 2 else FieldShape.CONE))
             beam_shape_type = torch.full((batch_size, 1), shape_id, device=device, dtype=torch.float32)
         except Exception:
@@ -476,8 +490,8 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
         """Declare what this model CONSUMES and PRODUCES, as RF3M tensor descriptors.
 
         Returns ``(inputs, outputs)``, each a mapping of GRAPH TENSOR NAME -> the keyword set of
-        ``RadFiled3D.nn.deploy.PackageBuilder.add_input`` / ``add_output``: the ``semantic`` (what the
-        numbers mean), the physical ``unit``, and the ``normalizer`` that maps between the two. It
+        ``radfiled3d.nn.deploy.ModelBuilder.add_input`` / ``add_output``: the ``semantic`` (what the
+        numbers mean), the physical ``unit``, and — on OUTPUTS only; a network normalizes its own inputs — the ``normalizer`` that maps between the two. It
         describes data, never the network — two architectures with the same I/O are interchangeable
         to a consumer.
 
@@ -509,17 +523,17 @@ class BaseNeuralRadFieldModel(pl.LightningModule):
             "beam_collimation": dict(semantic="beam_collimation", unit="deg"),
             "beam_collimation_kind": dict(semantic="beam_collimation_kind", unit="",
                                           range=["cone", "rectangle"]),
-            # The beam encoder's latent is an ordinary bound input of the trunk: the container
-            # records nowhere how a two-graph model composes, so a consumer runs the encoder itself
-            # and binds its output here.
+            # The beam encoder's latent. Described here because it is a graph tensor and every
+            # graph tensor has to be described — but it is normally NOT declared on the package:
+            # the export records how the encoder feeds the trunk, and the runtime then fills the
+            # latent between stages. ModelPackager drops it from the declarations for exactly that
+            # reason; it stays declared only for a package written without that wiring, where a
+            # consumer does run the encoder itself and binds its output here.
             "latent": dict(semantic="beam_latent", unit=""),
         }
-        norm, params = self._normalizer.get_type(), self._normalizer.deploy_params()
         outputs = {
-            "flux": dict(semantic="flux", shape=[1], unit="",
-                         normalizer=norm, normalizer_params=params),
-            "spectrum": dict(semantic="spectrum", shape=[out_bins], unit="",
-                             normalizer=norm, normalizer_params=params),
+            "flux": dict(semantic="flux", shape=[1], unit=""),
+            "spectrum": dict(semantic="spectrum", shape=[out_bins], unit=""),
         }
         return inputs, outputs
 

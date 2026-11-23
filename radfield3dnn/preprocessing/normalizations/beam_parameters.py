@@ -1,10 +1,14 @@
-from RadFiled3D.pytorch.datasets.processing import DataProcessing
+from radfiled3d.pytorch.datasets.processing import DataProcessing
 from radfield3dnn.rftypes import TrainingInputData, DirectionalInput, PositionalInput
-from RadFiled3D.RadFiled3D import FieldShape
+from radfiled3d import FieldShape
 import torch
 
 
 class BeamParametersNormalization(DataProcessing):
+    # Below this a distance range is float noise, not a range: 0.1 mm against tube distances of
+    # tens of centimetres.
+    DEGENERATE_DISTANCE_SPAN_M = 1e-4
+
     def __init__(self, opening_angle_range_deg: tuple[float, float], size_per_voxel_m: float, is_origin_centered: bool, distance_range_m: tuple[float, float] | None = None, half_field_size: tuple[float, float, float] | None = None):
         super().__init__()
         self.opening_angle_range = (float(torch.deg2rad(torch.tensor(opening_angle_range_deg[0], dtype=torch.float32))), float(torch.deg2rad(torch.tensor(opening_angle_range_deg[1], dtype=torch.float32))))  # in radians
@@ -51,7 +55,16 @@ class BeamParametersNormalization(DataProcessing):
             # reverse field-relative normalization of origin from dataloader
             origin = (x.input.origin * 2 * half_field_size) - half_field_size if self.half_field_size is not None else x.input.origin
             origin_distance = torch.linalg.norm(origin, dim=1)  # in meters
-            origin_distance = (origin_distance - distance_range[0]) / (distance_range[1] - distance_range[0])  # normalize to [0, 1] depending on is_origin_centered
+            span = distance_range[1] - distance_range[0]
+            if span < self.DEGENERATE_DISTANCE_SPAN_M:
+                # A tube distance that never varied carries no information, and dividing by its
+                # span would not give 0/0 but something worse: on DS04-Angio-ArtisQ the span is
+                # 4e-7 m of float noise, so the quotient is that noise amplified ~2.4 million-fold
+                # into a [0, 1] input the model could latch onto. Map it to the constant mid-range,
+                # as TranslationNormalization does for an axis that was never varied.
+                origin_distance = torch.full_like(origin_distance, 0.5)
+            else:
+                origin_distance = (origin_distance - distance_range[0]) / span  # normalize to [0, 1] depending on is_origin_centered
             origin_distance[(origin_distance > 1.0) & torch.isclose(origin_distance, torch.tensor(1.0, device=origin_distance.device))] = 1.0  # ensure max value is exactly 1.0 avoiding floating point issues
             origin_distance[(origin_distance < 0.0) & torch.isclose(origin_distance, torch.tensor(0.0, device=origin_distance.device))] = 0.0  # ensure min value is exactly 0.0 avoiding floating point issues
             assert (origin_distance >= 0).all() and (origin_distance <= 1.0).all(), f"Expected origin distances to be in [{distance_range[0].item()}, {distance_range[1].item()}] meters, but got min { (origin_distance).min().item()} and max {(origin_distance).max().item()} meters."
@@ -64,7 +77,8 @@ class BeamParametersNormalization(DataProcessing):
                     beam_shape_parameters=x.input.beam_shape_parameters.clone(),  # clone: the CONE block normalizes this in place; never mutate the shared/cached source
                 ),
                 ground_truth=x.ground_truth,
-                original_ground_truth=x.original_ground_truth if hasattr(x, 'original_ground_truth') else None
+                original_ground_truth=x.original_ground_truth if hasattr(x, 'original_ground_truth') else None,
+                lobes=getattr(x, "lobes", None),
             )
             
 
@@ -111,9 +125,14 @@ class BeamParametersNormalization(DataProcessing):
         params = {p["name"]: p for p in definition.get("Parameters", [])}
         meta = definition.get("Metaparameters", {})
 
-        assert "source_distance" in params and "range" in params["source_distance"], \
-            "Dataset definition lacks a source_distance range"
-        distance_range_m = tuple(float(v) for v in params["source_distance"]["range"])
+        assert "source_distance" in params, "Dataset definition lacks a source_distance parameter"
+        distance = params["source_distance"]
+        if "range" in distance:
+            distance_range_m = tuple(float(v) for v in distance["range"])
+        else:
+            # A FIXED distance is a range of zero width; the normalization maps it to a constant.
+            assert "value" in distance, "source_distance has neither a range nor a value"
+            distance_range_m = (float(distance["value"]), float(distance["value"]))
 
         opening_angle_range_deg = (1.0, 1.0)  # harmless placeholder; only the CONE branch reads it
         oa = params.get("source_opening_angle", {}).get("range")

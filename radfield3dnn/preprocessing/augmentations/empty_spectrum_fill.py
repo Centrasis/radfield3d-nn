@@ -1,5 +1,5 @@
 import torch
-from RadFiled3D.pytorch.datasets.processing import DataProcessing
+from radfiled3d.pytorch.datasets.processing import DataProcessing
 
 from radfield3dnn.roi import BEAM_REL_DEFAULT, SCATTER_LO_DEFAULT
 from radfield3dnn.rftypes import (

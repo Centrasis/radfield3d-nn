@@ -293,7 +293,7 @@ class FieldScatterUNet(BaseNeuralRadFieldModel):
         # this as a volume model rather than a per-voxel one. The analytic direct beam and the core
         # run inside the graph, so nothing is re-implemented on the consumer side.
         from radfield3dnn.models import ExportedGraph
-        from RadFiled3D.nn.torch_export import export_to_onnx
+        from radfiled3d.nn.torch_export import export_to_onnx
         self.eval()
         dev = next(self.parameters()).device
         args = (torch.rand(1, 3, device=dev), torch.rand(1, 3, device=dev),
@@ -329,4 +329,5 @@ class _VolumeExportWrap(nn.Module):
         direct = self.m.adb(direction, origin, spectrum, beam_shape,
                             density=None, dims=self.m.out_dims, voxel_size=self.m.voxel_size_m)
         field = self.m._forward_from_direct(direct, spectrum)
-        return field.scatter_field.flux, field.scatter_field.spectrum
+        from radfield3dnn.models import in_final_units
+        return in_final_units(self.m, (field.scatter_field.flux, field.scatter_field.spectrum))

@@ -1,15 +1,16 @@
+import os
 import lightning.pytorch as pl
-from RadFiled3D.pytorch.radiationfieldloader import DataLoaderBuilder
-from RadFiled3D.pytorch.datasets.radfield3d import RadField3DDataset
+from radfiled3d.pytorch.radiationfieldloader import DataLoaderBuilder
+from radfiled3d.pytorch.datasets.radfield3d import RadField3DDataset
 from typing import Type
 from radfield3dnn.rftypes import TrainingInputData, RadiationField, rf3RadiationField
-from RadFiled3D.pytorch.datasets.processing import DataProcessing
+from radfiled3d.pytorch.datasets.processing import DataProcessing
 from radfield3dnn.preprocessing.augmentations.augmentation_limit import LimitedAugmentation
 from radfield3dnn.datasets.prefetcher import CudaStreamPrefetcher
 
 
 class RadiationFieldDataModule(pl.LightningDataModule):
-    def __init__(self, zip_directory, dataset_cls: Type[RadField3DDataset], batch_size=32, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, num_workers=None, data_processings: list[DataProcessing]=None, prefetch_to_device: bool = True, max_fields: int = None, cache_to_ram: bool = False, cache_ram_gb: float = None, exclude_files: set = None):
+    def __init__(self, zip_directory, dataset_cls: Type[RadField3DDataset], batch_size=32, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, num_workers=None, data_processings: list[DataProcessing]=None, prefetch_to_device: bool = True, max_fields: int = None, cache_to_ram: bool = False, cache_ram_gb: float = None, exclude_files: set = None, split: dict = None):
         super().__init__()
         self.zip_directory = zip_directory
         # Overlap the H2D upload + GPU preprocessing of the next batch with the current step's
@@ -79,8 +80,38 @@ class RadiationFieldDataModule(pl.LightningDataModule):
             print(f"[yellow]max_fields={max_fields}: using {len(fp)} of the available fields "
                   f"(train≈{int(self.train_ratio*len(fp))}).[/yellow]")
 
+        # A fixed split replaces the random one: {"train", "val", "test"} lists of field paths
+        # relative to the dataset directory. A field in no list is not used at all.
+        if split is not None:
+            if max_fields is not None:
+                raise ValueError("dataset.split_file and max_fields both choose the fields; use one")
+            available = {os.path.relpath(str(f), str(self.zip_directory)): f
+                         for f in self._dataloader_builder.file_paths}
+            parts = {}
+            for name in ("train", "val", "test"):
+                missing = [f for f in split[name] if f not in available]
+                if missing:
+                    raise ValueError(f"split '{name}' names {len(missing)} field(s) this dataset does not "
+                                     f"provide, e.g. {missing[:3]}")
+                parts[name] = [available[f] for f in split[name]]
+            listed = split["train"] + split["val"] + split["test"]
+            if split.get("overfit", False):
+                # a deliberate memorisation test: every part is the same field set, scored on itself
+                if not (sorted(split["train"]) == sorted(split["val"]) == sorted(split["test"])):
+                    raise ValueError("an overfit split must list the same fields in train, val and test")
+                listed = list(split["train"])
+            if len(set(listed)) != len(listed):
+                raise ValueError("the split lists a field in more than one part (or twice)")
+            self._dataloader_builder.train_files = parts["train"]
+            self._dataloader_builder.val_files = parts["val"]
+            self._dataloader_builder.test_files = parts["test"]
+            self._dataloader_builder.file_paths = list(dict.fromkeys(parts["train"] + parts["val"] + parts["test"]))
+            print(f"[green]Fixed split: {len(parts['train'])}/{len(parts['val'])}/{len(parts['test'])} "
+                  f"train/val/test fields; {len(available) - len(listed)} unused.[/green]")
+
         self._fields_count = len(self._dataloader_builder.file_paths)
-        self._train_count = int(self.train_ratio * self._fields_count)
+        self._train_count = len(self._dataloader_builder.train_files) if split is not None \
+            else int(self.train_ratio * self._fields_count)
 
         self._train_dataset = self.dataloader_builder.build_train_dataset()
         self._val_dataset = self.dataloader_builder.build_val_dataset()

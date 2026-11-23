@@ -17,7 +17,7 @@ call, repeating each field within an epoch (``dataset_multiplier`` > 1) makes th
 DIFFERENT parts of the scatter ROI each repeat while always re-seeing the beam.
 """
 import torch
-from RadFiled3D.pytorch.datasets.processing import DataProcessing
+from radfiled3d.pytorch.datasets.processing import DataProcessing
 
 from radfield3dnn.rftypes import AirKermaField, TrainingInputData, RadiationFieldChannel, RadiationField, rf3RadiationField
 from radfield3dnn.roi import compute_roi_masks, BEAM_REL_DEFAULT, SCATTER_LO_DEFAULT

@@ -1,4 +1,4 @@
-from RadFiled3D.pytorch.datasets.processing import DataProcessing
+from radfiled3d.pytorch.datasets.processing import DataProcessing
 from radfield3dnn.rftypes import TrainingInputData, RadiationField, RadiationFieldChannel, DirectionalInput
 import torch
 from torch.nn import functional as F

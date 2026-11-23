@@ -92,6 +92,20 @@ def _load_excluded_fields(spec, config_dir: str) -> set:
     return fields
 
 
+def _load_split(spec, config_dir: str) -> dict:
+    """The fixed {"train", "val", "test"} field lists of a split JSON, or None for the random split."""
+    if not spec:
+        return None
+    path = spec if os.path.isabs(spec) else os.path.join(config_dir, spec)
+    with open(path) as f:
+        split = json.load(f)
+    missing = {"train", "val", "test"} - set(split)
+    if missing:
+        raise ValueError(f"dataset.split_file {path} lacks {sorted(missing)}")
+    print(f"[green]Using the fixed split in {path}")
+    return {**{k: list(split[k]) for k in ("train", "val", "test")}, "overfit": bool(split.get("overfit", False))}
+
+
 def collect_cacheable_files(dataset_path: str, min_age_s: float, now: float = None) -> tuple[list[str], int]:
     """Walk the dataset and return (relative paths to cache, number skipped as too young).
 
@@ -483,11 +497,20 @@ if __name__ == "__main__":
 
     # ── Model ─────────────────────────────────────────────────────────────────
     torch.set_float32_matmul_precision('high')
+    use_lobes = bool(ds_cfg.get("use_lobes", False))
 
     import tempfile
     # Inject the resolved normalizer back into the config for model construction
     full_cfg = dict(raw_model_cfg)
     full_cfg.setdefault("parameters", {})["normalizer"] = norm_name  # keep as string for ModelConstructor
+
+    # The dataset owns how the translation is normalised; the beam_geometry block has to invert it.
+    beam_geometry_cfg = full_cfg["parameters"].get("conditioning_params", {}).get("beam_geometry")
+    if beam_geometry_cfg and "definition_file" in beam_geometry_cfg:
+        if "translation_output_range" in beam_geometry_cfg:
+            raise ValueError("beam_geometry.translation_output_range is set by dataset.translation_output_range; "
+                             "remove it from the model config")
+        beam_geometry_cfg["translation_output_range"] = list(ds_cfg.get("translation_output_range", (0.0, 1.0)))
 
     precision = train_cfg.get("precision", "fp32")
     if precision == "fp16":
@@ -500,6 +523,20 @@ if __name__ == "__main__":
     model_cls = ModelConstructor.create_model_from_config(tmp_path)
     os.unlink(tmp_path)
     model = model_cls().cuda()
+    # `training: init_checkpoint:` — start from another run's weights (a Lightning checkpoint of the same
+    # network, or of the one this model extends); optimizer and schedule start fresh.
+    init_checkpoint = train_cfg.get("init_checkpoint")
+    if init_checkpoint:
+        from radfield3dnn.models.warm_start import load_warm_start
+        warm = load_warm_start(model, init_checkpoint)
+        print(f"[green]Warm start from {init_checkpoint}: {warm['loaded']} tensors loaded"
+              + (f", {len(warm['new'])} left fresh ({warm['new'][0].split('.')[0]}…)." if warm["new"] else "."))
+    if use_lobes != model.learns_lobes:
+        raise ValueError(
+            f"dataset.use_lobes is {use_lobes} but {raw_model_cfg['model_name']} "
+            f"{'learns' if model.learns_lobes else 'does not learn'} the lobes: "
+            + ("set use_lobes: true, or train a TPBRFNet." if model.learns_lobes else
+               "set use_lobes: false, or train a TDPBRFNet to learn them."))
     # Reproducibility: `training: lr_finder: false` skips the per-seed LR sweep
     # and trains at the model's configured LR (a fixed LR removes a variance source).
     if not train_cfg.get("lr_finder", True):
@@ -563,8 +600,29 @@ if __name__ == "__main__":
         # attach the binary geometry-occupancy mask so GeometryVoxelExclusion has its channel
         # (no-op for fields without a geometry channel; use_geometry attaches it anyway)
         attach_geometry_mask=exclude_geometry and not ds_cfg.get("use_geometry", False),
+        # `dataset: use_lobes:` — load the radiation channel's von Mises-Fisher lobes as the
+        # directional target; set exactly when the model learns them (TDPBRFNet), checked above.
+        use_lobes=use_lobes,
+        # `dataset: translation_output_range:` — where the per-axis-normalized patient translation
+        # lands; [-1, 1] centres it for a Fourier-feature encoder. Default [0, 1].
+        translation_output_range=tuple(ds_cfg.get("translation_output_range", (0.0, 1.0))),
+        # `dataset: split_file:` — JSON with "train" / "val" / "test" lists of dataset-relative
+        # field paths. Replaces the random split; runs compared on one test set need it.
+        split=_load_split(ds_cfg.get("split_file", None), CONFIG_DIR),
     )
     _, VOXEL_SIZE_M = get_dataset_dimensions_and_voxel_size(datamodule)
+
+    # Record the split. It is drawn from the GLOBAL RNG after the model was instantiated once, so it
+    # depends on every draw before it and cannot be recovered from the seed afterwards — an
+    # evaluation that re-derives it gets a different "test" set that overlaps training, and reports
+    # the model as better than it is. Written down here, a run's held-out fields are always known.
+    _builder = datamodule._dataloader_builder
+    os.makedirs(args.logs_path, exist_ok=True)
+    with open(os.path.join(args.logs_path, "split.json"), "w") as _f:
+        json.dump({"seed": int(args.seed),
+                   "train": sorted(str(x) for x in _builder.train_files),
+                   "val": sorted(str(x) for x in _builder.val_files),
+                   "test": sorted(str(x) for x in _builder.test_files)}, _f, indent=1)
 
     # Flux-head output-bias init is decided by the flux activation itself (its `init_bias`
     # property), inside the model's apply_weights_init — no external/data-adaptive override.
